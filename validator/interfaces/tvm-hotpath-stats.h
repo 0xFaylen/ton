@@ -174,6 +174,28 @@ class TvmHotpathStats {
     }
   }
 
+  void scale(double factor) {
+    total_time_ *= factor;
+    total_executions_ = scale_u64(total_executions_, factor);
+    total_vm_gas_used_ = scale_u64(total_vm_gas_used_, factor);
+    total_billed_gas_used_ = scale_u64(total_billed_gas_used_, factor);
+    total_vm_steps_ = scale_u64(total_vm_steps_, factor);
+    replacements_ = scale_u64(replacements_, factor);
+    for (auto& entry : entries_) {
+      entry.observed_time *= factor;
+      entry.estimated_wall *= factor;
+      entry.wall_error *= factor;
+      entry.executions = scale_u64(entry.executions, factor);
+      entry.vm_gas_used = scale_u64(entry.vm_gas_used, factor);
+      entry.billed_gas_used = scale_u64(entry.billed_gas_used, factor);
+      entry.vm_steps = scale_u64(entry.vm_steps, factor);
+      for (std::size_t i = 0; i < entry.accounts_size; ++i) {
+        entry.accounts[i].executions = scale_u64(entry.accounts[i].executions, factor);
+        entry.accounts[i].error = scale_u64(entry.accounts[i].error, factor);
+      }
+    }
+  }
+
   std::vector<Entry> entries_by_wall(std::size_t limit = default_output_limit) const {
     auto result = entries_;
     std::sort(result.begin(), result.end(), [](const Entry& lhs, const Entry& rhs) {
@@ -238,6 +260,10 @@ class TvmHotpathStats {
   }
 
  private:
+  static td::uint64 scale_u64(td::uint64 value, double factor) {
+    return static_cast<td::uint64>(std::llround(static_cast<double>(value) * factor));
+  }
+
   void add_entry(Entry incoming) {
     for (auto& entry : entries_) {
       if (entry.code_hash == incoming.code_hash) {

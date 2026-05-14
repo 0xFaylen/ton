@@ -114,6 +114,11 @@ set(VALIDATOR_SOURCE
   consensus/types.cpp
   consensus/utils.cpp
 
+  validation-replay/validation-replay.h
+  validation-replay/validation-replay.cpp
+  validation-replay/utils.h
+  validation-replay/utils.cpp
+
   ${VALIDATOR_HEADERS}
 )
 
