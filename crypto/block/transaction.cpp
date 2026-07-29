@@ -1998,6 +1998,12 @@ bool Transaction::prepare_compute_phase(const ComputePhaseConfig& cfg) {
 
   LOG(DEBUG) << "starting VM";
   cp.vm_init_state_hash = vm.get_state_hash();
+  {
+    td::RealCpuTimer profile_timer;
+    tvm_executed = true;
+    tvm_code_hash = new_code->get_hash().bits();
+    time_tvm_profile += profile_timer.elapsed_both();
+  }
   td::RealCpuTimer timer;
   cp.exit_code = ~vm.run();
   time_tvm = timer.elapsed_both();
@@ -2008,6 +2014,8 @@ bool Transaction::prepare_compute_phase(const ComputePhaseConfig& cfg) {
   cp.vm_steps = (int)vm.get_steps_count();
   gas = vm.get_gas_limits();
   cp.gas_used = std::min<long long>(gas.gas_consumed(), gas.gas_limit);
+  tvm_steps = vm.get_steps_count();
+  tvm_gas_used = cp.gas_used;
   cp.accepted = (gas.gas_credit == 0);
   cp.success = (cp.accepted && vm.committed());
   if (cp.accepted & use_msg_state) {

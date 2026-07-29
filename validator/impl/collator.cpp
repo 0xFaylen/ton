@@ -3204,9 +3204,16 @@ bool Collator::create_ticktock_transaction(const ton::StdSmcAddress& smc_addr, t
       req_start_lt, now_);
   td::RealCpuTimer timer;
   SCOPE_EXIT {
+    auto elapsed = timer.elapsed_both();
     stats_.work_time.trx_tvm += trans->time_tvm;
     stats_.work_time.trx_storage_stat += trans->time_storage_stat;
-    stats_.work_time.trx_other += timer.elapsed_both() - trans->time_tvm - trans->time_storage_stat;
+    stats_.work_time.trx_other += elapsed - trans->time_tvm - trans->time_tvm_profile - trans->time_storage_stat;
+    if (trans->tvm_executed) {
+      td::RealCpuTimer profile_timer;
+      stats_.work_time.tvm_hotpath.record(trans->tvm_code_hash, trans->account.addr, trans->time_tvm,
+                                          trans->tvm_gas_used, trans->gas_used(), trans->tvm_steps);
+      stats_.work_time.trx_tvm_profile += trans->time_tvm_profile + profile_timer.elapsed_both();
+    }
   };
   if (!trans->prepare_storage_phase(storage_phase_cfg_, true)) {
     return fatal_error(td::Status::Error(
@@ -3394,9 +3401,16 @@ td::Result<std::unique_ptr<block::transaction::Transaction>> Collator::impl_crea
     td::RealCpuTimer timer;
     SCOPE_EXIT {
       if (stats) {
+        auto elapsed = timer.elapsed_both();
         stats->work_time.trx_tvm += trans->time_tvm;
         stats->work_time.trx_storage_stat += trans->time_storage_stat;
-        stats->work_time.trx_other += timer.elapsed_both() - trans->time_tvm - trans->time_storage_stat;
+        stats->work_time.trx_other += elapsed - trans->time_tvm - trans->time_tvm_profile - trans->time_storage_stat;
+        if (trans->tvm_executed) {
+          td::RealCpuTimer profile_timer;
+          stats->work_time.tvm_hotpath.record(trans->tvm_code_hash, trans->account.addr, trans->time_tvm,
+                                              trans->tvm_gas_used, trans->gas_used(), trans->tvm_steps);
+          stats->work_time.trx_tvm_profile += trans->time_tvm_profile + profile_timer.elapsed_both();
+        }
       }
     };
     bool ihr_delivered = false;  // FIXME
