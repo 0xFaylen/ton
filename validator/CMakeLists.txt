@@ -48,6 +48,7 @@ set(VALIDATOR_HEADERS
   interfaces/out-msg-queue-proof.h
   interfaces/proof.h
   interfaces/shard.h
+  interfaces/tvm-hotpath-stats.h
   interfaces/validator-full-id.h
   interfaces/validator-manager.h
   invariants.hpp

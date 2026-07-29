@@ -35,6 +35,7 @@
 #include "proof.h"
 #include "shard-block.h"
 #include "shard.h"
+#include "tvm-hotpath-stats.h"
 
 DECLARE_LOG_CATEGORY(validator)
 
@@ -142,6 +143,7 @@ struct CollationStats {
     td::RealCpuTimer::Time queue_cleanup;
     td::RealCpuTimer::Time prelim_storage_stat;
     td::RealCpuTimer::Time trx_tvm;
+    td::RealCpuTimer::Time trx_tvm_profile;
     td::RealCpuTimer::Time trx_storage_stat;
     td::RealCpuTimer::Time trx_other;
     td::RealCpuTimer::Time final_storage_stat;
@@ -156,16 +158,19 @@ struct CollationStats {
       return PSTRING() << "total=" << total.get(is_cpu) << " preinit=" << preinit.get(is_cpu)
                        << " queue_cleanup=" << queue_cleanup.get(is_cpu)
                        << " prelim_storage_stat=" << prelim_storage_stat.get(is_cpu)
-                       << " trx_tvm=" << trx_tvm.get(is_cpu) << " trx_storage_stat=" << trx_storage_stat.get(is_cpu)
-                       << " trx_other=" << trx_other.get(is_cpu)
+                       << " trx_tvm=" << trx_tvm.get(is_cpu) << " trx_tvm_profile=" << trx_tvm_profile.get(is_cpu)
+                       << " trx_storage_stat=" << trx_storage_stat.get(is_cpu) << " trx_other=" << trx_other.get(is_cpu)
                        << " final_storage_stat=" << final_storage_stat.get(is_cpu)
                        << " enqueue_new_messages=" << enqueue_new_messages.get(is_cpu)
                        << " combine_account_transactions=" << combine_account_transactions.get(is_cpu)
                        << " create_shard_state=" << create_shard_state.get(is_cpu)
                        << " create_block=" << create_block.get(is_cpu)
                        << " create_collated_data=" << create_collated_data.get(is_cpu)
-                       << " create_block_candidate=" << create_block_candidate.get(is_cpu);
+                       << " create_block_candidate=" << create_block_candidate.get(is_cpu)
+                       << " tvm_hotpath=" << tvm_hotpath.to_str(is_cpu);
     }
+
+    TvmHotpathStats tvm_hotpath;
   };
   WorkTimeStats work_time;
   double wait_externals_time = 0.0;
@@ -219,6 +224,7 @@ struct ValidationStats {
     td::RealCpuTimer::Time unpack_block_candidate;
     td::RealCpuTimer::Time process_mc_state;
     td::RealCpuTimer::Time trx_tvm;
+    td::RealCpuTimer::Time trx_tvm_profile;
     td::RealCpuTimer::Time trx_storage_stat;
     td::RealCpuTimer::Time trx_other;
     td::RealCpuTimer::Time check_transactions_other;
@@ -240,6 +246,7 @@ struct ValidationStats {
       return PSTRING() << "total=" << total.get(is_cpu)
                        << " unpack_block_candidate=" << unpack_block_candidate.get(is_cpu)
                        << " process_mc_state=" << process_mc_state.get(is_cpu) << " trx_tvm=" << trx_tvm.get(is_cpu)
+                       << " trx_tvm_profile=" << trx_tvm_profile.get(is_cpu)
                        << " trx_storage_stat=" << trx_storage_stat.get(is_cpu) << " trx_other=" << trx_other.get(is_cpu)
                        << " check_transactions_other=" << check_transactions_other.get(is_cpu)
                        << " unpack_state=" << unpack_state.get(is_cpu)
@@ -254,8 +261,11 @@ struct ValidationStats {
                        << " check_dispatch_queue=" << check_dispatch_queue.get(is_cpu)
                        << " check_processed_upto=" << check_processed_upto.get(is_cpu)
                        << " check_in_queue=" << check_in_queue.get(is_cpu)
-                       << " check_new_state=" << check_new_state.get(is_cpu);
+                       << " check_new_state=" << check_new_state.get(is_cpu)
+                       << " tvm_hotpath=" << tvm_hotpath.to_str(is_cpu);
     }
+
+    TvmHotpathStats tvm_hotpath;
   };
   WorkTimeStats work_time;
   mutable StorageStatCacheStats storage_stat_cache;

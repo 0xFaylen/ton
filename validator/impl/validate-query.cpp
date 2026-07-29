@@ -6014,8 +6014,16 @@ bool ValidateQuery::CheckAccountTxs::check_one_transaction(block::Account& accou
     auto elapsed = timer.elapsed_both();
     ctx_.work_time.trx_tvm += trs->time_tvm;
     ctx_.work_time.trx_storage_stat += trs->time_storage_stat;
-    ctx_.work_time.trx_other += elapsed - trs->time_tvm - trs->time_storage_stat;
+    ctx_.work_time.trx_other += elapsed - trs->time_tvm - trs->time_tvm_profile - trs->time_storage_stat;
     ctx_.work_time.check_transactions_other -= elapsed;
+    if (trs->tvm_executed) {
+      td::RealCpuTimer profile_timer;
+      ctx_.work_time.tvm_hotpath.record(trs->tvm_code_hash, trs->account.addr, trs->time_tvm, trs->tvm_gas_used,
+                                        trs->gas_used(), trs->tvm_steps);
+      auto profile_elapsed = profile_timer.elapsed_both();
+      ctx_.work_time.trx_tvm_profile += trs->time_tvm_profile + profile_elapsed;
+      ctx_.work_time.check_transactions_other -= profile_elapsed;
+    }
   };
   if (in_msg_root.not_null()) {
     if (!trs->unpack_input_msg(ihr_delivered, &vq_.action_phase_cfg_)) {
@@ -6314,10 +6322,12 @@ void ValidateQuery::save_account_transactions_context(const StdSmcAddress& addre
   }
 
   stats_.work_time.trx_tvm += ctx.work_time.trx_tvm;
+  stats_.work_time.trx_tvm_profile += ctx.work_time.trx_tvm_profile;
   stats_.work_time.trx_storage_stat += ctx.work_time.trx_storage_stat;
   stats_.work_time.trx_other += ctx.work_time.trx_other;
   stats_.work_time.check_transactions_other += ctx.work_time.check_transactions_other;
   stats_.work_time.total += ctx.work_time.total;
+  stats_.work_time.tvm_hotpath.merge(ctx.work_time.tvm_hotpath);
   parallel_total_real_time_ += ctx.work_time.total.real;
 
   total_burned_ += ctx.total_burned;
