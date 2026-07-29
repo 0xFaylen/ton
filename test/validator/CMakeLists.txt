@@ -6,4 +6,5 @@ target_link_libraries(test-tvm-hotpath-stats PRIVATE
     tdutils
     ton_crypto
 )
+target_include_directories(test-tvm-hotpath-stats PRIVATE ${CMAKE_SOURCE_DIR}/validator)
 ton_test(test-tvm-hotpath-stats)

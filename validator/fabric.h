@@ -53,6 +53,7 @@ struct CollateParams {
   std::vector<Ref<ExtMessage>> in_external_messages = {};
   std::vector<Ref<ShardTopBlockDescription>> in_shard_blocks = {};
   td::Bits256 in_rand_seed = td::Bits256::zero();
+  bool exact_tvm_hotpaths = false;
   td::Promise<CollationStats> store_stats_to = {};
 };
 
@@ -72,6 +73,7 @@ struct ValidateParams {
   std::vector<Ref<vm::Cell>> prev_block_state_roots = {};
 
   bool is_replay = false;
+  bool exact_tvm_hotpaths = false;
   td::Promise<ValidationStats> store_stats_to = {};
 };
 

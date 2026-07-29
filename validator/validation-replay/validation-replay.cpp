@@ -14,6 +14,8 @@
     You should have received a copy of the GNU Lesser General Public License
     along with TON Blockchain Library.  If not, see <http://www.gnu.org/licenses/>.
 */
+#include <deque>
+
 #include "ton/ton-io.hpp"
 
 #include "block-auto.h"
@@ -32,10 +34,14 @@ struct RunInfo {
   size_t idx = 0;
   std::string description;
   std::string status;
+  std::optional<TvmHotpathStats> collate_hotpaths;
+  std::optional<TvmHotpathStats> validate_hotpaths;
 };
 
 class ValidationReplayerImpl : public ValidationReplayer {
  public:
+  static constexpr std::size_t max_stored_runs = 16;
+
   ValidationReplayerImpl(td::actor::ActorId<ValidatorManager> manager, Ref<ValidatorManagerOptions> opts)
       : manager_(std::move(manager)), opts_(std::move(opts)) {
   }
@@ -73,9 +79,51 @@ class ValidationReplayerImpl : public ValidationReplayer {
       CO_TRY(check_eoln());
       co_return command_cancel();
     }
+    if (tokens[0] == "forget") {
+      if (eoln()) {
+        co_return td::Status::Error("expected run id");
+      }
+      auto run_idx = CO_TRY(td::to_integer_safe<td::uint64>(CO_TRY(next())));
+      CO_TRY(check_eoln());
+      co_return command_forget(run_idx);
+    }
+    if (tokens[0] == "hotpaths") {
+      if (eoln()) {
+        co_return td::Status::Error("expected run id");
+      }
+      auto run_idx = CO_TRY(td::to_integer_safe<td::uint64>(CO_TRY(next())));
+      std::string source = "validate";
+      bool is_cpu = false;
+      std::size_t offset = 0;
+      std::size_t limit = 100;
+      while (!eoln()) {
+        std::string token = CO_TRY(next());
+        if (token == "--source") {
+          source = CO_TRY(next());
+        } else if (token == "--metric") {
+          auto metric = CO_TRY(next());
+          if (metric == "cpu") {
+            is_cpu = true;
+          } else if (metric != "wall") {
+            co_return td::Status::Error(PSTRING() << "invalid metric " << metric);
+          }
+        } else if (token == "--offset") {
+          offset = CO_TRY(td::to_integer_safe<std::size_t>(CO_TRY(next())));
+        } else if (token == "--limit") {
+          limit = CO_TRY(td::to_integer_safe<std::size_t>(CO_TRY(next())));
+        } else {
+          co_return td::Status::Error(PSTRING() << "unknown flag " << token);
+        }
+      }
+      if (limit == 0 || limit > 1000) {
+        co_return td::Status::Error("limit must be between 1 and 1000");
+      }
+      co_return command_hotpaths(run_idx, source, is_cpu, offset, limit);
+    }
     if (tokens[0] == "run") {
       ReplayMode mode = ReplayMode::validate;
       bool log_work_time = false;
+      bool exact_tvm_hotpaths = false;
       std::vector<std::string> params;
       while (!eoln()) {
         std::string token = CO_TRY(next());
@@ -83,6 +131,8 @@ class ValidationReplayerImpl : public ValidationReplayer {
           mode = CO_TRY(parse_mode(CO_TRY(next())));
         } else if (token == "--log-work-time") {
           log_work_time = true;
+        } else if (token == "--exact-tvm-hotpaths") {
+          exact_tvm_hotpaths = true;
         } else if (token[0] == '-') {
           co_return td::Status::Error(PSTRING() << "unknown flag " << token);
         } else {
@@ -96,12 +146,13 @@ class ValidationReplayerImpl : public ValidationReplayer {
       for (const std::string& s : params) {
         block_ids.push_back(CO_TRY(BlockId::from_str(s)));
       }
-      command_run(std::move(block_ids), mode, log_work_time).start().detach_silent();
+      command_run(std::move(block_ids), mode, log_work_time, exact_tvm_hotpaths).start().detach_silent();
       co_return "Started. `vrp show` to see results.";
     }
     if (tokens[0] == "run-range") {
       ReplayMode mode = ReplayMode::validate;
       bool log_work_time = false;
+      bool exact_tvm_hotpaths = false;
       td::uint32 max_jobs = 1;
       std::optional<WorkchainId> wc;
       std::vector<std::string> params;
@@ -115,6 +166,8 @@ class ValidationReplayerImpl : public ValidationReplayer {
           max_jobs = CO_TRY(td::to_integer_safe<td::uint32>(CO_TRY(next())));
         } else if (token == "--log-work-time") {
           log_work_time = true;
+        } else if (token == "--exact-tvm-hotpaths") {
+          exact_tvm_hotpaths = true;
         } else if (token[0] == '-') {
           co_return td::Status::Error(PSTRING() << "unknown flag " << token);
         } else {
@@ -132,7 +185,13 @@ class ValidationReplayerImpl : public ValidationReplayer {
       if (max_jobs == 0) {
         co_return td::Status::Error("max-jobs is 0");
       }
-      command_run_range(start, end, mode, log_work_time, wc, max_jobs).start().detach_silent();
+      if (max_jobs > 64) {
+        co_return td::Status::Error("max-jobs must not exceed 64");
+      }
+      if (exact_tvm_hotpaths && max_jobs != 1) {
+        co_return td::Status::Error("exact TVM hotpaths require max-jobs 1 for reproducible timing");
+      }
+      command_run_range(start, end, mode, log_work_time, exact_tvm_hotpaths, wc, max_jobs).start().detach_silent();
       co_return "Started. `vrp show` to see results.";
     }
     co_return td::Status::Error("Unknown command " + tokens[0]);
@@ -146,7 +205,7 @@ class ValidationReplayerImpl : public ValidationReplayer {
   td::actor::ActorId<ValidatorManager> manager_;
   Ref<ValidatorManagerOptions> opts_;
 
-  std::vector<RunInfo> past_runs_;
+  std::deque<RunInfo> past_runs_;
   bool busy_ = false;
   RunInfo current_run_;
   std::queue<td::Promise<>> run_queue_;
@@ -157,15 +216,20 @@ class ValidationReplayerImpl : public ValidationReplayer {
     return "Validation replayer - replays collation and validation for old blocks\n"
            "vrp help\tshow help\n"
            "vrp show\tshow runs\n"
+           "vrp forget <run_id>\tforget a completed run and release its retained results\n"
+           "vrp hotpaths <run_id> [--source validate|collate] [--metric wall|cpu] [--offset n] [--limit n]\n"
+           "\treturn a paginated JSON result; limit is 1..1000\n"
            "vrp run [--mode mode] <block_id> ...\tprocess given blocks. Id format: (0,8000000000000000,123456) (no "
            "hashes)\n"
            "\t--mode mode\tcollate/validate/both (default: validate)\n"
            "\t--log-work-time\tshow detailed work time stats\n"
+           "\t--exact-tvm-hotpaths\tretain every executed code hash and exact per-hash account counts\n"
            "vrp run-range [--mode mode] <start> <end>\tprocess all blocks between mc seqnos <start> and <end>\n"
            "\t--mode mode\tcollate/validate/both (default: validate)\n"
            "\t--log-work-time\tshow detailed work time stats\n"
-           "\t--workchain <wc>\tprocess blocks from <wc> - 0 or -1 (default: both)\n"
-           "\t--max-jobs <wc>\tmaximum number of blocks processed in parallel (default: 1)\n"
+           "\t--exact-tvm-hotpaths\tretain every executed code hash and exact per-hash account counts\n"
+           "\t--wc <wc>\tprocess blocks from <wc> - 0 or -1 (default: both)\n"
+           "\t--max-jobs <n>\tmaximum number of blocks processed in parallel, 1..64 (default: 1; exact mode: 1)\n"
            "vrp cancel\tcancel current run\n";
   }
 
@@ -206,7 +270,45 @@ class ValidationReplayerImpl : public ValidationReplayer {
     return "Cancelled";
   }
 
-  td::actor::Task<> command_run(std::vector<BlockId> block_ids, ReplayMode mode, bool log_work_time) {
+  td::Result<std::string> command_forget(td::uint64 run_idx) {
+    for (auto it = past_runs_.begin(); it != past_runs_.end(); ++it) {
+      if (it->idx == run_idx) {
+        past_runs_.erase(it);
+        return PSTRING() << "Forgot run #" << run_idx;
+      }
+    }
+    return td::Status::Error(PSTRING() << "completed run #" << run_idx << " not found");
+  }
+
+  td::Result<std::string> command_hotpaths(td::uint64 run_idx, const std::string& source, bool is_cpu,
+                                           std::size_t offset, std::size_t limit) const {
+    const RunInfo* run = nullptr;
+    for (const auto& candidate : past_runs_) {
+      if (candidate.idx == run_idx) {
+        run = &candidate;
+        break;
+      }
+    }
+    if (run == nullptr) {
+      return td::Status::Error(PSTRING() << "run #" << run_idx << " not found or still active");
+    }
+    const std::optional<TvmHotpathStats>* hotpaths = nullptr;
+    if (source == "validate") {
+      hotpaths = &run->validate_hotpaths;
+    } else if (source == "collate") {
+      hotpaths = &run->collate_hotpaths;
+    } else {
+      return td::Status::Error(PSTRING() << "invalid source " << source);
+    }
+    if (!*hotpaths) {
+      return td::Status::Error(PSTRING() << "run #" << run_idx << " has no " << source << " hotpath data");
+    }
+    return PSTRING() << "{\"run\":" << run_idx << ",\"source\":\"" << source
+                     << "\",\"data\":" << (*hotpaths)->to_json(is_cpu, offset, limit) << "}";
+  }
+
+  td::actor::Task<> command_run(std::vector<BlockId> block_ids, ReplayMode mode, bool log_work_time,
+                                bool exact_tvm_hotpaths) {
     std::string description;
     CHECK(!block_ids.empty());
     if (block_ids.size() == 1) {
@@ -214,8 +316,11 @@ class ValidationReplayerImpl : public ValidationReplayer {
     } else {
       description = PSTRING() << block_ids.size() << " blocks, mode=" << mode_to_str(mode);
     }
+    if (exact_tvm_hotpaths) {
+      description += ", tvm_hotpaths=exact";
+    }
     co_await run_start(description);
-    auto result = co_await command_run_inner(std::move(block_ids), mode, log_work_time).wrap();
+    auto result = co_await command_run_inner(std::move(block_ids), mode, log_work_time, exact_tvm_hotpaths).wrap();
     if (result.is_error()) {
       LOG(ERROR) << "ERROR run #" << current_run_.idx << ": " << result.error();
       current_run_.status = PSTRING() << "ERROR: " << result.error().to_string()
@@ -225,7 +330,8 @@ class ValidationReplayerImpl : public ValidationReplayer {
     co_return {};
   }
 
-  td::actor::Task<> command_run_inner(std::vector<BlockId> block_ids, ReplayMode mode, bool log_work_time) {
+  td::actor::Task<> command_run_inner(std::vector<BlockId> block_ids, ReplayMode mode, bool log_work_time,
+                                      bool exact_tvm_hotpaths) {
     auto cancellation_token = cancellation_.get_cancellation_token();
     ProcessBlockResult total;
     size_t processed_ok = 0;
@@ -233,7 +339,7 @@ class ValidationReplayerImpl : public ValidationReplayer {
       BlockId block_id = block_ids[i];
       auto handle = co_await get_block_by_id(manager_, block_id);
       current_run_.status = "Processing block " + block_id.to_str();
-      auto R = co_await process_block(handle, mode).wrap();
+      auto R = co_await process_block(handle, mode, exact_tvm_hotpaths).wrap();
       if (R.is_ok()) {
         total += R.ok();
         ++processed_ok;
@@ -257,20 +363,31 @@ class ValidationReplayerImpl : public ValidationReplayer {
       current_run_.status = sb.as_cslice().str();
       CO_TRY(cancellation_token.check());
     }
+    if (total.collate) {
+      current_run_.collate_hotpaths = std::move(total.collate->work_time.tvm_hotpath);
+    }
+    if (total.validate) {
+      current_run_.validate_hotpaths = std::move(total.validate->work_time.tvm_hotpath);
+    }
 
     co_return {};
   }
 
   td::actor::Task<> command_run_range(BlockSeqno mc_seqno_start, BlockSeqno mc_seqno_end, ReplayMode mode,
-                                      bool log_work_time, std::optional<WorkchainId> wc, td::uint32 max_jobs) {
+                                      bool log_work_time, bool exact_tvm_hotpaths, std::optional<WorkchainId> wc,
+                                      td::uint32 max_jobs) {
     std::string description = PSTRING() << "MC range " << mc_seqno_start << " to " << mc_seqno_end
                                         << ", mode=" << mode_to_str(mode);
     if (wc) {
       description += PSTRING() << ", wc=" << *wc;
     }
+    if (exact_tvm_hotpaths) {
+      description += ", tvm_hotpaths=exact";
+    }
     co_await run_start(std::move(description));
-    auto result =
-        co_await command_run_range_inner(mc_seqno_start, mc_seqno_end, mode, log_work_time, wc, max_jobs).wrap();
+    auto result = co_await command_run_range_inner(mc_seqno_start, mc_seqno_end, mode, log_work_time,
+                                                   exact_tvm_hotpaths, wc, max_jobs)
+                      .wrap();
     if (result.is_error()) {
       LOG(ERROR) << "ERROR run #" << current_run_.idx << ": " << result.error();
       current_run_.status = PSTRING() << "ERROR: " << result.error().to_string()
@@ -281,7 +398,8 @@ class ValidationReplayerImpl : public ValidationReplayer {
   }
 
   td::actor::Task<> command_run_range_inner(BlockSeqno mc_seqno_start, BlockSeqno mc_seqno_end, ReplayMode mode,
-                                            bool log_work_time, std::optional<WorkchainId> wc, td::uint32 max_jobs) {
+                                            bool log_work_time, bool exact_tvm_hotpaths, std::optional<WorkchainId> wc,
+                                            td::uint32 max_jobs) {
     auto cancellation_token = cancellation_.get_cancellation_token();
     struct State {
       size_t processed_total = 0;
@@ -313,8 +431,9 @@ class ValidationReplayerImpl : public ValidationReplayer {
     };
 
     auto process_block_outer = [](ValidationReplayerImpl* self, size_t run_idx, std::shared_ptr<State> state,
-                                  ReplayMode mode, ConstBlockHandle handle) -> td::actor::Task<> {
-      auto R = co_await self->process_block(handle, mode).wrap();
+                                  ReplayMode mode, bool exact_tvm_hotpaths,
+                                  ConstBlockHandle handle) -> td::actor::Task<> {
+      auto R = co_await self->process_block(handle, mode, exact_tvm_hotpaths).wrap();
       ++state->processed_total;
       if (R.is_ok()) {
         ++state->processed_ok;
@@ -342,7 +461,7 @@ class ValidationReplayerImpl : public ValidationReplayer {
           CHECK(state->running_jobs < max_jobs);
         }
         ++state->running_jobs;
-        process_block_outer(this, current_run_.idx, state, mode, handle).start().detach_silent();
+        process_block_outer(this, current_run_.idx, state, mode, exact_tvm_hotpaths, handle).start().detach_silent();
       }
       update_status();
       CO_TRY(cancellation_token.check());
@@ -358,6 +477,12 @@ class ValidationReplayerImpl : public ValidationReplayer {
       co_await std::move(task);
     }
     update_status();
+    if (state->total.collate) {
+      current_run_.collate_hotpaths = std::move(state->total.collate->work_time.tvm_hotpath);
+    }
+    if (state->total.validate) {
+      current_run_.validate_hotpaths = std::move(state->total.validate->work_time.tvm_hotpath);
+    }
 
     co_return {};
   }
@@ -370,7 +495,10 @@ class ValidationReplayerImpl : public ValidationReplayer {
     }
     CHECK(!busy_);
     busy_ = true;
-    current_run_ = RunInfo{.idx = next_run_idx_++, .description = std::move(desc), .status = "Started"};
+    current_run_ = RunInfo{};
+    current_run_.idx = next_run_idx_++;
+    current_run_.description = std::move(desc);
+    current_run_.status = "Started";
     co_return {};
   }
 
@@ -378,6 +506,9 @@ class ValidationReplayerImpl : public ValidationReplayer {
     CHECK(busy_);
     busy_ = false;
     past_runs_.push_back(std::move(current_run_));
+    if (past_runs_.size() > max_stored_runs) {
+      past_runs_.pop_front();
+    }
     if (!run_queue_.empty()) {
       auto promise = std::move(run_queue_.front());
       run_queue_.pop();
@@ -453,7 +584,7 @@ class ValidationReplayerImpl : public ValidationReplayer {
       return sb.as_cslice().str();
     }
   };
-  td::actor::Task<ProcessBlockResult> process_block(ConstBlockHandle handle, ReplayMode mode) {
+  td::actor::Task<ProcessBlockResult> process_block(ConstBlockHandle handle, ReplayMode mode, bool exact_tvm_hotpaths) {
     Ref<BlockData> block = co_await td::actor::ask(manager_, &ValidatorManager::get_block_data_from_db, handle);
     ProcessBlockResult result;
     result.block_size = (double)block->data().size();
@@ -495,6 +626,7 @@ class ValidationReplayerImpl : public ValidationReplayer {
               .in_external_messages = unpacked.ext_msgs,
               .in_shard_blocks = shard_blocks,
               .in_rand_seed = unpacked.rand_seed,
+              .exact_tvm_hotpaths = exact_tvm_hotpaths,
               .store_stats_to = std::move(stats_promise),
           },
           manager_, {}, std::move(promise));
@@ -536,6 +668,7 @@ class ValidationReplayerImpl : public ValidationReplayer {
                              .prev = unpacked.prev,
                              .validator_set = validator_set,
                              .is_replay = true,
+                             .exact_tvm_hotpaths = exact_tvm_hotpaths,
                              .store_stats_to = std::move(stats_promise),
                          },
                          manager_, td::Timestamp::in(30.0), std::move(promise));

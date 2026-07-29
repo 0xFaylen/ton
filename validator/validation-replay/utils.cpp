@@ -27,14 +27,14 @@ namespace ton::validator {
 std::vector<std::string> tokenize(const std::string& s) {
   std::vector<std::string> tokens;
   for (size_t i = 0; i < s.size();) {
-    while (i < s.size() && std::isspace(s[i])) {
+    while (i < s.size() && std::isspace(static_cast<unsigned char>(s[i]))) {
       ++i;
     }
     if (i == s.size()) {
       break;
     }
     size_t start = i;
-    while (i < s.size() && !std::isspace(s[i])) {
+    while (i < s.size() && !std::isspace(static_cast<unsigned char>(s[i]))) {
       ++i;
     }
     tokens.push_back(s.substr(start, i - start));

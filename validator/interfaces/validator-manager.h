@@ -173,12 +173,17 @@ struct CollationStats {
     TvmHotpathStats tvm_hotpath;
     WorkTimeStats& operator+=(const WorkTimeStats& r) {
       total += r.total;
+      preinit += r.preinit;
       queue_cleanup += r.queue_cleanup;
       prelim_storage_stat += r.prelim_storage_stat;
       trx_tvm += r.trx_tvm;
+      trx_tvm_profile += r.trx_tvm_profile;
       trx_storage_stat += r.trx_storage_stat;
       trx_other += r.trx_other;
       final_storage_stat += r.final_storage_stat;
+      enqueue_new_messages += r.enqueue_new_messages;
+      combine_account_transactions += r.combine_account_transactions;
+      create_shard_state += r.create_shard_state;
       create_block += r.create_block;
       create_collated_data += r.create_collated_data;
       create_block_candidate += r.create_block_candidate;
@@ -188,12 +193,17 @@ struct CollationStats {
 
     WorkTimeStats& operator*=(double r) {
       total *= r;
+      preinit *= r;
       queue_cleanup *= r;
       prelim_storage_stat *= r;
       trx_tvm *= r;
+      trx_tvm_profile *= r;
       trx_storage_stat *= r;
       trx_other *= r;
       final_storage_stat *= r;
+      enqueue_new_messages *= r;
+      combine_account_transactions *= r;
+      create_shard_state *= r;
       create_block *= r;
       create_collated_data *= r;
       create_block_candidate *= r;
@@ -297,11 +307,15 @@ struct ValidationStats {
     TvmHotpathStats tvm_hotpath;
     WorkTimeStats& operator+=(const WorkTimeStats& r) {
       total += r.total;
+      unpack_block_candidate += r.unpack_block_candidate;
+      process_mc_state += r.process_mc_state;
       trx_tvm += r.trx_tvm;
+      trx_tvm_profile += r.trx_tvm_profile;
       trx_storage_stat += r.trx_storage_stat;
       trx_other += r.trx_other;
       unpack_state += r.unpack_state;
       validate_block_tlb += r.validate_block_tlb;
+      unpack_block_data += r.unpack_block_data;
       precheck_account_updates += r.precheck_account_updates;
       precheck_account_transactions += r.precheck_account_transactions;
       precheck_msg_queue += r.precheck_msg_queue;
@@ -319,11 +333,15 @@ struct ValidationStats {
 
     WorkTimeStats& operator*=(double r) {
       total *= r;
+      unpack_block_candidate *= r;
+      process_mc_state *= r;
       trx_tvm *= r;
+      trx_tvm_profile *= r;
       trx_storage_stat *= r;
       trx_other *= r;
       unpack_state *= r;
       validate_block_tlb *= r;
+      unpack_block_data *= r;
       precheck_account_updates *= r;
       precheck_account_transactions *= r;
       precheck_msg_queue *= r;

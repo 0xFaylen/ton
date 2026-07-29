@@ -78,6 +78,9 @@ Collator::Collator(CollateParams params, td::actor::ActorId<ValidatorManager> ma
                     send_closure(manager, &ValidatorManager::add_perf_timer_stat, "collate", duration);
                   })
     , cancellation_token_(std::move(cancellation_token)) {
+  if (params_.exact_tvm_hotpaths) {
+    stats_.work_time.tvm_hotpath.enable_exact();
+  }
   if (params_.collator_opts.is_null()) {
     params_.collator_opts = Ref<CollatorOptions>{true};
   }
@@ -3259,8 +3262,8 @@ bool Collator::create_ticktock_transaction(const ton::StdSmcAddress& smc_addr, t
     stats_.work_time.trx_other += elapsed - trans->time_tvm - trans->time_tvm_profile - trans->time_storage_stat;
     if (trans->tvm_executed) {
       td::RealCpuTimer profile_timer;
-      stats_.work_time.tvm_hotpath.record(trans->tvm_code_hash, trans->account.addr, trans->time_tvm,
-                                          trans->tvm_gas_used, trans->gas_used(), trans->tvm_steps);
+      stats_.work_time.tvm_hotpath.record(trans->tvm_code_hash, trans->account.workchain, trans->account.addr,
+                                          trans->time_tvm, trans->tvm_gas_used, trans->gas_used(), trans->tvm_steps);
       stats_.work_time.trx_tvm_profile += trans->time_tvm_profile + profile_timer.elapsed_both();
     }
   };
@@ -3456,8 +3459,9 @@ td::Result<std::unique_ptr<block::transaction::Transaction>> Collator::impl_crea
         stats->work_time.trx_other += elapsed - trans->time_tvm - trans->time_tvm_profile - trans->time_storage_stat;
         if (trans->tvm_executed) {
           td::RealCpuTimer profile_timer;
-          stats->work_time.tvm_hotpath.record(trans->tvm_code_hash, trans->account.addr, trans->time_tvm,
-                                              trans->tvm_gas_used, trans->gas_used(), trans->tvm_steps);
+          stats->work_time.tvm_hotpath.record(trans->tvm_code_hash, trans->account.workchain, trans->account.addr,
+                                              trans->time_tvm, trans->tvm_gas_used, trans->gas_used(),
+                                              trans->tvm_steps);
           stats->work_time.trx_tvm_profile += trans->time_tvm_profile + profile_timer.elapsed_both();
         }
       }

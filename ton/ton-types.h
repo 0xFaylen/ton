@@ -241,9 +241,10 @@ struct BlockId {
   }
   static td::Result<BlockId> from_str(td::CSlice s) {
     BlockId v;
-    auto r = sscanf(s.begin(), "(%d,%" SCNx64 ",%u)", &v.workchain, &v.shard, &v.seqno);
-    if (r < 3) {
-      return td::Status::Error("failed to parse block id");
+    int consumed = -1;
+    auto r = sscanf(s.begin(), "(%d,%" SCNx64 ",%u)%n", &v.workchain, &v.shard, &v.seqno, &consumed);
+    if (r != 3 || consumed < 0 || static_cast<std::size_t>(consumed) != s.size() || !v.is_valid_full()) {
+      return td::Status::Error(PSTRING() << "invalid block id " << s);
     }
     return v;
   }

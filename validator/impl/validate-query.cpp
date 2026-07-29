@@ -107,6 +107,9 @@ ValidateQuery::ValidateQuery(BlockCandidate candidate, ValidateParams params,
                   })
     , store_stats_to_(std::move(params.store_stats_to)) {
   CHECK(main_promise);
+  if (params.exact_tvm_hotpaths) {
+    stats_.work_time.tvm_hotpath.enable_exact();
+  }
 }
 
 /**
@@ -6021,8 +6024,8 @@ bool ValidateQuery::CheckAccountTxs::check_one_transaction(block::Account& accou
     ctx_.work_time.check_transactions_other -= elapsed;
     if (trs->tvm_executed) {
       td::RealCpuTimer profile_timer;
-      ctx_.work_time.tvm_hotpath.record(trs->tvm_code_hash, trs->account.addr, trs->time_tvm, trs->tvm_gas_used,
-                                        trs->gas_used(), trs->tvm_steps);
+      ctx_.work_time.tvm_hotpath.record(trs->tvm_code_hash, trs->account.workchain, trs->account.addr, trs->time_tvm,
+                                        trs->tvm_gas_used, trs->gas_used(), trs->tvm_steps);
       auto profile_elapsed = profile_timer.elapsed_both();
       ctx_.work_time.trx_tvm_profile += trs->time_tvm_profile + profile_elapsed;
       ctx_.work_time.check_transactions_other -= profile_elapsed;
@@ -6281,6 +6284,9 @@ bool ValidateQuery::CheckAccountTxs::fatal_error(std::string err_msg, int err_co
 ValidateQuery::CheckAccountTxs::Context ValidateQuery::load_check_account_transactions_context(
     const StdSmcAddress& address) {
   CheckAccountTxs::Context ctx{};
+  if (stats_.work_time.tvm_hotpath.is_exact()) {
+    ctx.work_time.tvm_hotpath.enable_exact();
+  }
   if (!accounts_with_dispatch_queue_diff_.contains(address) && ps_.dispatch_queue_->lookup(address).not_null()) {
     account_expected_defer_all_messages_.insert(address);
   }
