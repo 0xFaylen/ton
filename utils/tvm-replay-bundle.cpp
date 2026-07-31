@@ -627,6 +627,7 @@ td::Result<ReplayResult> replay_transactions(const BlockContext& target, const L
 
   ReplayResult result;
   td::Status replay_status = td::Status::OK();
+  std::set<td::Bits256> missing_libraries;
   bool accounts_ok = account_blocks.check_for_each_extra([&](Ref<vm::CellSlice> account_block_slice, Ref<vm::CellSlice>,
                                                              td::ConstBitPtr key, int key_len) {
     if (key_len != 256) {
@@ -694,6 +695,7 @@ td::Result<ReplayResult> replay_transactions(const BlockContext& target, const L
 
     vm::AugmentedDictionary transactions{vm::DictNonEmpty(), std::move(account_block.transactions), 64,
                                          block::tlb::aug_AccountTransactions};
+    bool account_missing_libraries = false;
     bool transactions_ok = transactions.check_for_each_extra(
         [&](Ref<vm::CellSlice> transaction_slice, Ref<vm::CellSlice>, td::ConstBitPtr tx_key, int tx_key_len) {
           if (tx_key_len != 64) {
@@ -716,13 +718,11 @@ td::Result<ReplayResult> replay_transactions(const BlockContext& target, const L
             for (const auto& hash : required.ok()) {
               if (library_bodies == nullptr || library_bodies->hashes.count(hash) == 0) {
                 missing.insert(hash);
+                missing_libraries.insert(hash);
               }
             }
             if (!missing.empty()) {
-              replay_status =
-                  td::Status::Error(PSTRING() << "transaction " << tx_key.get_uint(64) << " of " << address.to_hex()
-                                              << " requires public library bodies absent from --library-bodies: "
-                                              << join_library_hashes(missing));
+              account_missing_libraries = true;
               return false;
             }
           }
@@ -742,6 +742,9 @@ td::Result<ReplayResult> replay_transactions(const BlockContext& target, const L
           account = std::move(emulated.account);
           return true;
         });
+    if (!transactions_ok && account_missing_libraries) {
+      return true;
+    }
     if (!transactions_ok && replay_status.is_ok()) {
       replay_status = td::Status::Error(PSTRING() << "invalid transaction dictionary for " << address.to_hex());
     }
@@ -752,6 +755,10 @@ td::Result<ReplayResult> replay_transactions(const BlockContext& target, const L
     replay_status = td::Status::Error("invalid account-block dictionary");
   }
   TRY_STATUS(std::move(replay_status));
+  if (!missing_libraries.empty()) {
+    return td::Status::Error(PSTRING() << "replay requires public library bodies absent from --library-bodies: "
+                                       << join_library_hashes(missing_libraries));
+  }
   return result;
 }
 
