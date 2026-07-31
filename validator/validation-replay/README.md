@@ -41,6 +41,25 @@ top-account concentration, and the ten most active workchain-and-address pairs
 for each returned code hash. Ed25519 timing is enabled only by exact offline
 replay; normal collation and validation do not start the inner crypto timer.
 
+For a full-wall PSAE shadow projection, replay collation on a dedicated copied
+validator database:
+
+```text
+vrp run --mode collate --exact-tvm-hotpaths '(0,8000000000000000,SEQNO)'
+vrp hotpaths <run_id> --source collate --metric wall --offset 0 --limit 100
+```
+
+The response then includes `account_lane_ceiling`. It measures successful
+ordinary-transaction creation by destination account and models the full outer
+collation wall as unchanged serial residue plus a greedy 1/2/4/8/16-worker
+account critical path. The projection excludes worker contention and receipt
+merge overhead; it is not a measured parallel speedup. This first ceiling
+includes inbound, external, and newly generated ordinary transactions, so it
+describes the P4 end state and must not be reported as a P2 inbound-only result.
+Bounded online mode retains no per-account timing map. Do not run this profiling
+mode on a validator participating in consensus or on a latency-sensitive
+production node.
+
 Collection work is timed separately as `trx_tvm_profile`; it is not included in
 the per-code `time_tvm` values. Exact maps can make the replay itself slower,
 but do not inflate the measured TVM execution time.

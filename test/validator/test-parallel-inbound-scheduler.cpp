@@ -185,5 +185,22 @@ TEST(ParallelInboundScheduler, ReportsOnlyAnIdealOfflineAccountLaneCeiling) {
   ASSERT_EQ(estimate_account_lane_ceiling({}, 8).ideal_speedup(), 1.0);
 }
 
+TEST(ParallelInboundScheduler, ProjectsOnlyMeasuredAccountWorkOutOfTheFullWallPath) {
+  const std::vector<double> account_work{0.3, 0.2, 0.1};
+  const auto one = estimate_full_path_ceiling(1.0, account_work, 1);
+  const auto two = estimate_full_path_ceiling(1.0, account_work, 2);
+  ASSERT_TRUE(one.measurement_consistent);
+  ASSERT_TRUE(std::abs(one.serial_residue - 0.4) < 1e-12);
+  ASSERT_TRUE(std::abs(one.projected_critical_path - 1.0) < 1e-12);
+  ASSERT_TRUE(std::abs(one.ideal_speedup() - 1.0) < 1e-12);
+  ASSERT_TRUE(std::abs(two.account_critical_path - 0.3) < 1e-12);
+  ASSERT_TRUE(std::abs(two.projected_critical_path - 0.7) < 1e-12);
+  ASSERT_TRUE(std::abs(two.ideal_speedup() - (1.0 / 0.7)) < 1e-12);
+
+  const auto inconsistent = estimate_full_path_ceiling(0.5, account_work, 2);
+  ASSERT_TRUE(!inconsistent.measurement_consistent);
+  ASSERT_EQ(inconsistent.serial_residue, 0.0);
+}
+
 }  // namespace
 }  // namespace ton::validator::parallel_inbound::test

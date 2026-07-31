@@ -3451,6 +3451,7 @@ td::Result<std::unique_ptr<block::transaction::Transaction>> Collator::impl_crea
 
   std::unique_ptr<block::transaction::Transaction> trans = std::make_unique<block::transaction::Transaction>(
       *acc, block::transaction::Transaction::tr_ord, trans_min_lt + 1, utime, msg_root);
+  bool transaction_ready = false;
   {
     td::RealCpuTimer timer;
     SCOPE_EXIT {
@@ -3465,6 +3466,9 @@ td::Result<std::unique_ptr<block::transaction::Transaction>> Collator::impl_crea
                                               trans->time_tvm, trans->tvm_gas_used, trans->gas_used(), trans->tvm_steps,
                                               trans->tvm_ed25519_verifications, trans->time_tvm_ed25519);
           stats->work_time.trx_tvm_profile += trans->time_tvm_profile + profile_timer.elapsed_both();
+        }
+        if (transaction_ready) {
+          stats->work_time.tvm_hotpath.record_account_work(trans->account.workchain, trans->account.addr, elapsed);
         }
       }
     };
@@ -3526,6 +3530,7 @@ td::Result<std::unique_ptr<block::transaction::Transaction>> Collator::impl_crea
     if (!trans->serialize(*serialize_cfg)) {
       return td::Status::Error(-669, "cannot serialize new transaction for smart contract "s + acc->addr.to_hex());
     }
+    transaction_ready = true;
   }
   return std::move(trans);
 }

@@ -90,6 +90,19 @@ struct LaneCeiling {
   }
 };
 
+struct FullPathCeiling {
+  double full_serial_work{0.0};
+  double account_serial_work{0.0};
+  double serial_residue{0.0};
+  double account_critical_path{0.0};
+  double projected_critical_path{0.0};
+  bool measurement_consistent{true};
+
+  double ideal_speedup() const {
+    return projected_critical_path > 0.0 ? full_serial_work / projected_critical_path : 1.0;
+  }
+};
+
 // Greedy longest-processing-time placement is used only as an offline ceiling
 // estimate from measured per-account work. It is not a live scheduling policy
 // and excludes merge, proof, storage, and worker-contention overhead.
@@ -106,6 +119,23 @@ inline LaneCeiling estimate_account_lane_ceiling(std::vector<double> account_wor
     *lane += work;
   }
   result.critical_path = *std::max_element(lanes.begin(), lanes.end());
+  return result;
+}
+
+// Amdahl-style shadow projection over a measured full wall path. Only the
+// measured account-local portion is replaced by its ideal lane critical path;
+// all remaining wall time stays serial. Worker and receipt-merge overhead are
+// intentionally absent and must be measured by the next gate.
+inline FullPathCeiling estimate_full_path_ceiling(double full_serial_work, std::vector<double> account_work,
+                                                  std::size_t worker_count) {
+  const auto accounts = estimate_account_lane_ceiling(std::move(account_work), worker_count);
+  FullPathCeiling result;
+  result.full_serial_work = full_serial_work;
+  result.account_serial_work = accounts.serial_work;
+  result.measurement_consistent = accounts.serial_work <= full_serial_work + 1e-9;
+  result.serial_residue = std::max(0.0, full_serial_work - accounts.serial_work);
+  result.account_critical_path = accounts.critical_path;
+  result.projected_critical_path = result.serial_residue + accounts.critical_path;
   return result;
 }
 

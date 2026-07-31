@@ -126,28 +126,43 @@ Gas складывается просто, но bytes/proofs не являютс
 
 ## Этапы реализации
 
-### P0. Исполняемые инварианты — начато
+### P0. Исполняемые инварианты — выполнено
 
 - чистая deterministic lane plan;
 - prefix-only commit;
 - hole/failure/limit tests;
 - никаких изменений live path.
 
-Gate: все model tests проходят при разных completion permutations.
+Gate: 11 model tests проходят, включая промежуточные completion permutations,
+worker/commit failure, limit boundary, account affinity и full-wall projection.
 
-### P1. Shadow planner
+### P1. Shadow full-wall planner — инструментация готова, corpus run ожидается
 
-В offline replay serial collator продолжает строить настоящий block. Параллельно
-PSAE только строит план и пишет:
+В offline replay serial collator продолжает строить настоящий block. В режиме
+`--exact-tvm-hotpaths` успешная ordinary transaction записывает полный
+account-local creation wall (`TVM + storage/action/serialization`), но не меняет
+исполнение. Outer timer `ValidationReplayer` даёт полный collation wall. JSON
+`vrp hotpaths ... --source collate --metric wall` для 1/2/4/8/16 workers считает:
 
-- число messages и distinct destination accounts;
-- длины account lanes;
-- теоретический critical path `max(sum lane work)`;
-- frontier stalls и speculative waste;
-- долю transit/deferred/external work;
-- оценку 1/2/4/8/16 workers из измеренного per-transaction wall time.
+- `account_serial_seconds` и число destination accounts;
+- теоретический account critical path через greedy LPT;
+- неизменяемый serial residue `full_collation_wall - account_serial`;
+- `projected_full_ideal_speedup = full_wall / (serial_residue + account_critical_path)`;
+- флаг несогласованного измерения, если вложенные account timers неожиданно
+  превышают outer wall.
+
+Первая метрика объединяет inbound, external и newly generated ordinary
+transactions. Поэтому это потолок полной архитектуры после P4, а не результат
+ограниченного P2. До P2 gate статистика должна получить phase split.
+
+Default online mode не хранит per-account timing map. Профилирование запускается
+только на отдельной копии validator DB, не на нашей production/mainnet ноде.
+Ещё не измерены canonical frontier stalls, speculative waste и доля transit;
+они остаются следующей частью P1, а не выдаются за готовый результат.
 
 Gate: shadow не меняет ни один root; overhead не более 2% на Linux replay.
+Текущий код компилируется и покрыт unit tests, но этот gate ещё не пройден без
+полного скопированного validator DB corpus.
 
 ### P2. Parallel execute, serial commit
 

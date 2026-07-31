@@ -89,6 +89,15 @@ The Release build was not used because its existing CMake environment currently
 fails to find `absl/hash/hash.h`; that build problem is independent of replay
 equivalence and must be fixed before performance publication.
 
+The next shadow instrumentation is now implemented but not yet measured. Exact
+offline collation records only successful ordinary-transaction creation wall by
+destination account; the ValidationReplayer output combines that with its outer
+collation wall and reports `serial residue + greedy account critical path` for
+1/2/4/8/16 workers. Default online collection remains bounded and stores no
+per-account work map. A full run requires a copied validator database with the
+historical queues/states; the latency-sensitive live node is explicitly out of
+scope.
+
 ## Dead ends and cautions
 
 - Search results did not expose a public TON trace JIT or public intra-block

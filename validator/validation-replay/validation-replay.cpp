@@ -16,6 +16,7 @@
 */
 #include <deque>
 
+#include "impl/parallel-inbound-scheduler.h"
 #include "ton/ton-io.hpp"
 
 #include "block-auto.h"
@@ -30,12 +31,77 @@ namespace ton::validator {
 
 namespace {
 
+std::string account_lane_ceiling_json(const TvmHotpathStats& stats, bool is_cpu,
+                                      std::optional<double> full_collation_wall) {
+  td::StringBuilder out;
+  if (!stats.is_exact()) {
+    out << "{\"available\":false,\"reason\":\"exact_replay_required\"}";
+    return out.as_cslice().str();
+  }
+  if (!stats.account_work_complete()) {
+    out << "{\"available\":false,\"reason\":\"account_work_incomplete\"}";
+    return out.as_cslice().str();
+  }
+  const auto entries = stats.account_work_entries();
+  if (entries.empty()) {
+    out << "{\"available\":false,\"reason\":\"no_successful_ordinary_transactions\"}";
+    return out.as_cslice().str();
+  }
+
+  std::vector<double> account_work;
+  account_work.reserve(entries.size());
+  double total_account_work = 0.0;
+  double max_account_work = 0.0;
+  for (const auto& entry : entries) {
+    const auto work = entry.observed_time.get(is_cpu);
+    account_work.push_back(work);
+    total_account_work += work;
+    max_account_work = std::max(max_account_work, work);
+  }
+
+  out << "{\"available\":true,\"scope\":\"all_successful_ordinary_transaction_creation\",\"metric\":\""
+      << (is_cpu ? "cpu" : "wall") << "\",\"method\":\"greedy_lpt_account_totals\""
+      << ",\"distinct_accounts\":" << entries.size() << ",\"account_serial_seconds\":" << total_account_work
+      << ",\"max_account_share\":" << (total_account_work > 0.0 ? max_account_work / total_account_work : 0.0)
+      << ",\"full_collation_wall_seconds\":";
+  if (full_collation_wall) {
+    out << *full_collation_wall;
+  } else {
+    out << "null";
+  }
+  out << ",\"workers\":[";
+  bool first_worker = true;
+  for (std::size_t workers : {std::size_t{1}, std::size_t{2}, std::size_t{4}, std::size_t{8}, std::size_t{16}}) {
+    if (!first_worker) {
+      out << ",";
+    }
+    first_worker = false;
+    const auto lane = parallel_inbound::estimate_account_lane_ceiling(account_work, workers);
+    out << "{\"workers\":" << workers << ",\"account_critical_path_seconds\":" << lane.critical_path
+        << ",\"account_ideal_speedup\":" << lane.ideal_speedup();
+    if (full_collation_wall) {
+      const auto full = parallel_inbound::estimate_full_path_ceiling(*full_collation_wall, account_work, workers);
+      out << ",\"measurement_consistent\":" << full.measurement_consistent
+          << ",\"serial_residue_seconds\":" << full.serial_residue
+          << ",\"projected_full_critical_path_seconds\":" << full.projected_critical_path
+          << ",\"projected_full_ideal_speedup\":" << full.ideal_speedup();
+    } else {
+      out << ",\"measurement_consistent\":null,\"serial_residue_seconds\":null"
+             ",\"projected_full_critical_path_seconds\":null,\"projected_full_ideal_speedup\":null";
+    }
+    out << "}";
+  }
+  out << "],\"excludes\":[\"worker_contention\",\"receipt_merge_overhead\"]}";
+  return out.as_cslice().str();
+}
+
 struct RunInfo {
   size_t idx = 0;
   std::string description;
   std::string status;
   std::optional<TvmHotpathStats> collate_hotpaths;
   std::optional<TvmHotpathStats> validate_hotpaths;
+  std::optional<double> collate_wall_seconds;
 };
 
 class ValidationReplayerImpl : public ValidationReplayer {
@@ -303,8 +369,10 @@ class ValidationReplayerImpl : public ValidationReplayer {
     if (!*hotpaths) {
       return td::Status::Error(PSTRING() << "run #" << run_idx << " has no " << source << " hotpath data");
     }
+    const auto full_collation_wall = source == "collate" && !is_cpu ? run->collate_wall_seconds : std::nullopt;
     return PSTRING() << "{\"run\":" << run_idx << ",\"source\":\"" << source
-                     << "\",\"data\":" << (*hotpaths)->to_json(is_cpu, offset, limit) << "}";
+                     << "\",\"data\":" << (*hotpaths)->to_json(is_cpu, offset, limit) << ",\"account_lane_ceiling\":"
+                     << account_lane_ceiling_json(**hotpaths, is_cpu, full_collation_wall) << "}";
   }
 
   td::actor::Task<> command_run(std::vector<BlockId> block_ids, ReplayMode mode, bool log_work_time,
@@ -364,6 +432,7 @@ class ValidationReplayerImpl : public ValidationReplayer {
       CO_TRY(cancellation_token.check());
     }
     if (total.collate) {
+      current_run_.collate_wall_seconds = total.collate->time;
       current_run_.collate_hotpaths = std::move(total.collate->work_time.tvm_hotpath);
     }
     if (total.validate) {
@@ -478,6 +547,7 @@ class ValidationReplayerImpl : public ValidationReplayer {
     }
     update_status();
     if (state->total.collate) {
+      current_run_.collate_wall_seconds = state->total.collate->time;
       current_run_.collate_hotpaths = std::move(state->total.collate->work_time.tvm_hotpath);
     }
     if (state->total.validate) {

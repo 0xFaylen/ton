@@ -57,6 +57,12 @@ class TvmHotpathStats {
     td::uint64 error = 0;
   };
 
+  struct AccountWorkEntry {
+    AccountId account;
+    td::uint64 executions = 0;
+    td::RealCpuTimer::Time observed_time;
+  };
+
   struct Entry {
     td::Bits256 code_hash = td::Bits256::zero();
     td::RealCpuTimer::Time observed_time;
@@ -272,6 +278,20 @@ class TvmHotpathStats {
     add_entry(std::move(entry));
   }
 
+  // Exact replay only: records the account-local portion that can move to a
+  // PSAE worker. The default bounded online hotpath sketch deliberately keeps
+  // no per-account timing map and therefore pays no cardinality cost.
+  void record_account_work(WorkchainId workchain, const StdSmcAddress& account, td::RealCpuTimer::Time time) {
+    if (!exact_) {
+      return;
+    }
+    AccountId id{workchain, account};
+    auto& entry = exact_account_work_[id];
+    entry.account = id;
+    ++entry.executions;
+    entry.observed_time += time;
+  }
+
   void merge(const TvmHotpathStats& other) {
     total_executions_ += other.total_executions_;
     total_time_ += other.total_time_;
@@ -282,6 +302,19 @@ class TvmHotpathStats {
     total_ed25519_time_ += other.total_ed25519_time_;
     replacements_ += other.replacements_;
     exact_complete_ = exact_complete_ && (!exact_ || (other.exact_ && other.exact_complete_));
+    if (exact_) {
+      if (other.exact_) {
+        for (const auto& [account, incoming] : other.exact_account_work_) {
+          auto& entry = exact_account_work_[account];
+          entry.account = account;
+          entry.executions += incoming.executions;
+          entry.observed_time += incoming.observed_time;
+        }
+        account_work_complete_ = account_work_complete_ && other.account_work_complete_;
+      } else {
+        account_work_complete_ = false;
+      }
+    }
     for (const auto& entry : other.entries_) {
       add_entry(entry);
     }
@@ -313,6 +346,10 @@ class TvmHotpathStats {
       for (auto& [_, executions] : entry.exact_account_executions) {
         executions = scale_u64(executions, factor);
       }
+    }
+    for (auto& [_, entry] : exact_account_work_) {
+      entry.executions = scale_u64(entry.executions, factor);
+      entry.observed_time *= factor;
     }
   }
 
@@ -446,6 +483,19 @@ class TvmHotpathStats {
     return total_time_;
   }
 
+  bool account_work_complete() const {
+    return exact_ && exact_complete_ && account_work_complete_;
+  }
+
+  std::vector<AccountWorkEntry> account_work_entries() const {
+    std::vector<AccountWorkEntry> result;
+    result.reserve(exact_account_work_.size());
+    for (const auto& [_, entry] : exact_account_work_) {
+      result.push_back(entry);
+    }
+    return result;
+  }
+
  private:
   static td::uint64 scale_u64(td::uint64 value, double factor) {
     return static_cast<td::uint64>(std::llround(static_cast<double>(value) * factor));
@@ -518,8 +568,10 @@ class TvmHotpathStats {
   std::size_t capacity_;
   std::vector<Entry> entries_;
   std::map<td::Bits256, std::size_t> exact_entry_index_;
+  std::map<AccountId, AccountWorkEntry> exact_account_work_;
   bool exact_ = false;
   bool exact_complete_ = true;
+  bool account_work_complete_ = true;
   td::uint64 replacements_ = 0;
   td::uint64 total_executions_ = 0;
   td::RealCpuTimer::Time total_time_;
