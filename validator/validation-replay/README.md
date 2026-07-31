@@ -1,5 +1,11 @@
 # Validation replay
 
+The large single-shard execution track is documented in
+[`PARALLEL_SINGLE_SHARD_EXECUTOR.ru.md`](PARALLEL_SINGLE_SHARD_EXECUTOR.ru.md).
+Its first artifact is a pure prefix-safe account-lane scheduler with regression
+tests. It is not wired into the live collator yet. The bounded source review is
+kept in [`PARALLEL_EXECUTION_RESEARCH.md`](PARALLEL_EXECUTION_RESEARCH.md).
+
 `ValidationReplayer` reruns collation, validation, or both against blocks and
 states already present in a C++ validator database. It is intended for
 measurement on a dedicated replay node, not for use in the consensus path of a
@@ -83,6 +89,13 @@ skipped accounts; it must not be presented as a full-block result.
 verification to every code-hash entry. It does not bypass signature checking or
 change gas accounting. The replay still requires exact transaction and
 resulting account-state hashes.
+
+The replay JSON also contains `account_lane_ceiling`. It groups measured
+transaction and TVM wall time by account and reports greedy ideal makespans for
+1/2/4/8/16 workers. This is an execution-only ceiling: it excludes worker
+contention, serial commit, block limits, cell-proof/state merge, network, and
+consensus. It must not be reported as a TPS prediction or a measured parallel
+speedup.
 
 The shard archive anchors the predecessor state through the intervening block
 chain. The masterchain archive anchors the configuration state by requiring its

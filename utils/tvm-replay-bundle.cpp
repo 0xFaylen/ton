@@ -26,9 +26,11 @@
 
 #include <cstdlib>
 #include <iostream>
+#include <map>
 #include <memory>
 #include <set>
 #include <string>
+#include <vector>
 
 #include "auto/tl/lite_api.hpp"
 #include "block/block-auto.h"
@@ -45,6 +47,7 @@
 #include "ton/lite-tl.hpp"
 #include "validator/db/fileref.hpp"
 #include "validator/db/package.hpp"
+#include "validator/impl/parallel-inbound-scheduler.h"
 #include "validator/interfaces/tvm-hotpath-stats.h"
 #include "vm/boc.h"
 #include "vm/cells/DataCell.h"
@@ -106,12 +109,19 @@ struct LoadedLibraryBodies {
 };
 
 struct ReplayResult {
+  struct AccountWork {
+    std::size_t transactions = 0;
+    double transaction_seconds = 0.0;
+    double tvm_seconds = 0.0;
+  };
+
   std::size_t target_accounts = 0;
   std::size_t accounts = 0;
   std::size_t skipped_accounts = 0;
   std::size_t transactions = 0;
   std::size_t tvm_transactions = 0;
   TvmHotpathStats hotpaths;
+  std::map<StdSmcAddress, AccountWork> account_work;
 
   ReplayResult() {
     hotpaths.enable_exact();
@@ -735,8 +745,12 @@ td::Result<ReplayResult> replay_transactions(const BlockContext& target, const L
           }
           auto emulated = emulation.move_as_ok();
           ++result.transactions;
+          auto& account_work = result.account_work[address];
+          ++account_work.transactions;
+          account_work.transaction_seconds += emulated.elapsed_time;
           if (emulated.vm.executed) {
             ++result.tvm_transactions;
+            account_work.tvm_seconds += emulated.vm.time.real;
             result.hotpaths.record(emulated.vm.code_hash, target.id.id.workchain, address, emulated.vm.time,
                                    emulated.vm.vm_gas_used, emulated.vm.billed_gas_used, emulated.vm.vm_steps,
                                    emulated.vm.ed25519_verifications, emulated.vm.ed25519_time);
@@ -810,6 +824,45 @@ std::string inspect_state_json(const LoadedState& state) {
   return out.as_cslice().str();
 }
 
+std::string account_lane_ceiling_json(const ReplayResult& replay) {
+  std::vector<double> transaction_work;
+  std::vector<double> tvm_work;
+  transaction_work.reserve(replay.account_work.size());
+  tvm_work.reserve(replay.account_work.size());
+  double max_transaction_work = 0.0;
+  double total_transaction_work = 0.0;
+  for (const auto& [_, work] : replay.account_work) {
+    transaction_work.push_back(work.transaction_seconds);
+    tvm_work.push_back(work.tvm_seconds);
+    max_transaction_work = std::max(max_transaction_work, work.transaction_seconds);
+    total_transaction_work += work.transaction_seconds;
+  }
+
+  td::StringBuilder out;
+  out << "{\"scope\":\"transaction_replay_only\",\"method\":\"greedy_lpt_account_totals\""
+      << ",\"distinct_accounts\":" << replay.account_work.size() << ",\"max_account_transaction_share\":"
+      << (total_transaction_work > 0.0 ? max_transaction_work / total_transaction_work : 0.0) << ",\"workers\":[";
+  bool first_worker = true;
+  for (std::size_t workers : {std::size_t{1}, std::size_t{2}, std::size_t{4}, std::size_t{8}, std::size_t{16}}) {
+    if (!first_worker) {
+      out << ",";
+    }
+    first_worker = false;
+    const auto transaction_ceiling =
+        ton::validator::parallel_inbound::estimate_account_lane_ceiling(transaction_work, workers);
+    const auto tvm_ceiling = ton::validator::parallel_inbound::estimate_account_lane_ceiling(tvm_work, workers);
+    out << "{\"workers\":" << workers << ",\"transaction_serial_seconds\":" << transaction_ceiling.serial_work
+        << ",\"transaction_critical_path_seconds\":" << transaction_ceiling.critical_path
+        << ",\"transaction_ideal_speedup\":" << transaction_ceiling.ideal_speedup()
+        << ",\"tvm_serial_seconds\":" << tvm_ceiling.serial_work
+        << ",\"tvm_critical_path_seconds\":" << tvm_ceiling.critical_path
+        << ",\"tvm_ideal_speedup\":" << tvm_ceiling.ideal_speedup() << "}";
+  }
+  out << "],\"excludes\":[\"worker_contention\",\"serial_commit\",\"block_limits\",\"cell_proof_merge\","
+         "\"state_merge\",\"network\",\"consensus\"]}";
+  return out.as_cslice().str();
+}
+
 std::string replay_json(const BlockContext& target, const LoadedState* account_state,
                         const std::vector<LoadedAccountProof>& account_proofs, const LoadedState& mc_state,
                         const LoadedLibraryBodies* library_bodies, const ReplayResult& replay, bool profile_ed25519) {
@@ -853,7 +906,7 @@ std::string replay_json(const BlockContext& target, const LoadedState* account_s
   out << ",\"hotpaths_cpu\":" << replay.hotpaths.to_json(true, 0, replay.hotpaths.size())
       << ",\"cpu_metric_status\":\"available\"";
 #endif
-  out << "}";
+  out << ",\"account_lane_ceiling\":" << account_lane_ceiling_json(replay) << "}";
   return out.as_cslice().str();
 }
 
