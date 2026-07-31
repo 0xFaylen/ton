@@ -21,6 +21,7 @@
 #include "common/refcnt.hpp"
 #include "td/utils/HashMap.h"
 #include "td/utils/HashSet.h"
+#include "td/utils/Timer.h"
 #include "td/utils/optional.h"
 #include "vm/cellslice.h"
 #include "vm/continuation.h"
@@ -108,6 +109,9 @@ class VmState final : public VmStateInterface {
   size_t chksgn_counter = 0;
   size_t get_extra_balance_counter = 0;
   long long free_gas_consumed = 0;
+  bool profile_ed25519 = false;
+  td::uint64 ed25519_verifications = 0;
+  td::RealCpuTimer::Time time_ed25519;
   std::unique_ptr<ParentVmState> parent = nullptr;
 
  public:
@@ -411,6 +415,22 @@ class VmState final : public VmStateInterface {
   }
   bool get_chksig_always_succeed() const {
     return chksig_always_succeed;
+  }
+  void set_profile_ed25519(bool flag) {
+    profile_ed25519 = flag;
+  }
+  bool get_profile_ed25519() const {
+    return profile_ed25519;
+  }
+  void record_ed25519_verification(td::RealCpuTimer::Time time) {
+    ++ed25519_verifications;
+    time_ed25519 += time;
+  }
+  td::uint64 get_ed25519_verifications() const {
+    return ed25519_verifications;
+  }
+  td::RealCpuTimer::Time get_ed25519_time() const {
+    return time_ed25519;
   }
   void set_stop_on_accept_message(bool flag) {
     stop_on_accept_message = flag;

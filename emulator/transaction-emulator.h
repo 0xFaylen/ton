@@ -16,6 +16,7 @@ class TransactionEmulator {
   ton::LogicalTime lt_;
   td::BitArray<256> rand_seed_;
   bool ignore_chksig_;
+  bool profile_ed25519_;
   bool debug_enabled_;
   td::Ref<vm::Tuple> prev_blocks_info_;
 
@@ -28,6 +29,7 @@ class TransactionEmulator {
       , lt_(0)
       , rand_seed_(td::BitArray<256>::zero())
       , ignore_chksig_(false)
+      , profile_ed25519_(false)
       , debug_enabled_(false) {
   }
 
@@ -48,6 +50,8 @@ class TransactionEmulator {
       td::uint64 vm_gas_used = 0;
       td::uint64 billed_gas_used = 0;
       td::uint64 vm_steps = 0;
+      td::uint64 ed25519_verifications = 0;
+      td::RealCpuTimer::Time ed25519_time;
     };
 
     td::Ref<vm::Cell> transaction;
@@ -98,6 +102,7 @@ class TransactionEmulator {
   void set_lt(ton::LogicalTime lt);
   void set_rand_seed(td::BitArray<256>& rand_seed);
   void set_ignore_chksig(bool ignore_chksig);
+  void set_profile_ed25519(bool profile_ed25519);
   void set_config(std::shared_ptr<block::Config> config);
   void set_libs(vm::Dictionary&& libs);
   void set_debug_enabled(bool debug_enabled);

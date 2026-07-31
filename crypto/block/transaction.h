@@ -122,6 +122,7 @@ struct ComputePhaseConfig {
   Ref<vm::Cell> global_config;
   td::BitArray<256> block_rand_seed;
   bool ignore_chksig{false};
+  bool profile_ed25519{false};
   bool with_vm_log{false};
   td::uint16 max_vm_data_depth = 512;
   int global_version = 0;
@@ -416,7 +417,8 @@ struct Transaction {
   td::Bits256 tvm_code_hash = td::Bits256::zero();
   td::uint64 tvm_gas_used{0};
   td::uint64 tvm_steps{0};
-  td::RealCpuTimer::Time time_tvm, time_tvm_profile, time_storage_stat;
+  td::uint64 tvm_ed25519_verifications{0};
+  td::RealCpuTimer::Time time_tvm, time_tvm_profile, time_tvm_ed25519, time_storage_stat;
   Transaction(const Account& _account, int ttype, ton::LogicalTime req_start_lt, ton::UnixTime _now,
               Ref<vm::Cell> _inmsg = {});
   bool unpack_input_msg(bool ihr_delivered, const ActionPhaseConfig* cfg);

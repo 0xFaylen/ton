@@ -1990,6 +1990,7 @@ bool Transaction::prepare_compute_phase(const ComputePhaseConfig& cfg) {
   vm.set_max_data_depth(cfg.max_vm_data_depth);
   vm.set_c7(prepare_vm_c7(cfg));  // tuple with SmartContractInfo
   vm.set_chksig_always_succeed(cfg.ignore_chksig);
+  vm.set_profile_ed25519(cfg.profile_ed25519);
   vm.set_stop_on_accept_message(cfg.stop_on_accept_message);
   if (cfg.size_limits.max_transaction_library_loads) {
     vm.set_max_library_loads(cfg.size_limits.max_transaction_library_loads.value());
@@ -2016,6 +2017,8 @@ bool Transaction::prepare_compute_phase(const ComputePhaseConfig& cfg) {
   cp.gas_used = std::min<long long>(gas.gas_consumed(), gas.gas_limit);
   tvm_steps = vm.get_steps_count();
   tvm_gas_used = cp.gas_used;
+  tvm_ed25519_verifications = vm.get_ed25519_verifications();
+  time_tvm_ed25519 = vm.get_ed25519_time();
   cp.accepted = (gas.gas_credit == 0);
   cp.success = (cp.accepted && vm.committed());
   if (cp.accepted & use_msg_state) {

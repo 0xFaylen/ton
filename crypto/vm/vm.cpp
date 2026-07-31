@@ -751,6 +751,7 @@ void VmState::run_child_vm(VmState&& new_state, bool return_data, bool return_ac
   new_state.chksgn_counter = chksgn_counter;
   new_state.free_gas_consumed = free_gas_consumed;
   new_state.get_extra_balance_counter = get_extra_balance_counter;
+  new_state.profile_ed25519 = profile_ed25519;
   if (global_version >= 10) {
     new_state.gas = GasLimits{std::min(new_state.gas.gas_limit, gas.gas_remaining),
                               std::min(new_state.gas.gas_max, gas.gas_remaining)};
@@ -782,6 +783,8 @@ void VmState::restore_parent_vm(int res) {
   chksgn_counter = child_state.chksgn_counter;
   get_extra_balance_counter = child_state.get_extra_balance_counter;
   free_gas_consumed = child_state.free_gas_consumed;
+  ed25519_verifications += child_state.ed25519_verifications;
+  time_ed25519 += child_state.time_ed25519;
   VM_LOG(this) << "Child VM finished. res: " << res << ", steps: " << child_state.steps
                << ", gas: " << child_state.gas_consumed();
 

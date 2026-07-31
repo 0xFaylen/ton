@@ -30,8 +30,10 @@ vrp hotpaths <run_id> --source validate --metric wall --offset 0 --limit 100
 ```
 
 The response includes execution count, wall or CPU time, VM and billed gas,
-VM steps, exact distinct-account count, top-account concentration, and the ten
-most active workchain-and-address pairs for each returned code hash.
+VM steps, Ed25519 verification count and time, exact distinct-account count,
+top-account concentration, and the ten most active workchain-and-address pairs
+for each returned code hash. Ed25519 timing is enabled only by exact offline
+replay; normal collation and validation do not start the inner crypto timer.
 
 Collection work is timed separately as `trx_tvm_profile`; it is not included in
 the per-code `time_tvm` values. Exact maps can make the replay itself slower,
@@ -58,7 +60,8 @@ tvm-replay-bundle \
   --block-id '(0,8000000000000000,SEQNO)' \
   --prev-state <shard-state-or-split-header.boc> \
   --mc-state <referenced-masterchain-state.boc> \
-  --account-part E=<stateaccount-part.boc>
+  --account-part E=<stateaccount-part.boc> \
+  --profile-ed25519
 ```
 
 Before copying state, inspect the block to obtain its exact predecessor,
@@ -75,6 +78,11 @@ and the resulting account-state hash to match. It reports exact, unbounded
 `code_hash` hot paths for that explicit input. If only some account parts are
 provided, output is labelled `account_prefix_subset` and includes the number of
 skipped accounts; it must not be presented as a full-block result.
+
+`--profile-ed25519` adds the count and time spent inside real Ed25519 signature
+verification to every code-hash entry. It does not bypass signature checking or
+change gas accounting. The replay still requires exact transaction and
+resulting account-state hashes.
 
 The shard archive anchors the predecessor state through the intervening block
 chain. The masterchain archive anchors the configuration state by requiring its

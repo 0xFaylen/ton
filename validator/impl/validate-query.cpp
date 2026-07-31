@@ -1106,6 +1106,7 @@ bool ValidateQuery::fetch_config_params() {
     storage_phase_cfg_.global_version = config_->get_global_version();
     compute_phase_cfg_.block_rand_seed = rand_seed_;
     compute_phase_cfg_.libraries = std::make_unique<vm::Dictionary>(config_->get_libraries_root(), 256);
+    compute_phase_cfg_.profile_ed25519 = stats_.work_time.tvm_hotpath.is_exact();
     compute_phase_cfg_.max_vm_data_depth = size_limits.max_vm_data_depth;
     compute_phase_cfg_.global_config = config_->get_root_cell();
     compute_phase_cfg_.global_version = config_->get_global_version();
@@ -6025,7 +6026,8 @@ bool ValidateQuery::CheckAccountTxs::check_one_transaction(block::Account& accou
     if (trs->tvm_executed) {
       td::RealCpuTimer profile_timer;
       ctx_.work_time.tvm_hotpath.record(trs->tvm_code_hash, trs->account.workchain, trs->account.addr, trs->time_tvm,
-                                        trs->tvm_gas_used, trs->gas_used(), trs->tvm_steps);
+                                        trs->tvm_gas_used, trs->gas_used(), trs->tvm_steps,
+                                        trs->tvm_ed25519_verifications, trs->time_tvm_ed25519);
       auto profile_elapsed = profile_timer.elapsed_both();
       ctx_.work_time.trx_tvm_profile += trs->time_tvm_profile + profile_elapsed;
       ctx_.work_time.check_transactions_other -= profile_elapsed;

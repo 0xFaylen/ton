@@ -578,7 +578,7 @@ td::Result<ReplayResult> replay_transactions(const BlockContext& target, const L
                                              const LoadedState& mc_state,
                                              const std::vector<LoadedAccountPart>& account_parts,
                                              const std::vector<LoadedAccountProof>& account_proofs,
-                                             const LoadedLibraryBodies* library_bodies) {
+                                             const LoadedLibraryBodies* library_bodies, bool profile_ed25519) {
   TRY_STATUS(verify_replay_scope(target));
   if ((prev_state != nullptr && prev_state->record.global_id != target.global_id) ||
       mc_state.record.global_id != target.global_id) {
@@ -611,6 +611,7 @@ td::Result<ReplayResult> replay_transactions(const BlockContext& target, const L
   TRY_RESULT(prev_blocks_info, config->get_prev_blocks_info());
 
   emulator::TransactionEmulator emulator(config);
+  emulator.set_profile_ed25519(profile_ed25519);
   auto rand_seed = target.rand_seed;
   emulator.set_rand_seed(rand_seed);
   emulator.set_prev_blocks_info(std::move(prev_blocks_info));
@@ -737,7 +738,8 @@ td::Result<ReplayResult> replay_transactions(const BlockContext& target, const L
           if (emulated.vm.executed) {
             ++result.tvm_transactions;
             result.hotpaths.record(emulated.vm.code_hash, target.id.id.workchain, address, emulated.vm.time,
-                                   emulated.vm.vm_gas_used, emulated.vm.billed_gas_used, emulated.vm.vm_steps);
+                                   emulated.vm.vm_gas_used, emulated.vm.billed_gas_used, emulated.vm.vm_steps,
+                                   emulated.vm.ed25519_verifications, emulated.vm.ed25519_time);
           }
           account = std::move(emulated.account);
           return true;
@@ -810,7 +812,7 @@ std::string inspect_state_json(const LoadedState& state) {
 
 std::string replay_json(const BlockContext& target, const LoadedState* account_state,
                         const std::vector<LoadedAccountProof>& account_proofs, const LoadedState& mc_state,
-                        const LoadedLibraryBodies* library_bodies, const ReplayResult& replay) {
+                        const LoadedLibraryBodies* library_bodies, const ReplayResult& replay, bool profile_ed25519) {
   td::StringBuilder out;
   out << "{\"schema_version\":1,\"mode\":\"transaction_equivalence_replay\",\"block_id\":\"" << target.id.to_str()
       << "\",\"predecessor_id\":\"" << target.prev[0].to_str() << "\",\"account_source\":\""
@@ -842,7 +844,7 @@ std::string replay_json(const BlockContext& target, const LoadedState* account_s
                                        : "account_subset")
       << "\",\"target_accounts\":" << replay.target_accounts << ",\"accounts\":" << replay.accounts
       << ",\"skipped_accounts\":" << replay.skipped_accounts << ",\"transactions\":" << replay.transactions
-      << ",\"tvm_transactions\":" << replay.tvm_transactions
+      << ",\"tvm_transactions\":" << replay.tvm_transactions << ",\"ed25519_profiled\":" << profile_ed25519
       << ",\"equivalence\":\"transaction_hash_and_account_state_hash\",\"hotpaths_wall\":"
       << replay.hotpaths.to_json(false, 0, replay.hotpaths.size());
 #if TD_WINDOWS
@@ -859,7 +861,8 @@ td::Result<std::string> run(const std::string& archive, const std::string& mc_ar
                             bool inspect, const std::string& prev_state_path, const std::string& mc_state_path,
                             const std::string& mc_proof_path, const std::vector<std::string>& library_body_paths,
                             const std::vector<std::string>& account_part_specs,
-                            const std::vector<std::string>& account_proof_specs, int split_depth) {
+                            const std::vector<std::string>& account_proof_specs, int split_depth,
+                            bool profile_ed25519) {
   TRY_RESULT(requested_id, BlockId::from_str(block_id_text));
   TRY_RESULT(block_data, load_block_from_archive(archive, requested_id));
   TRY_RESULT(target, unpack_block_context(std::move(block_data)));
@@ -923,8 +926,9 @@ td::Result<std::string> run(const std::string& archive, const std::string& mc_ar
     library_bodies = std::make_unique<LoadedLibraryBodies>(std::move(loaded));
   }
   TRY_RESULT(replay, replay_transactions(target, prev_state.get(), *mc_state, account_parts, account_proofs,
-                                         library_bodies.get()));
-  return replay_json(target, prev_state.get(), account_proofs, *mc_state, library_bodies.get(), replay);
+                                         library_bodies.get(), profile_ed25519));
+  return replay_json(target, prev_state.get(), account_proofs, *mc_state, library_bodies.get(), replay,
+                     profile_ed25519);
 }
 
 }  // namespace
@@ -943,6 +947,7 @@ int main(int argc, char** argv) {
   std::vector<std::string> account_proofs;
   int split_depth = 4;
   bool inspect = false;
+  bool profile_ed25519 = false;
 
   td::OptionParser options;
   options.set_description(
@@ -976,6 +981,8 @@ int main(int argc, char** argv) {
   options.add_option('i', "inspect", "print exact state ids required by the selected block", [&]() { inspect = true; });
   options.add_option(0, "inspect-state", "inspect a whole-state BOC or split-state Merkle header",
                      [&](td::Slice value) { inspect_state = value.str(); });
+  options.add_option(0, "profile-ed25519", "time Ed25519 verification during offline transaction replay",
+                     [&]() { profile_ed25519 = true; });
   options.add_option('h', "help", "print help", [&]() {
     char buffer[16384];
     td::StringBuilder out(td::MutableSlice{buffer, sizeof(buffer)});
@@ -1005,7 +1012,7 @@ int main(int argc, char** argv) {
       }
     } else {
       result = run(archive, mc_archive, block_id, inspect, prev_state, mc_state, mc_proof, library_bodies,
-                   account_parts, account_proofs, split_depth);
+                   account_parts, account_proofs, split_depth, profile_ed25519);
     }
     if (result.is_error()) {
       std::cerr << "Error: " << result.move_as_error().to_string() << '\n';

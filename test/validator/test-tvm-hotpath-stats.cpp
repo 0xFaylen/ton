@@ -196,6 +196,29 @@ TEST(TvmHotpathStats, CpuJsonUsesCpuOrdering) {
   ASSERT_TRUE(cpu_json.find(make_hash(1).to_hex()) == std::string::npos);
 }
 
+TEST(TvmHotpathStats, AggregatesAndExportsEd25519Timing) {
+  TvmHotpathStats first;
+  TvmHotpathStats second;
+  first.enable_exact();
+  second.enable_exact();
+  const auto code_hash = make_hash(1);
+  const auto account = make_hash(2);
+  first.record(code_hash, basechainId, account, make_time(0.4, 0.3), 10, 10, 1, 1, make_time(0.1, 0.08));
+  second.record(code_hash, basechainId, account, make_time(0.6, 0.5), 20, 20, 2, 2, make_time(0.2, 0.16));
+
+  first.merge(second);
+  first.scale(0.5);
+
+  const auto entries = first.entries_by_wall(1);
+  ASSERT_EQ(entries[0].ed25519_verifications, 2u);
+  ASSERT_TRUE(std::abs(entries[0].ed25519_time.real - 0.15) < 1e-12);
+  const auto json = first.to_json(false);
+  ASSERT_TRUE(json.find("\"total_ed25519_verifications\":2") != std::string::npos);
+  ASSERT_TRUE(json.find("\"ed25519_verifications\":2") != std::string::npos);
+  ASSERT_TRUE(json.find("\"ed25519_seconds\":0.15") != std::string::npos);
+  ASSERT_TRUE(json.find("\"ed25519_share_of_tvm\":0.3") != std::string::npos);
+}
+
 TEST(ValidationReplay, ParsesOnlyCompleteAndValidBlockIds) {
   auto valid = BlockId::from_str("(0,8000000000000000,123456)");
   ASSERT_TRUE(valid.is_ok());

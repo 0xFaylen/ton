@@ -2254,6 +2254,7 @@ bool Collator::fetch_config_params() {
     return fatal_error(res.move_as_error());
   }
   compute_phase_cfg_.libraries = std::make_unique<vm::Dictionary>(config_->get_libraries_root(), 256);
+  compute_phase_cfg_.profile_ed25519 = stats_.work_time.tvm_hotpath.is_exact();
   defer_out_queue_size_limit_ = std::max<td::uint64>(params_.collator_opts->defer_out_queue_size_limit,
                                                      compute_phase_cfg_.size_limits.defer_out_queue_size_limit);
   // This one is checked in validate-query
@@ -3263,7 +3264,8 @@ bool Collator::create_ticktock_transaction(const ton::StdSmcAddress& smc_addr, t
     if (trans->tvm_executed) {
       td::RealCpuTimer profile_timer;
       stats_.work_time.tvm_hotpath.record(trans->tvm_code_hash, trans->account.workchain, trans->account.addr,
-                                          trans->time_tvm, trans->tvm_gas_used, trans->gas_used(), trans->tvm_steps);
+                                          trans->time_tvm, trans->tvm_gas_used, trans->gas_used(), trans->tvm_steps,
+                                          trans->tvm_ed25519_verifications, trans->time_tvm_ed25519);
       stats_.work_time.trx_tvm_profile += trans->time_tvm_profile + profile_timer.elapsed_both();
     }
   };
@@ -3460,8 +3462,8 @@ td::Result<std::unique_ptr<block::transaction::Transaction>> Collator::impl_crea
         if (trans->tvm_executed) {
           td::RealCpuTimer profile_timer;
           stats->work_time.tvm_hotpath.record(trans->tvm_code_hash, trans->account.workchain, trans->account.addr,
-                                              trans->time_tvm, trans->tvm_gas_used, trans->gas_used(),
-                                              trans->tvm_steps);
+                                              trans->time_tvm, trans->tvm_gas_used, trans->gas_used(), trans->tvm_steps,
+                                              trans->tvm_ed25519_verifications, trans->time_tvm_ed25519);
           stats->work_time.trx_tvm_profile += trans->time_tvm_profile + profile_timer.elapsed_both();
         }
       }

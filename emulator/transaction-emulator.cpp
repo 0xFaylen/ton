@@ -47,6 +47,7 @@ td::Result<std::unique_ptr<TransactionEmulator::EmulationResult>> TransactionEmu
 
   compute_phase_cfg.libraries = std::make_unique<vm::Dictionary>(libraries_);
   compute_phase_cfg.ignore_chksig = ignore_chksig_;
+  compute_phase_cfg.profile_ed25519 = profile_ed25519_;
   compute_phase_cfg.with_vm_log = true;
   compute_phase_cfg.vm_log_verbosity = vm_log_verbosity_;
 
@@ -84,11 +85,12 @@ td::Result<std::unique_ptr<TransactionEmulator::EmulationResult>> TransactionEmu
       .vm_gas_used = trans->tvm_gas_used,
       .billed_gas_used = trans->gas_used(),
       .vm_steps = trans->tvm_steps,
+      .ed25519_verifications = trans->tvm_ed25519_verifications,
+      .ed25519_time = trans->time_tvm_ed25519,
   };
-  return std::make_unique<TransactionEmulator::EmulationSuccess>(std::move(trans_root), std::move(account),
-                                                                 std::move(trans->compute_phase->vm_log),
-                                                                 std::move(trans->compute_phase->actions),
-                                                                 std::move(vm_stats), elapsed);
+  return std::make_unique<TransactionEmulator::EmulationSuccess>(
+      std::move(trans_root), std::move(account), std::move(trans->compute_phase->vm_log),
+      std::move(trans->compute_phase->actions), std::move(vm_stats), elapsed);
 }
 
 td::Result<TransactionEmulator::EmulationSuccess> TransactionEmulator::emulate_transaction(
@@ -280,6 +282,10 @@ void TransactionEmulator::set_rand_seed(td::BitArray<256>& rand_seed) {
 
 void TransactionEmulator::set_ignore_chksig(bool ignore_chksig) {
   ignore_chksig_ = ignore_chksig;
+}
+
+void TransactionEmulator::set_profile_ed25519(bool profile_ed25519) {
+  profile_ed25519_ = profile_ed25519;
 }
 
 void TransactionEmulator::set_config(std::shared_ptr<block::Config> config) {

@@ -796,7 +796,14 @@ int exec_ed25519_check_signature(VmState* st, bool from_slice) {
     }
   }
   td::Ed25519::PublicKey pub_key{td::SecureString(td::Slice{key, 32})};
-  auto res = pub_key.verify_signature(td::Slice{data, data_len}, td::Slice{signature, 64});
+  td::Status res;
+  if (st->get_profile_ed25519()) {
+    td::RealCpuTimer timer;
+    res = pub_key.verify_signature(td::Slice{data, data_len}, td::Slice{signature, 64});
+    st->record_ed25519_verification(timer.elapsed_both());
+  } else {
+    res = pub_key.verify_signature(td::Slice{data, data_len}, td::Slice{signature, 64});
+  }
   stack.push_bool(res.is_ok() || st->get_chksig_always_succeed());
   return 0;
 }
