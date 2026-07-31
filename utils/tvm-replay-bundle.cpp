@@ -1,0 +1,1019 @@
+/*
+    This file is part of TON Blockchain source code.
+
+    TON Blockchain is free software; you can redistribute it and/or
+    modify it under the terms of the GNU General Public License
+    as published by the Free Software Foundation; either version 2
+    of the License, or (at your option) any later version.
+
+    TON Blockchain is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU General Public License for more details.
+
+    You should have received a copy of the GNU General Public License
+    along with TON Blockchain.  If not, see <http://www.gnu.org/licenses/>.
+
+    In addition, as a special exception, the copyright holders give permission
+    to link the code of portions of this program with the OpenSSL library.
+    You must obey the GNU General Public License in all respects for all
+    of the code used other than OpenSSL. If you modify file(s) with this
+    exception, you may extend this exception to your version of the file(s),
+    but you are not obligated to do so. If you do not wish to do so, delete this
+    exception statement from your version. If you delete this exception statement
+    from all source files in the program, then also delete it here.
+*/
+
+#include <cstdlib>
+#include <iostream>
+#include <memory>
+#include <set>
+#include <string>
+
+#include "auto/tl/lite_api.hpp"
+#include "block/block-auto.h"
+#include "block/block-parse.h"
+#include "block/check-proof.h"
+#include "block/mc-config.h"
+#include "common/checksum.h"
+#include "emulator/transaction-emulator.h"
+#include "td/db/utils/BlobView.h"
+#include "td/utils/OptionParser.h"
+#include "td/utils/Timer.h"
+#include "td/utils/filesystem.h"
+#include "td/utils/overloaded.h"
+#include "ton/lite-tl.hpp"
+#include "validator/db/fileref.hpp"
+#include "validator/db/package.hpp"
+#include "validator/interfaces/tvm-hotpath-stats.h"
+#include "vm/boc.h"
+#include "vm/cells/DataCell.h"
+#include "vm/cells/MerkleProof.h"
+#include "vm/db/StaticBagOfCellsDb.h"
+
+namespace {
+
+using td::Ref;
+using ton::BlockId;
+using ton::BlockIdExt;
+using ton::StdSmcAddress;
+using ton::validator::TvmHotpathStats;
+
+// Core's persistent-state serializer requires split_depth <= 63. This CLI uses
+// whole hexadecimal digits, so 60 is the largest representable supported depth.
+constexpr int kMaxHexSplitDepth = 60;
+
+struct BlockContext {
+  Ref<vm::Cell> root;
+  BlockIdExt id;
+  std::vector<BlockIdExt> prev;
+  BlockIdExt mc_id;
+  td::Bits256 rand_seed = td::Bits256::zero();
+  ton::UnixTime gen_utime = 0;
+  int global_id = 0;
+  bool after_split = false;
+  bool after_merge = false;
+  bool before_split = false;
+  Ref<vm::Cell> account_blocks;
+};
+
+struct LoadedState {
+  std::shared_ptr<vm::StaticBagOfCellsDb> boc;
+  Ref<vm::Cell> root;
+  block::gen::ShardStateUnsplit::Record record;
+  BlockId id;
+  bool split_header = false;
+};
+
+struct LoadedAccountPart {
+  std::string prefix_hex;
+  int prefix_len = 0;
+  td::Bits256 prefix = td::Bits256::zero();
+  std::shared_ptr<vm::StaticBagOfCellsDb> boc;
+  Ref<vm::Cell> root;
+  std::unique_ptr<vm::AugmentedDictionary> accounts;
+};
+
+struct LoadedAccountProof {
+  StdSmcAddress address;
+  BlockIdExt shard_block;
+  Ref<vm::Cell> shard_account;
+};
+
+struct LoadedLibraryBodies {
+  Ref<vm::Cell> root;
+  std::set<td::Bits256> hashes;
+};
+
+struct ReplayResult {
+  std::size_t target_accounts = 0;
+  std::size_t accounts = 0;
+  std::size_t skipped_accounts = 0;
+  std::size_t transactions = 0;
+  std::size_t tvm_transactions = 0;
+  TvmHotpathStats hotpaths;
+
+  ReplayResult() {
+    hotpaths.enable_exact();
+  }
+};
+
+td::Result<std::pair<BlockIdExt, Ref<vm::Cell>>> load_block_from_archive(const std::string& archive,
+                                                                         const BlockId& requested_id) {
+  TRY_RESULT(package, ton::Package::open(archive, true, false));
+  BlockIdExt found_id;
+  Ref<vm::Cell> found_root;
+  td::Status scan_status = td::Status::OK();
+  std::size_t matches = 0;
+
+  TRY_STATUS(package.iterate([&](std::string filename, td::BufferSlice data, td::uint64) {
+    auto file_ref = ton::validator::FileReference::create(std::move(filename));
+    if (file_ref.is_error()) {
+      return true;
+    }
+    auto parsed = file_ref.move_as_ok();
+    parsed.ref().visit(td::overloaded(
+        [&](const ton::validator::fileref::Block& block_ref) {
+          if (block_ref.block_id.id != requested_id) {
+            return;
+          }
+          ++matches;
+          if (matches > 1) {
+            scan_status = td::Status::Error("archive contains more than one block file for the requested block id");
+            return;
+          }
+          if (td::sha256_bits256(data) != block_ref.block_id.file_hash) {
+            scan_status = td::Status::Error("requested block file hash does not match its archive filename");
+            return;
+          }
+          auto root = vm::std_boc_deserialize(data.as_slice());
+          if (root.is_error()) {
+            scan_status = root.move_as_error_prefix("cannot deserialize requested block: ");
+            return;
+          }
+          found_root = root.move_as_ok();
+          if (td::Bits256(found_root->get_hash().bits()) != block_ref.block_id.root_hash) {
+            scan_status = td::Status::Error("requested block root hash does not match its archive filename");
+            found_root.clear();
+            return;
+          }
+          found_id = block_ref.block_id;
+        },
+        [&](const auto&) {}));
+    return scan_status.is_ok();
+  }));
+
+  TRY_STATUS(std::move(scan_status));
+  if (found_root.is_null()) {
+    return td::Status::Error(PSTRING() << "block " << requested_id.to_str() << " was not found in archive");
+  }
+  return std::make_pair(found_id, found_root);
+}
+
+td::Result<BlockContext> unpack_block_context(std::pair<BlockIdExt, Ref<vm::Cell>> block_data) {
+  BlockContext result;
+  result.id = block_data.first;
+  result.root = std::move(block_data.second);
+  TRY_STATUS(block::unpack_block_prev_blk_try(result.root, result.id, result.prev, result.mc_id, result.after_split));
+
+  block::gen::Block::Record block_record;
+  block::gen::BlockInfo::Record info;
+  block::gen::BlockExtra::Record extra;
+  if (!tlb::unpack_cell(result.root, block_record) || !tlb::unpack_cell(block_record.info, info) ||
+      !tlb::unpack_cell(block_record.extra, extra)) {
+    return td::Status::Error("cannot unpack block header and extra");
+  }
+  result.global_id = block_record.global_id;
+  result.gen_utime = info.gen_utime;
+  result.after_merge = info.after_merge;
+  result.before_split = info.before_split;
+  result.rand_seed = extra.rand_seed;
+  result.account_blocks = std::move(extra.account_blocks);
+  return result;
+}
+
+td::Result<LoadedState> load_state_boc_unchecked(const std::string& path, td::Slice description) {
+  TRY_RESULT(blob, td::FileBlobView::create(path));
+  TRY_RESULT(boc, vm::StaticBagOfCellsDbLazy::create(std::move(blob)));
+  TRY_RESULT(root_count, boc->get_root_count());
+  if (root_count != 1) {
+    return td::Status::Error(PSLICE() << description << " BOC must contain exactly one root, found " << root_count);
+  }
+  TRY_RESULT(root, boc->get_root_cell(0));
+
+  block::gen::ShardStateUnsplit::Record state;
+  bool split_header = false;
+  if (!tlb::unpack_cell(root, state)) {
+    TRY_RESULT(virtual_root, vm::MerkleProof::virtualize(root));
+    block::gen::ShardStateUnsplit::Record virtual_state;
+    if (!tlb::unpack_cell(virtual_root, virtual_state)) {
+      return td::Status::Error(PSLICE() << "cannot unpack " << description
+                                        << " as ShardStateUnsplit or a split-state Merkle header");
+    }
+    root = std::move(virtual_root);
+    state = std::move(virtual_state);
+    split_header = true;
+  }
+  BlockId actual_id{ton::ShardIdFull(block::ShardId{state.shard_id}), static_cast<ton::BlockSeqno>(state.seq_no)};
+  return LoadedState{std::move(boc), std::move(root), std::move(state), actual_id, split_header};
+}
+
+td::Result<LoadedState> load_state_boc(const std::string& path, const BlockIdExt& expected_id, td::Slice description) {
+  TRY_RESULT(state, load_state_boc_unchecked(path, description));
+  const auto& actual_id = state.id;
+  if (actual_id != expected_id.id) {
+    return td::Status::Error(PSLICE() << description << " id mismatch: expected " << expected_id.id.to_str()
+                                      << ", found " << actual_id.to_str());
+  }
+  return state;
+}
+
+td::Result<td::Bits256> parse_hex_prefix(td::Slice prefix) {
+  if (prefix.empty() || prefix.size() > kMaxHexSplitDepth / 4) {
+    return td::Status::Error("account-part prefix must contain 1..15 hexadecimal digits");
+  }
+  td::Bits256 result = td::Bits256::zero();
+  for (std::size_t i = 0; i < prefix.size(); ++i) {
+    char c = prefix[i];
+    int digit = c >= '0' && c <= '9'   ? c - '0'
+                : c >= 'a' && c <= 'f' ? c - 'a' + 10
+                : c >= 'A' && c <= 'F' ? c - 'A' + 10
+                                       : -1;
+    if (digit < 0) {
+      return td::Status::Error("account-part prefix is not hexadecimal");
+    }
+    (result.bits() + static_cast<int>(i * 4)).store_uint(static_cast<td::uint64>(digit), 4);
+  }
+  return result;
+}
+
+td::Result<LoadedAccountPart> load_account_part(const std::string& spec, const LoadedState& split_state) {
+  auto separator = spec.find('=');
+  if (separator == std::string::npos || separator == 0 || separator + 1 == spec.size()) {
+    return td::Status::Error("account-part must use HEX_PREFIX=PATH");
+  }
+  auto prefix_hex = spec.substr(0, separator);
+  auto path = spec.substr(separator + 1);
+  TRY_RESULT(prefix, parse_hex_prefix(prefix_hex));
+  int prefix_len = static_cast<int>(prefix_hex.size() * 4);
+
+  TRY_RESULT(blob, td::FileBlobView::create(path));
+  TRY_RESULT(boc, vm::StaticBagOfCellsDbLazy::create(std::move(blob)));
+  TRY_RESULT(root_count, boc->get_root_count());
+  if (root_count != 1) {
+    return td::Status::Error(PSLICE() << "account part " << prefix_hex << " must contain exactly one BOC root");
+  }
+  TRY_RESULT(root, boc->get_root_cell(0));
+  auto accounts = std::make_unique<vm::AugmentedDictionary>(vm::load_cell_slice_ref(root), 256,
+                                                            block::tlb::aug_ShardAccounts, false);
+  if (!accounts->is_valid() || !accounts->has_common_prefix(prefix.bits(), prefix_len)) {
+    return td::Status::Error(PSLICE() << "account part " << prefix_hex << " has an invalid dictionary prefix");
+  }
+
+  vm::AugmentedDictionary expected{vm::load_cell_slice_ref(split_state.record.accounts), 256,
+                                   block::tlb::aug_ShardAccounts, false};
+  if (!expected.cut_prefix_subdict(prefix.bits(), prefix_len) || expected.is_empty()) {
+    return td::Status::Error(PSLICE() << "split-state header has no account part for prefix " << prefix_hex);
+  }
+  auto expected_root = expected.get_wrapped_dict_root();
+  if (expected_root.is_null() ||
+      td::Bits256(expected_root->get_hash().bits()) != td::Bits256(root->get_hash().bits())) {
+    return td::Status::Error(PSLICE() << "account part " << prefix_hex << " hash does not match split-state header");
+  }
+
+  return LoadedAccountPart{std::move(prefix_hex), prefix_len,      prefix,
+                           std::move(boc),        std::move(root), std::move(accounts)};
+}
+
+td::Result<LoadedState> load_config_proof(const std::string& path, const BlockIdExt& expected_id) {
+  TRY_RESULT(data, td::read_file(path));
+  TRY_RESULT(response, ton::fetch_tl_object<ton::lite_api::liteServer_configInfo>(std::move(data), true));
+  auto actual_id = ton::create_block_id(response->id_);
+  if (actual_id != expected_id) {
+    return td::Status::Error(PSLICE() << "config proof id mismatch: expected " << expected_id.to_str() << ", found "
+                                      << actual_id.to_str());
+  }
+  TRY_RESULT(root, block::check_extract_state_proof(actual_id, response->state_proof_.as_slice(),
+                                                    response->config_proof_.as_slice()));
+  block::gen::ShardStateUnsplit::Record state;
+  if (!tlb::unpack_cell(root, state)) {
+    return td::Status::Error("cannot unpack masterchain state from config proof");
+  }
+  BlockId state_id{ton::ShardIdFull(block::ShardId{state.shard_id}), static_cast<ton::BlockSeqno>(state.seq_no)};
+  if (state_id != expected_id.id) {
+    return td::Status::Error("masterchain state in config proof has the wrong block id");
+  }
+  return LoadedState{nullptr, std::move(root), std::move(state), state_id, false};
+}
+
+td::Result<LoadedAccountProof> load_account_proof(const std::string& spec, const BlockIdExt& mc_id) {
+  auto separator = spec.find('=');
+  if (separator == std::string::npos || separator == 0 || separator + 1 == spec.size()) {
+    return td::Status::Error("account-proof must use ACCOUNT_HEX=PATH");
+  }
+  auto address_text = spec.substr(0, separator);
+  auto path = spec.substr(separator + 1);
+  StdSmcAddress address;
+  if (address.from_hex(address_text) != 256) {
+    return td::Status::Error("account-proof address must contain exactly 64 hexadecimal digits");
+  }
+
+  TRY_RESULT(data, td::read_file(path));
+  TRY_RESULT(response, ton::fetch_tl_object<ton::lite_api::liteServer_accountState>(std::move(data), true));
+  block::AccountState proof;
+  proof.blk = ton::create_block_id(response->id_);
+  proof.shard_blk = ton::create_block_id(response->shardblk_);
+  proof.shard_proof = std::move(response->shard_proof_);
+  proof.proof = std::move(response->proof_);
+  proof.state = std::move(response->state_);
+  TRY_RESULT(info, proof.validate(mc_id, block::StdAddress(ton::basechainId, address)));
+
+  Ref<vm::Cell> shard_account;
+  if (info.root.not_null()) {
+    block::gen::ShardAccount::Record record;
+    record.account = std::move(info.root);
+    record.last_trans_hash = info.last_trans_hash;
+    record.last_trans_lt = info.last_trans_lt;
+    if (!block::gen::t_ShardAccount.cell_pack(shard_account, record)) {
+      return td::Status::Error("cannot reconstruct ShardAccount from verified account proof");
+    }
+  }
+  return LoadedAccountProof{address, proof.shard_blk, std::move(shard_account)};
+}
+
+td::Result<LoadedLibraryBodies> load_library_bodies(const std::vector<std::string>& paths) {
+  vm::Dictionary dictionary{256};
+  std::set<td::Bits256> hashes;
+  for (const auto& path : paths) {
+    TRY_RESULT(data, td::read_file(path));
+    TRY_RESULT(response, ton::fetch_tl_object<ton::lite_api::liteServer_libraryResult>(std::move(data), true));
+    if (response->result_.empty() || response->result_.size() > 256) {
+      return td::Status::Error("library body bundle must contain 1..256 entries");
+    }
+    for (auto& entry : response->result_) {
+      TRY_RESULT(cell, vm::std_boc_deserialize(entry->data_.as_slice()));
+      if (cell.is_null() || !cell->get_hash().bits().equals(entry->hash_.cbits(), 256)) {
+        return td::Status::Error(PSLICE() << "library body hash mismatch for " << entry->hash_.to_hex());
+      }
+      if (cell->get_depth() > 512) {
+        return td::Status::Error(PSLICE() << "library body exceeds VM depth limit: " << entry->hash_.to_hex());
+      }
+      if (!hashes.insert(entry->hash_).second) {
+        continue;
+      }
+      vm::CellBuilder value;
+      if (!value.store_ref_bool(std::move(cell)) ||
+          !dictionary.set_builder(entry->hash_.bits(), 256, value, vm::Dictionary::SetMode::Add)) {
+        return td::Status::Error(PSLICE() << "cannot register library body " << entry->hash_.to_hex());
+      }
+    }
+  }
+  return LoadedLibraryBodies{dictionary.get_root_cell(), std::move(hashes)};
+}
+
+td::Status verify_replay_scope(const BlockContext& target) {
+  if (target.id.is_masterchain()) {
+    return td::Status::Error("masterchain replay is not supported by this transaction-equivalence tool");
+  }
+  if (target.id.id.workchain != ton::basechainId) {
+    return td::Status::Error("only basechain blocks are supported");
+  }
+  if (target.prev.size() != 1 || target.after_merge || target.after_split || target.before_split) {
+    return td::Status::Error("split/merge boundary blocks are not supported");
+  }
+  if (!target.mc_id.is_valid() || !target.mc_id.is_masterchain()) {
+    return td::Status::Error("block does not contain a valid masterchain reference");
+  }
+  return td::Status::OK();
+}
+
+td::Result<std::set<std::string>> collect_account_prefixes(const BlockContext& target, int split_depth) {
+  if (split_depth <= 0 || split_depth > kMaxHexSplitDepth || split_depth % 4 != 0) {
+    return td::Status::Error("split depth must be a positive multiple of 4 and at most 60");
+  }
+  vm::AugmentedDictionary account_blocks{vm::load_cell_slice_ref(target.account_blocks), 256,
+                                         block::tlb::aug_ShardAccountBlocks};
+  std::set<std::string> result;
+  bool valid = account_blocks.check_for_each_extra(
+      [&](Ref<vm::CellSlice>, Ref<vm::CellSlice>, td::ConstBitPtr key, int key_len) {
+        if (key_len != 256) {
+          return false;
+        }
+        result.insert(key.to_hex(split_depth));
+        return true;
+      });
+  if (!valid) {
+    return td::Status::Error("cannot enumerate account prefixes from target block");
+  }
+  return result;
+}
+
+td::Result<std::set<StdSmcAddress>> collect_accounts(const BlockContext& block_context) {
+  vm::AugmentedDictionary account_blocks{vm::load_cell_slice_ref(block_context.account_blocks), 256,
+                                         block::tlb::aug_ShardAccountBlocks};
+  std::set<StdSmcAddress> result;
+  bool valid = account_blocks.check_for_each_extra(
+      [&](Ref<vm::CellSlice>, Ref<vm::CellSlice>, td::ConstBitPtr key, int key_len) {
+        if (key_len != 256) {
+          return false;
+        }
+        result.emplace(key);
+        return true;
+      });
+  if (!valid) {
+    return td::Status::Error("cannot enumerate accounts from block");
+  }
+  return result;
+}
+
+td::Result<td::Bits256> get_new_state_hash(const BlockContext& block_context) {
+  block::gen::Block::Record block_record;
+  block::gen::MERKLE_UPDATE::Record update;
+  if (!tlb::unpack_cell(block_context.root, block_record) ||
+      !tlb::type_unpack_cell(block_record.state_update, block::gen::t_MERKLE_UPDATE_ShardState, update)) {
+    return td::Status::Error("cannot unpack block state update");
+  }
+  return td::Bits256(update.new_hash);
+}
+
+td::Status verify_masterchain_state(const std::string& mc_archive, const BlockIdExt& expected_id,
+                                    const LoadedState& mc_state) {
+  TRY_RESULT(block_data, load_block_from_archive(mc_archive, expected_id.id));
+  TRY_RESULT(block_context, unpack_block_context(std::move(block_data)));
+  if (block_context.id != expected_id) {
+    return td::Status::Error("masterchain archive block does not match the shard block reference");
+  }
+  TRY_RESULT(state_hash, get_new_state_hash(block_context));
+  if (state_hash != td::Bits256(mc_state.root->get_hash().bits())) {
+    return td::Status::Error("masterchain state root hash does not match its producing block");
+  }
+  return td::Status::OK();
+}
+
+td::Status verify_account_state_base(const std::string& archive, const BlockContext& target,
+                                     const LoadedState& account_state) {
+  if (account_state.id.shard_full() != target.id.shard_full()) {
+    return td::Status::Error("account state shard does not match target block shard");
+  }
+  if (account_state.id.seqno > target.prev[0].seqno()) {
+    return td::Status::Error("account state is newer than target predecessor");
+  }
+
+  TRY_RESULT(base_data, load_block_from_archive(archive, account_state.id));
+  TRY_RESULT(base_block, unpack_block_context(std::move(base_data)));
+  TRY_RESULT(base_state_hash, get_new_state_hash(base_block));
+  if (base_state_hash != td::Bits256(account_state.root->get_hash().bits())) {
+    return td::Status::Error("account state root hash does not match its producing block");
+  }
+
+  TRY_RESULT(target_accounts, collect_accounts(target));
+  BlockIdExt current = base_block.id;
+  for (ton::BlockSeqno seqno = account_state.id.seqno + 1; seqno <= target.prev[0].seqno(); ++seqno) {
+    BlockId intermediate_id{target.id.shard_full(), seqno};
+    TRY_RESULT(intermediate_data, load_block_from_archive(archive, intermediate_id));
+    TRY_RESULT(intermediate, unpack_block_context(std::move(intermediate_data)));
+    if (intermediate.prev.size() != 1 || intermediate.prev[0] != current) {
+      return td::Status::Error(PSLICE() << "non-linear block history at " << intermediate.id.to_str());
+    }
+    TRY_RESULT(changed_accounts, collect_accounts(intermediate));
+    for (const auto& account : target_accounts) {
+      if (changed_accounts.count(account) != 0) {
+        return td::Status::Error(PSLICE() << "account state is stale for " << account.to_hex()
+                                          << ": changed in intermediate block " << intermediate.id.to_str());
+      }
+    }
+    current = intermediate.id;
+  }
+  if (current != target.prev[0]) {
+    return td::Status::Error("account-state history does not reach target predecessor");
+  }
+  return td::Status::OK();
+}
+
+td::Status verify_account_proof_base(const std::string& archive, const BlockContext& target,
+                                     const LoadedAccountProof& proof) {
+  if (proof.shard_block.shard_full() != target.id.shard_full()) {
+    return td::Status::Error("account proof shard does not match target block shard");
+  }
+  if (proof.shard_block.seqno() > target.prev[0].seqno()) {
+    return td::Status::Error("account proof is newer than target predecessor");
+  }
+
+  BlockIdExt current = proof.shard_block;
+  for (ton::BlockSeqno seqno = proof.shard_block.seqno() + 1; seqno <= target.prev[0].seqno(); ++seqno) {
+    BlockId intermediate_id{target.id.shard_full(), seqno};
+    TRY_RESULT(intermediate_data, load_block_from_archive(archive, intermediate_id));
+    TRY_RESULT(intermediate, unpack_block_context(std::move(intermediate_data)));
+    if (intermediate.prev.size() != 1 || intermediate.prev[0] != current) {
+      return td::Status::Error(PSLICE() << "non-linear block history at " << intermediate.id.to_str());
+    }
+    TRY_RESULT(changed_accounts, collect_accounts(intermediate));
+    if (changed_accounts.count(proof.address) != 0) {
+      return td::Status::Error(PSLICE() << "account proof is stale for " << proof.address.to_hex()
+                                        << ": changed in intermediate block " << intermediate.id.to_str());
+    }
+    current = intermediate.id;
+  }
+  if (current != target.prev[0]) {
+    return td::Status::Error("account-proof history does not reach target predecessor");
+  }
+  return td::Status::OK();
+}
+
+td::Status collect_library_refs(Ref<vm::Cell> cell, std::set<vm::Cell::Hash>& visited, std::set<td::Bits256>& libraries,
+                                int depth = 1024) {
+  if (cell.is_null()) {
+    return td::Status::OK();
+  }
+  if (depth <= 0 || visited.size() >= 4096 || libraries.size() >= 256) {
+    return td::Status::Error("library-reference scan exceeded its safety bound");
+  }
+  if (!visited.insert(cell->get_hash()).second) {
+    return td::Status::OK();
+  }
+  TRY_RESULT(loaded, cell->load_cell());
+  if (loaded.data_cell->is_special()) {
+    if (loaded.data_cell->special_type() == vm::DataCell::SpecialType::Library) {
+      vm::CellSlice slice(std::move(loaded));
+      if (slice.size() != vm::Cell::hash_bits + 8) {
+        return td::Status::Error("invalid library-reference cell");
+      }
+      libraries.emplace(slice.data_bits() + 8);
+    }
+    return td::Status::OK();
+  }
+  for (unsigned i = 0; i < loaded.data_cell->get_refs_cnt(); ++i) {
+    TRY_STATUS(collect_library_refs(loaded.data_cell->get_ref(i), visited, libraries, depth - 1));
+  }
+  return td::Status::OK();
+}
+
+td::Result<std::set<td::Bits256>> required_libraries(const block::Account& account, Ref<vm::Cell> transaction) {
+  block::gen::Transaction::Record transaction_record;
+  if (!tlb::unpack_cell(transaction, transaction_record)) {
+    return td::Status::Error("cannot unpack transaction while scanning library references");
+  }
+
+  std::set<vm::Cell::Hash> visited;
+  std::set<td::Bits256> result;
+  TRY_STATUS(collect_library_refs(account.code, visited, result));
+  TRY_STATUS(collect_library_refs(transaction_record.r1.in_msg->prefetch_ref(), visited, result));
+  return result;
+}
+
+std::string join_library_hashes(const std::set<td::Bits256>& libraries) {
+  td::StringBuilder out;
+  bool first = true;
+  for (const auto& hash : libraries) {
+    if (!first) {
+      out << ",";
+    }
+    first = false;
+    out << hash.to_hex();
+  }
+  return out.as_cslice().str();
+}
+
+td::Result<ReplayResult> replay_transactions(const BlockContext& target, const LoadedState* prev_state,
+                                             const LoadedState& mc_state,
+                                             const std::vector<LoadedAccountPart>& account_parts,
+                                             const std::vector<LoadedAccountProof>& account_proofs,
+                                             const LoadedLibraryBodies* library_bodies) {
+  TRY_STATUS(verify_replay_scope(target));
+  if ((prev_state != nullptr && prev_state->record.global_id != target.global_id) ||
+      mc_state.record.global_id != target.global_id) {
+    return td::Status::Error("block, predecessor state, and masterchain state have different global ids");
+  }
+  if (prev_state == nullptr && account_proofs.empty()) {
+    return td::Status::Error("replay requires a predecessor state or at least one account proof");
+  }
+  if (prev_state != nullptr && !account_proofs.empty()) {
+    return td::Status::Error("predecessor-state and account-proof replay modes cannot be mixed");
+  }
+  if (prev_state == nullptr && !account_parts.empty()) {
+    return td::Status::Error("account parts require a split predecessor-state header");
+  }
+  if (prev_state != nullptr && prev_state->split_header && account_parts.empty()) {
+    return td::Status::Error("split predecessor state requires at least one --account-part");
+  }
+  if (prev_state != nullptr && !prev_state->split_header && !account_parts.empty()) {
+    return td::Status::Error("--account-part is only valid with a split-state predecessor header");
+  }
+
+  constexpr int config_mode = block::ConfigInfo::needLibraries | block::ConfigInfo::needCapabilities |
+                              block::ConfigInfo::needPrevBlocks | block::ConfigInfo::needWorkchainInfo |
+                              block::ConfigInfo::needSpecialSmc;
+  TRY_RESULT(config_unique, block::ConfigInfo::extract_config(mc_state.root, target.mc_id, config_mode));
+  auto config = std::shared_ptr<block::ConfigInfo>(std::move(config_unique));
+  if (config->get_global_blockchain_id() != target.global_id) {
+    return td::Status::Error("masterchain configuration global id does not match the target block");
+  }
+  TRY_RESULT(prev_blocks_info, config->get_prev_blocks_info());
+
+  emulator::TransactionEmulator emulator(config);
+  auto rand_seed = target.rand_seed;
+  emulator.set_rand_seed(rand_seed);
+  emulator.set_prev_blocks_info(std::move(prev_blocks_info));
+  emulator.set_libs(
+      vm::Dictionary(library_bodies == nullptr ? config->get_libraries_root() : library_bodies->root, 256));
+
+  std::unique_ptr<vm::AugmentedDictionary> accounts;
+  if (prev_state != nullptr && !prev_state->split_header) {
+    accounts = std::make_unique<vm::AugmentedDictionary>(
+        vm::load_cell_slice(prev_state->record.accounts).prefetch_ref(), 256, block::tlb::aug_ShardAccounts);
+  }
+  vm::AugmentedDictionary account_blocks{vm::load_cell_slice_ref(target.account_blocks), 256,
+                                         block::tlb::aug_ShardAccountBlocks};
+
+  ReplayResult result;
+  td::Status replay_status = td::Status::OK();
+  bool accounts_ok = account_blocks.check_for_each_extra([&](Ref<vm::CellSlice> account_block_slice, Ref<vm::CellSlice>,
+                                                             td::ConstBitPtr key, int key_len) {
+    if (key_len != 256) {
+      replay_status = td::Status::Error("invalid account block key length");
+      return false;
+    }
+    ++result.target_accounts;
+    StdSmcAddress address = key;
+
+    const LoadedAccountPart* matching_part = nullptr;
+    const LoadedAccountProof* matching_proof = nullptr;
+    if (prev_state == nullptr) {
+      for (const auto& proof : account_proofs) {
+        if (proof.address == address) {
+          matching_proof = &proof;
+          break;
+        }
+      }
+      if (matching_proof == nullptr) {
+        ++result.skipped_accounts;
+        return true;
+      }
+    } else if (prev_state->split_header) {
+      for (const auto& part : account_parts) {
+        if (key.equals(part.prefix.bits(), part.prefix_len) &&
+            (matching_part == nullptr || part.prefix_len > matching_part->prefix_len)) {
+          matching_part = &part;
+        }
+      }
+      if (matching_part == nullptr) {
+        ++result.skipped_accounts;
+        return true;
+      }
+    }
+    ++result.accounts;
+
+    block::gen::AccountBlock::Record account_block;
+    if (!tlb::csr_unpack(std::move(account_block_slice), account_block) || account_block.account_addr != address) {
+      replay_status = td::Status::Error(PSTRING() << "cannot unpack AccountBlock for " << address.to_hex());
+      return false;
+    }
+
+    block::Account account(target.id.id.workchain, address.bits());
+    Ref<vm::CellSlice> old_account;
+    if (matching_proof != nullptr && matching_proof->shard_account.not_null()) {
+      old_account = vm::load_cell_slice_ref(matching_proof->shard_account);
+    } else if (prev_state != nullptr && prev_state->split_header) {
+      old_account = matching_part->accounts->lookup_extra(key, 256).first;
+    } else if (prev_state != nullptr) {
+      old_account = accounts->lookup_extra(key, 256).first;
+    }
+    if (old_account.is_null()) {
+      if (!account.init_new(target.gen_utime)) {
+        replay_status = td::Status::Error(PSTRING() << "cannot initialize missing account " << address.to_hex());
+        return false;
+      }
+    } else if (!account.unpack(std::move(old_account), target.gen_utime, false)) {
+      replay_status = td::Status::Error(PSTRING() << "cannot unpack predecessor account " << address.to_hex());
+      return false;
+    }
+    if (!account.belongs_to_shard(target.id.shard_full())) {
+      replay_status = td::Status::Error(PSTRING() << "account " << address.to_hex() << " is outside the target shard");
+      return false;
+    }
+
+    vm::AugmentedDictionary transactions{vm::DictNonEmpty(), std::move(account_block.transactions), 64,
+                                         block::tlb::aug_AccountTransactions};
+    bool transactions_ok = transactions.check_for_each_extra(
+        [&](Ref<vm::CellSlice> transaction_slice, Ref<vm::CellSlice>, td::ConstBitPtr tx_key, int tx_key_len) {
+          if (tx_key_len != 64) {
+            replay_status = td::Status::Error("invalid transaction key length");
+            return false;
+          }
+          auto transaction = transaction_slice->prefetch_ref();
+          if (transaction.is_null()) {
+            replay_status = td::Status::Error("transaction dictionary contains a null transaction");
+            return false;
+          }
+          auto required = required_libraries(account, transaction);
+          if (required.is_error()) {
+            replay_status = required.move_as_error_prefix(PSTRING() << "transaction " << tx_key.get_uint(64) << " of "
+                                                                    << address.to_hex() << ": ");
+            return false;
+          }
+          if (mc_state.boc == nullptr) {
+            std::set<td::Bits256> missing;
+            for (const auto& hash : required.ok()) {
+              if (library_bodies == nullptr || library_bodies->hashes.count(hash) == 0) {
+                missing.insert(hash);
+              }
+            }
+            if (!missing.empty()) {
+              replay_status =
+                  td::Status::Error(PSTRING() << "transaction " << tx_key.get_uint(64) << " of " << address.to_hex()
+                                              << " requires public library bodies absent from --library-bodies: "
+                                              << join_library_hashes(missing));
+              return false;
+            }
+          }
+          auto emulation = emulator.emulate_transaction(std::move(account), transaction);
+          if (emulation.is_error()) {
+            replay_status = emulation.move_as_error_prefix(PSTRING() << "transaction " << tx_key.get_uint(64) << " of "
+                                                                     << address.to_hex() << ": ");
+            return false;
+          }
+          auto emulated = emulation.move_as_ok();
+          ++result.transactions;
+          if (emulated.vm.executed) {
+            ++result.tvm_transactions;
+            result.hotpaths.record(emulated.vm.code_hash, target.id.id.workchain, address, emulated.vm.time,
+                                   emulated.vm.vm_gas_used, emulated.vm.billed_gas_used, emulated.vm.vm_steps);
+          }
+          account = std::move(emulated.account);
+          return true;
+        });
+    if (!transactions_ok && replay_status.is_ok()) {
+      replay_status = td::Status::Error(PSTRING() << "invalid transaction dictionary for " << address.to_hex());
+    }
+    return transactions_ok;
+  });
+
+  if (!accounts_ok && replay_status.is_ok()) {
+    replay_status = td::Status::Error("invalid account-block dictionary");
+  }
+  TRY_STATUS(std::move(replay_status));
+  return result;
+}
+
+td::Result<std::string> inspect_json(const BlockContext& target, int split_depth) {
+  TRY_RESULT(prefixes, collect_account_prefixes(target, split_depth));
+  TRY_RESULT(accounts, collect_accounts(target));
+  td::StringBuilder out;
+  out << "{\"schema_version\":1,\"mode\":\"inspect\",\"block_id\":\"" << target.id.to_str()
+      << "\",\"global_id\":" << target.global_id << ",\"gen_utime\":" << target.gen_utime
+      << ",\"after_split\":" << target.after_split << ",\"after_merge\":" << target.after_merge
+      << ",\"before_split\":" << target.before_split << ",\"predecessors\":[";
+  for (std::size_t i = 0; i < target.prev.size(); ++i) {
+    if (i != 0) {
+      out << ",";
+    }
+    out << "\"" << target.prev[i].to_str() << "\"";
+  }
+  out << "],\"masterchain_ref\":\"" << target.mc_id.to_str() << "\",\"split_depth\":" << split_depth
+      << ",\"required_account_prefixes\":[";
+  bool first_prefix = true;
+  for (const auto& prefix : prefixes) {
+    if (!first_prefix) {
+      out << ",";
+    }
+    first_prefix = false;
+    out << "\"" << prefix << "\"";
+  }
+  out << "],\"required_accounts\":[";
+  bool first_account = true;
+  for (const auto& account : accounts) {
+    if (!first_account) {
+      out << ",";
+    }
+    first_account = false;
+    out << "\"" << account.to_hex() << "\"";
+  }
+  out << "],\"replay_supported\":" << verify_replay_scope(target).is_ok() << "}";
+  return out.as_cslice().str();
+}
+
+std::string inspect_state_json(const LoadedState& state) {
+  td::StringBuilder out;
+  out << "{\"schema_version\":1,\"mode\":\"inspect_state\",\"state_id\":\"" << state.id.to_str()
+      << "\",\"global_id\":" << state.record.global_id << ",\"gen_utime\":" << state.record.gen_utime
+      << ",\"gen_lt\":" << state.record.gen_lt << ",\"root_hash\":\"" << state.root->get_hash().to_hex()
+      << "\",\"split_header\":" << state.split_header << "}";
+  return out.as_cslice().str();
+}
+
+std::string replay_json(const BlockContext& target, const LoadedState* account_state,
+                        const std::vector<LoadedAccountProof>& account_proofs, const LoadedState& mc_state,
+                        const LoadedLibraryBodies* library_bodies, const ReplayResult& replay) {
+  td::StringBuilder out;
+  out << "{\"schema_version\":1,\"mode\":\"transaction_equivalence_replay\",\"block_id\":\"" << target.id.to_str()
+      << "\",\"predecessor_id\":\"" << target.prev[0].to_str() << "\",\"account_source\":\""
+      << (account_state == nullptr ? "lite_server_proofs" : "persistent_state") << "\"";
+  if (account_state != nullptr) {
+    out << ",\"account_state_base_id\":\"" << account_state->id.to_str() << "\",\"account_state_root_hash\":\""
+        << account_state->root->get_hash().to_hex() << "\"";
+  } else {
+    out << ",\"account_proof_bases\":[";
+    for (std::size_t i = 0; i < account_proofs.size(); ++i) {
+      if (i != 0) {
+        out << ",";
+      }
+      out << "{\"address\":\"" << account_proofs[i].address.to_hex() << "\",\"block_id\":\""
+          << account_proofs[i].shard_block.to_str() << "\"}";
+    }
+    out << "]";
+  }
+  out << ",\"masterchain_state_id\":\"" << mc_state.id.to_str() << "\",\"masterchain_state_root_hash\":\""
+      << mc_state.root->get_hash().to_hex() << "\",\"masterchain_ref\":\"" << target.mc_id.to_str()
+      << "\",\"library_source\":\""
+      << (library_bodies != nullptr ? "content_hash_bundle"
+          : mc_state.boc != nullptr ? "masterchain_state"
+                                    : "config_proof")
+      << "\",\"library_membership_at_target_proven\":" << (library_bodies == nullptr && mc_state.boc != nullptr)
+      << ",\"scope\":\""
+      << (replay.skipped_accounts == 0 ? "full_block"
+          : account_proofs.empty()     ? "account_prefix_subset"
+                                       : "account_subset")
+      << "\",\"target_accounts\":" << replay.target_accounts << ",\"accounts\":" << replay.accounts
+      << ",\"skipped_accounts\":" << replay.skipped_accounts << ",\"transactions\":" << replay.transactions
+      << ",\"tvm_transactions\":" << replay.tvm_transactions
+      << ",\"equivalence\":\"transaction_hash_and_account_state_hash\",\"hotpaths_wall\":"
+      << replay.hotpaths.to_json(false, 0, replay.hotpaths.size());
+#if TD_WINDOWS
+  out << ",\"hotpaths_cpu\":null,\"cpu_metric_status\":\"unsupported_windows_timer_resolution\"";
+#else
+  out << ",\"hotpaths_cpu\":" << replay.hotpaths.to_json(true, 0, replay.hotpaths.size())
+      << ",\"cpu_metric_status\":\"available\"";
+#endif
+  out << "}";
+  return out.as_cslice().str();
+}
+
+td::Result<std::string> run(const std::string& archive, const std::string& mc_archive, const std::string& block_id_text,
+                            bool inspect, const std::string& prev_state_path, const std::string& mc_state_path,
+                            const std::string& mc_proof_path, const std::vector<std::string>& library_body_paths,
+                            const std::vector<std::string>& account_part_specs,
+                            const std::vector<std::string>& account_proof_specs, int split_depth) {
+  TRY_RESULT(requested_id, BlockId::from_str(block_id_text));
+  TRY_RESULT(block_data, load_block_from_archive(archive, requested_id));
+  TRY_RESULT(target, unpack_block_context(std::move(block_data)));
+  if (inspect) {
+    return inspect_json(target, split_depth);
+  }
+
+  TRY_STATUS(verify_replay_scope(target));
+  if (!mc_proof_path.empty() && (!mc_archive.empty() || !mc_state_path.empty())) {
+    return td::Status::Error("--mc-proof cannot be mixed with --mc-archive or --mc-state");
+  }
+  if (!library_body_paths.empty() && mc_proof_path.empty()) {
+    return td::Status::Error("--library-bodies is only valid with --mc-proof");
+  }
+  std::unique_ptr<LoadedState> mc_state;
+  if (!mc_proof_path.empty()) {
+    TRY_RESULT(loaded, load_config_proof(mc_proof_path, target.mc_id));
+    mc_state = std::make_unique<LoadedState>(std::move(loaded));
+  } else {
+    if (mc_archive.empty() || mc_state_path.empty()) {
+      return td::Status::Error("replay requires --mc-proof or both --mc-archive and --mc-state");
+    }
+    TRY_RESULT(loaded, load_state_boc(mc_state_path, target.mc_id, "masterchain state"));
+    TRY_STATUS(verify_masterchain_state(mc_archive, target.mc_id, loaded));
+    mc_state = std::make_unique<LoadedState>(std::move(loaded));
+  }
+
+  if (!account_proof_specs.empty() && (!prev_state_path.empty() || !account_part_specs.empty())) {
+    return td::Status::Error("--account-proof cannot be mixed with --prev-state or --account-part");
+  }
+  std::unique_ptr<LoadedState> prev_state;
+  std::vector<LoadedAccountPart> account_parts;
+  std::vector<LoadedAccountProof> account_proofs;
+  if (!account_proof_specs.empty()) {
+    std::set<StdSmcAddress> seen;
+    account_proofs.reserve(account_proof_specs.size());
+    for (const auto& spec : account_proof_specs) {
+      TRY_RESULT(proof, load_account_proof(spec, target.mc_id));
+      if (!seen.insert(proof.address).second) {
+        return td::Status::Error(PSLICE() << "duplicate account proof for " << proof.address.to_hex());
+      }
+      TRY_STATUS(verify_account_proof_base(archive, target, proof));
+      account_proofs.push_back(std::move(proof));
+    }
+  } else {
+    if (prev_state_path.empty()) {
+      return td::Status::Error("replay requires --account-proof or --prev-state");
+    }
+    TRY_RESULT(loaded, load_state_boc_unchecked(prev_state_path, "account state"));
+    TRY_STATUS(verify_account_state_base(archive, target, loaded));
+    prev_state = std::make_unique<LoadedState>(std::move(loaded));
+    account_parts.reserve(account_part_specs.size());
+    for (const auto& spec : account_part_specs) {
+      TRY_RESULT(part, load_account_part(spec, *prev_state));
+      account_parts.push_back(std::move(part));
+    }
+  }
+  std::unique_ptr<LoadedLibraryBodies> library_bodies;
+  if (!library_body_paths.empty()) {
+    TRY_RESULT(loaded, load_library_bodies(library_body_paths));
+    library_bodies = std::make_unique<LoadedLibraryBodies>(std::move(loaded));
+  }
+  TRY_RESULT(replay, replay_transactions(target, prev_state.get(), *mc_state, account_parts, account_proofs,
+                                         library_bodies.get()));
+  return replay_json(target, prev_state.get(), account_proofs, *mc_state, library_bodies.get(), replay);
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+  SET_VERBOSITY_LEVEL(verbosity_ERROR);
+  std::string archive;
+  std::string mc_archive;
+  std::string block_id;
+  std::string prev_state;
+  std::string mc_state;
+  std::string mc_proof;
+  std::vector<std::string> library_bodies;
+  std::string inspect_state;
+  std::vector<std::string> account_parts;
+  std::vector<std::string> account_proofs;
+  int split_depth = 4;
+  bool inspect = false;
+
+  td::OptionParser options;
+  options.set_description(
+      "Inspect or transaction-replay one basechain block from a closed TON archive using state BOCs or lite proofs");
+  options.add_option('a', "archive", "closed archive .pack file", [&](td::Slice value) { archive = value.str(); });
+  options.add_option(0, "mc-archive", "closed masterchain archive .pack file",
+                     [&](td::Slice value) { mc_archive = value.str(); });
+  options.add_option('b', "block-id", "short block id: (workchain,shard,seqno)",
+                     [&](td::Slice value) { block_id = value.str(); });
+  options.add_option('p', "prev-state", "predecessor ShardStateUnsplit BOC",
+                     [&](td::Slice value) { prev_state = value.str(); });
+  options.add_option('m', "mc-state", "referenced masterchain ShardStateUnsplit BOC",
+                     [&](td::Slice value) { mc_state = value.str(); });
+  options.add_option(0, "mc-proof", "verified liteServer.configInfo bundle from saveconfigproof",
+                     [&](td::Slice value) { mc_proof = value.str(); });
+  options.add_option(0, "library-bodies",
+                     "content-hash-checked liteServer.libraryResult from savelibraries; may be repeated",
+                     [&](td::Slice value) { library_bodies.push_back(value.str()); });
+  options.add_option('s', "account-part", "split-state account part as HEX_PREFIX=PATH; may be repeated",
+                     [&](td::Slice value) { account_parts.push_back(value.str()); });
+  options.add_option(0, "account-proof", "verified account proof as ACCOUNT_HEX=PATH; may be repeated",
+                     [&](td::Slice value) { account_proofs.push_back(value.str()); });
+  options.add_checked_option(
+      'd', "split-depth", "account prefix depth for --inspect (default: 4)", [&](td::Slice value) {
+        TRY_RESULT_ASSIGN(split_depth, td::to_integer_safe<int>(value));
+        if (split_depth <= 0 || split_depth > kMaxHexSplitDepth || split_depth % 4 != 0) {
+          return td::Status::Error("split depth must be a positive multiple of 4 and at most 60");
+        }
+        return td::Status::OK();
+      });
+  options.add_option('i', "inspect", "print exact state ids required by the selected block", [&]() { inspect = true; });
+  options.add_option(0, "inspect-state", "inspect a whole-state BOC or split-state Merkle header",
+                     [&](td::Slice value) { inspect_state = value.str(); });
+  options.add_option('h', "help", "print help", [&]() {
+    char buffer[16384];
+    td::StringBuilder out(td::MutableSlice{buffer, sizeof(buffer)});
+    out << options;
+    std::cout << out.as_cslice().str();
+    std::_Exit(0);
+  });
+
+  auto parse_status = options.run(argc, argv);
+  if (parse_status.is_error()) {
+    std::cerr << "Error: " << parse_status.move_as_error().to_string() << '\n';
+    return 1;
+  }
+  if (inspect_state.empty() && (archive.empty() || block_id.empty())) {
+    std::cerr << "Error: --archive and --block-id are required\n";
+    return 1;
+  }
+
+  try {
+    td::Result<std::string> result = td::Status::Error("uninitialized mode");
+    if (!inspect_state.empty()) {
+      auto state = load_state_boc_unchecked(inspect_state, "state");
+      if (state.is_error()) {
+        result = state.move_as_error();
+      } else {
+        result = inspect_state_json(state.move_as_ok());
+      }
+    } else {
+      result = run(archive, mc_archive, block_id, inspect, prev_state, mc_state, mc_proof, library_bodies,
+                   account_parts, account_proofs, split_depth);
+    }
+    if (result.is_error()) {
+      std::cerr << "Error: " << result.move_as_error().to_string() << '\n';
+      return 2;
+    }
+    std::cout << result.move_as_ok() << '\n';
+    return 0;
+  } catch (const vm::VmError& error) {
+    std::cerr << "Error: VM error: " << error.get_msg() << '\n';
+  } catch (const vm::VmVirtError& error) {
+    std::cerr << "Error: VM virtualization error: " << error.get_msg() << '\n';
+  } catch (const vm::CellBuilder::CellCreateError&) {
+    std::cerr << "Error: cell creation failed\n";
+  } catch (const vm::CellBuilder::CellWriteError&) {
+    std::cerr << "Error: cell write failed\n";
+  }
+  return 2;
+}

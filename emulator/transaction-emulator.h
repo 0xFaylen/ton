@@ -41,16 +41,27 @@ class TransactionEmulator {
   };
 
   struct EmulationSuccess : EmulationResult {
+    struct VmExecutionStats {
+      bool executed = false;
+      td::Bits256 code_hash = td::Bits256::zero();
+      td::RealCpuTimer::Time time;
+      td::uint64 vm_gas_used = 0;
+      td::uint64 billed_gas_used = 0;
+      td::uint64 vm_steps = 0;
+    };
+
     td::Ref<vm::Cell> transaction;
     block::Account account;
     td::Ref<vm::Cell> actions;
+    VmExecutionStats vm;
 
     EmulationSuccess(td::Ref<vm::Cell> transaction_, block::Account account_, std::string vm_log_,
-                     td::Ref<vm::Cell> actions_, double elapsed_time_)
+                     td::Ref<vm::Cell> actions_, VmExecutionStats vm_, double elapsed_time_)
         : EmulationResult(vm_log_, elapsed_time_)
         , transaction(transaction_)
         , account(std::move(account_))
-        , actions(actions_) {
+        , actions(actions_)
+        , vm(std::move(vm_)) {
     }
   };
 

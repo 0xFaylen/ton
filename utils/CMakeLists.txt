@@ -11,6 +11,14 @@ add_executable(pack-viewer pack-viewer.cpp )
 target_link_libraries(pack-viewer tl_api ton_crypto keys validator tddb)
 target_include_directories(pack-viewer PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>/..)
 
+add_executable(tvm-replay-bundle
+  tvm-replay-bundle.cpp
+  ../validator/db/fileref.cpp
+  ../validator/db/package.cpp
+)
+target_link_libraries(tvm-replay-bundle emulator_static tl_api tl_lite_api ton_crypto keys tddb)
+target_include_directories(tvm-replay-bundle PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>/..)
+
 add_executable(opcode-timing opcode-timing.cpp )
 target_link_libraries(opcode-timing ton_crypto)
 target_include_directories(pack-viewer PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>/..)

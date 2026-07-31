@@ -68,6 +68,10 @@ using td::Ref;
 
 int verbosity;
 
+namespace {
+constexpr int kSaveConfigProof = 1 << 20;
+}
+
 void TestNode::run() {
   class Cb : public td::TerminalIO::Callback {
    public:
@@ -996,6 +1000,7 @@ bool TestNode::show_help(std::string command) {
          "saveaccount[code|data] <filename> <addr> [<block-id-ext>]\tSaves into specified file the most recent state "
          "(StateInit) or just the code or data of specified account; <addr> is in "
          "[<workchain>:]<hex-or-base64-addr> format\n"
+         "saveaccountproof <filename> <addr> [<block-id-ext>]\tSaves the verified liteServer.accountState response\n"
          "runmethod[full] <addr> [<block-id-ext>] <name> <params>...\tRuns GET method <name> of account "
          "<addr> "
          "with specified parameters\n"
@@ -1010,6 +1015,11 @@ bool TestNode::show_help(std::string command) {
          "getkeyconfig <block-id-ext> [<param>...]\tShows specified or all configuration parameters from the "
          "previous key block with respect to <block-id-ext>\n"
          "saveconfig <filename> [<block-id-ext>]\tSaves all configuration parameters into specified file\n"
+         "saveconfigproof <filename> [<block-id-ext>]\tSaves a replay-capable liteServer.configInfo proof\n"
+         "savelibraries <filename> <hash>...\tSaves content-hash-checked public library bodies from the latest "
+         "state (16 hashes maximum)\n"
+         "savelibrariesproof <filename> <block-id-ext> <hash>...\tSaves verified public libraries and their "
+         "masterchain proof (16 hashes maximum)\n"
          "gethead <block-id-ext>\tShows block header for <block-id-ext>\n"
          "getblock <block-id-ext>\tDownloads block\n"
          "dumpblock <block-id-ext>\tDownloads and dumps specified block\n"
@@ -1096,6 +1106,12 @@ bool TestNode::do_parse_line() {
            (seekeoln() ? get_account_state(workchain, addr, mc_last_id_, addr_ext, filename, mode)
                        : parse_block_id_ext(blkid) && seekeoln() &&
                              get_account_state(workchain, addr, blkid, addr_ext, filename, mode));
+  } else if (word == "saveaccountproof") {
+    std::string filename;
+    return get_word_to(filename) && parse_account_addr_ext(workchain, addr, addr_ext) &&
+           (seekeoln() ? get_account_state(workchain, addr, mc_last_id_, addr_ext, filename, 3)
+                       : parse_block_id_ext(blkid) && seekeoln() &&
+                             get_account_state(workchain, addr, blkid, addr_ext, filename, 3));
   } else if (word == "runmethod" || word == "runmethodx" || word == "runmethodfull") {
     std::string method;
     return parse_account_addr_ext(workchain, addr, addr_ext) && get_word_to(method) &&
@@ -1122,6 +1138,54 @@ bool TestNode::do_parse_line() {
     std::string filename;
     return get_word_to(filename) && (seekeoln() || parse_block_id_ext(blkid)) && seekeoln() &&
            parse_get_config_params(blkid, -1, filename);
+  } else if (word == "saveconfigproof") {
+    blkid = mc_last_id_;
+    std::string filename;
+    constexpr int replay_config_mode = block::ConfigInfo::needLibraries | block::ConfigInfo::needCapabilities |
+                                       block::ConfigInfo::needPrevBlocks | block::ConfigInfo::needWorkchainInfo |
+                                       block::ConfigInfo::needSpecialSmc;
+    return get_word_to(filename) && (seekeoln() || parse_block_id_ext(blkid)) && seekeoln() &&
+           parse_get_config_params(blkid, kSaveConfigProof | replay_config_mode, filename);
+  } else if (word == "savelibrariesproof") {
+    std::string filename;
+    std::vector<td::Bits256> libraries;
+    if (!get_word_to(filename) || !parse_block_id_ext(blkid)) {
+      return false;
+    }
+    while (!seekeoln()) {
+      td::Bits256 hash;
+      if (!parse_hash(hash)) {
+        return false;
+      }
+      libraries.push_back(hash);
+    }
+    if (libraries.empty()) {
+      return set_error("at least one public library hash is required");
+    }
+    if (libraries.size() > 16) {
+      return set_error("at most 16 public library hashes may be requested at once");
+    }
+    return save_libraries_proof(blkid, std::move(libraries), std::move(filename));
+  } else if (word == "savelibraries") {
+    std::string filename;
+    std::vector<td::Bits256> libraries;
+    if (!get_word_to(filename)) {
+      return false;
+    }
+    while (!seekeoln()) {
+      td::Bits256 hash;
+      if (!parse_hash(hash)) {
+        return false;
+      }
+      libraries.push_back(hash);
+    }
+    if (libraries.empty()) {
+      return set_error("at least one public library hash is required");
+    }
+    if (libraries.size() > 16) {
+      return set_error("at most 16 public library hashes may be requested at once");
+    }
+    return save_library_bodies(std::move(libraries), std::move(filename));
   } else if (word == "getconfig" || word == "getconfigfrom") {
     blkid = mc_last_id_;
     return (word == "getconfig" || parse_block_id_ext(blkid)) && parse_get_config_params(blkid, 0);
@@ -2205,7 +2269,20 @@ void TestNode::got_account_state(ton::BlockIdExt ref_blk, ton::BlockIdExt blk, t
   }
   auto out = td::TerminalIO::out();
   auto info = r_info.move_as_ok();
-  if (mode < 0) {
+  if (mode == 3) {
+    auto bundle = ton::serialize_tl_object(
+        ton::create_tl_object<ton::lite_api::liteServer_accountState>(
+            ton::create_tl_lite_block_id(account_state.blk), ton::create_tl_lite_block_id(account_state.shard_blk),
+            account_state.shard_proof.clone(), account_state.proof.clone(), account_state.state.clone()),
+        true);
+    auto size = bundle.size();
+    auto status = td::write_file(filename, std::move(bundle));
+    if (status.is_error()) {
+      LOG(ERROR) << "cannot save account proof bundle to `" << filename << "`: " << status.move_as_error();
+      return;
+    }
+    out << "saved verified account proof bundle into file `" << filename << "` (" << size << " bytes)" << std::endl;
+  } else if (mode < 0) {
     if (info.root.not_null()) {
       out << "account state is ";
       std::ostringstream outp;
@@ -2958,6 +3035,19 @@ void TestNode::got_config_params(ton::BlockIdExt req_blkid, int mode, std::strin
                                        : block::Config::extract_from_state(state, mode & 0xfff),
                               "cannot unpack configuration:");
     ConfigInfo cinfo{std::move(config), std::move(state_proof), std::move(config_proof)};
+    if (mode & kSaveConfigProof) {
+      auto bundle = ton::serialize_tl_object(
+          ton::create_tl_object<ton::lite_api::liteServer_configInfo>(
+              f->mode_, ton::create_tl_lite_block_id(blkid), f->state_proof_.clone(), f->config_proof_.clone()),
+          true);
+      auto size = bundle.size();
+      TRY_STATUS_PROMISE_PREFIX(promise, td::write_file(filename, std::move(bundle)),
+                                PSLICE() << "cannot save config proof bundle to `" << filename << "`: ");
+      td::TerminalIO::out() << "saved verified config proof bundle into file `" << filename << "` (" << size
+                            << " bytes)" << std::endl;
+      promise.set_result(std::move(cinfo));
+      return;
+    }
     if (mode & 0x80000) {
       TRY_RESULT_PROMISE_PREFIX(promise, boc, vm::std_boc_serialize(cinfo.config->get_root_cell(), 2),
                                 "cannot serialize configuration:");
@@ -3023,6 +3113,176 @@ void TestNode::got_config_params(ton::BlockIdExt req_blkid, int mode, std::strin
     promise.set_error(err.as_status("virtualization error while traversing configuration: "));
     return;
   }
+}
+
+bool TestNode::save_library_bodies(std::vector<td::Bits256> libraries, std::string filename) {
+  if (!(ready_ && !client_.empty())) {
+    return set_error("server connection not ready");
+  }
+  std::sort(libraries.begin(), libraries.end());
+  libraries.erase(std::unique(libraries.begin(), libraries.end()), libraries.end());
+  auto query_libraries = libraries;
+  auto query = ton::serialize_tl_object(
+      ton::create_tl_object<ton::lite_api::liteServer_getLibraries>(std::move(query_libraries)), true);
+  LOG(INFO) << "requesting " << libraries.size() << " public library bodies";
+  return envelope_send_query(
+      std::move(query),
+      [libraries = std::move(libraries), filename = std::move(filename)](
+          td::Result<td::BufferSlice> result) mutable {
+        if (result.is_error()) {
+          LOG(ERROR) << "cannot obtain public library bodies: " << result.move_as_error();
+          return;
+        }
+        auto raw = result.move_as_ok();
+        auto bundle = raw.clone();
+        auto parsed = ton::fetch_tl_object<ton::lite_api::liteServer_libraryResult>(std::move(raw), true);
+        if (parsed.is_error()) {
+          LOG(ERROR) << "cannot parse liteServer.libraryResult: " << parsed.move_as_error();
+          return;
+        }
+        auto response = parsed.move_as_ok();
+        std::set<td::Bits256> seen;
+        for (const auto& entry : response->result_) {
+          if (!std::binary_search(libraries.begin(), libraries.end(), entry->hash_)) {
+            LOG(ERROR) << "public-library response contains an unrequested hash " << entry->hash_.to_hex();
+            return;
+          }
+          if (!seen.insert(entry->hash_).second) {
+            LOG(ERROR) << "public-library response contains duplicate hash " << entry->hash_.to_hex();
+            return;
+          }
+          auto contents = vm::std_boc_deserialize(entry->data_.as_slice());
+          if (contents.is_error() || contents.ok().is_null() ||
+              !contents.ok()->get_hash().bits().equals(entry->hash_.cbits(), 256)) {
+            LOG(ERROR) << "public library " << entry->hash_.to_hex() << " has invalid content";
+            return;
+          }
+          if (contents.ok()->get_depth() > 512) {
+            LOG(ERROR) << "public library " << entry->hash_.to_hex() << " exceeds the VM depth limit";
+            return;
+          }
+        }
+        if (seen.size() != libraries.size()) {
+          LOG(ERROR) << "one or more requested public libraries are absent from the latest state";
+          return;
+        }
+        auto size = bundle.size();
+        auto status = td::write_file(filename, std::move(bundle));
+        if (status.is_error()) {
+          LOG(ERROR) << "cannot save public-library body bundle to `" << filename << "`: "
+                     << status.move_as_error();
+          return;
+        }
+        td::TerminalIO::out() << "saved content-hash-checked public-library body bundle into file `" << filename
+                              << "` (" << size << " bytes)" << std::endl;
+      });
+}
+
+bool TestNode::save_libraries_proof(ton::BlockIdExt blkid, std::vector<td::Bits256> libraries,
+                                    std::string filename) {
+  if (!blkid.is_masterchain_ext()) {
+    return set_error("public-library proof requires a full masterchain block id");
+  }
+  if (!(ready_ && !client_.empty())) {
+    return set_error("server connection not ready");
+  }
+  std::sort(libraries.begin(), libraries.end());
+  libraries.erase(std::unique(libraries.begin(), libraries.end()), libraries.end());
+  auto query_libraries = libraries;
+  auto query = ton::serialize_tl_object(ton::create_tl_object<ton::lite_api::liteServer_getLibrariesWithProof>(
+                                            ton::create_tl_lite_block_id(blkid), 1, std::move(query_libraries)),
+                                        true);
+  LOG(INFO) << "requesting " << libraries.size() << " public libraries with proof for " << blkid;
+  return envelope_send_query(
+      std::move(query),
+      [blkid, libraries = std::move(libraries), filename = std::move(filename)](
+          td::Result<td::BufferSlice> result) mutable {
+        if (result.is_error()) {
+          LOG(ERROR) << "cannot obtain public-library proof: " << result.move_as_error();
+          return;
+        }
+        auto raw = result.move_as_ok();
+        auto bundle = raw.clone();
+        auto parsed = ton::fetch_tl_object<ton::lite_api::liteServer_libraryResultWithProof>(std::move(raw), true);
+        if (parsed.is_error()) {
+          LOG(ERROR) << "cannot parse liteServer.libraryResultWithProof: " << parsed.move_as_error();
+          return;
+        }
+        auto response = parsed.move_as_ok();
+        auto response_id = ton::create_block_id(response->id_);
+        if (response_id != blkid) {
+          LOG(ERROR) << "public-library proof is for " << response_id << " instead of " << blkid;
+          return;
+        }
+        if (response->mode_ & 2) {
+          LOG(ERROR) << "public-library response omitted library bodies";
+          return;
+        }
+        auto checked_state = block::check_extract_state_proof(
+            blkid, response->state_proof_.as_slice(), response->data_proof_.as_slice());
+        if (checked_state.is_error()) {
+          LOG(ERROR) << "invalid public-library state proof: " << checked_state.move_as_error();
+          return;
+        }
+        try {
+          block::gen::ShardStateUnsplit::Record state;
+          if (!tlb::unpack_cell(checked_state.move_as_ok(), state)) {
+            LOG(ERROR) << "cannot unpack masterchain state from public-library proof";
+            return;
+          }
+          vm::Dictionary proof_libraries(state.r1.libraries->prefetch_ref(), 256);
+          std::set<td::Bits256> seen;
+          for (const auto& entry : response->result_) {
+            if (!std::binary_search(libraries.begin(), libraries.end(), entry->hash_)) {
+              LOG(ERROR) << "public-library response contains an unrequested hash " << entry->hash_.to_hex();
+              return;
+            }
+            if (!seen.insert(entry->hash_).second) {
+              LOG(ERROR) << "public-library response contains duplicate hash " << entry->hash_.to_hex();
+              return;
+            }
+            auto proof_entry = proof_libraries.lookup(entry->hash_.bits(), 256);
+            block::gen::LibDescr::Record descriptor;
+            if (proof_entry.is_null() || !tlb::csr_unpack(proof_entry, descriptor)) {
+              LOG(ERROR) << "library " << entry->hash_.to_hex() << " is absent from its Merkle proof";
+              return;
+            }
+            auto contents = vm::std_boc_deserialize(entry->data_.as_slice());
+            if (contents.is_error() || contents.ok().is_null()) {
+              LOG(ERROR) << "cannot deserialize public library " << entry->hash_.to_hex();
+              return;
+            }
+            if (!contents.ok()->get_hash().bits().equals(entry->hash_.cbits(), 256) ||
+                contents.ok()->get_hash() != descriptor.lib->get_hash()) {
+              LOG(ERROR) << "public library " << entry->hash_.to_hex() << " does not match its proof";
+              return;
+            }
+            if (contents.ok()->get_depth() > 512) {
+              LOG(ERROR) << "public library " << entry->hash_.to_hex() << " exceeds the VM depth limit";
+              return;
+            }
+          }
+          if (seen.size() != libraries.size()) {
+            LOG(ERROR) << "one or more requested public libraries are absent from the response";
+            return;
+          }
+        } catch (const vm::VmError& error) {
+          LOG(ERROR) << "VM error while checking public-library proof: " << error.get_msg();
+          return;
+        } catch (const vm::VmVirtError& error) {
+          LOG(ERROR) << "virtualization error while checking public-library proof: " << error.get_msg();
+          return;
+        }
+        auto size = bundle.size();
+        auto status = td::write_file(filename, std::move(bundle));
+        if (status.is_error()) {
+          LOG(ERROR) << "cannot save public-library proof bundle to `" << filename << "`: "
+                     << status.move_as_error();
+          return;
+        }
+        td::TerminalIO::out() << "saved verified public-library proof bundle into file `" << filename << "` ("
+                              << size << " bytes)" << std::endl;
+      });
 }
 
 bool TestNode::register_config_param(int idx, Ref<vm::Cell> value) {

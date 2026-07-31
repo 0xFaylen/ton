@@ -237,6 +237,8 @@ class TestNode : public td::actor::Actor {
                              std::string filename = "", std::vector<int> params = {});
   void got_config_params(ton::BlockIdExt req_blkid, int mode, std::string filename, std::vector<int> params,
                          td::Result<td::BufferSlice> R, td::Promise<ConfigInfo> promise);
+  bool save_library_bodies(std::vector<td::Bits256> libraries, std::string filename);
+  bool save_libraries_proof(ton::BlockIdExt blkid, std::vector<td::Bits256> libraries, std::string filename);
   bool get_block(ton::BlockIdExt blk, bool dump = false);
   void got_block(ton::BlockIdExt blkid, td::BufferSlice data, bool dump);
   bool get_state(ton::BlockIdExt blk, bool dump = false);
