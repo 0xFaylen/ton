@@ -19,3 +19,15 @@ target_link_libraries(test-parallel-inbound-scheduler PRIVATE
 )
 target_include_directories(test-parallel-inbound-scheduler PRIVATE ${CMAKE_SOURCE_DIR}/validator)
 ton_test(test-parallel-inbound-scheduler)
+
+add_executable(test-parallel-cell-usage-journal
+    test-parallel-cell-usage-journal.cpp
+    ${CMAKE_SOURCE_DIR}/validator/impl/parallel-cell-usage-journal.cpp
+)
+target_link_libraries(test-parallel-cell-usage-journal PRIVATE
+    td-test-main
+    tdutils
+    ton_crypto
+)
+target_include_directories(test-parallel-cell-usage-journal PRIVATE ${CMAKE_SOURCE_DIR}/validator)
+ton_test(test-parallel-cell-usage-journal)

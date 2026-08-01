@@ -11,6 +11,7 @@ set(TON_VALIDATOR_SOURCE
   liteserver.cpp
   message-queue.cpp
   out-msg-queue-proof.cpp
+  parallel-cell-usage-journal.cpp
   proof.cpp
   shard.cpp
   top-shard-descr.cpp
@@ -28,6 +29,7 @@ set(TON_VALIDATOR_SOURCE
   liteserver-cache.hpp
   message-queue.hpp
   out-msg-queue-proof.hpp
+  parallel-cell-usage-journal.h
   proof.hpp
   shard.hpp
   top-shard-descr.hpp

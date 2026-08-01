@@ -67,6 +67,10 @@ These findings come from the checked-out TON source, not from external prose:
   one `CheckAccountTxs` actor per AccountBlock.
 - `CellUsageTree`, `current_tx_storage_dict_`, block limits and proof stats are
   mutable shared state and cannot be used concurrently without isolation.
+- `Transaction` itself holds a `const Account&` and mutates that account only in
+  `commit()`, but TVM cell loads mutate the shared usage/proof accounting before
+  commit through `CellUsageTree` callbacks. This is the first concrete worker
+  isolation boundary.
 
 This turns the unresolved partial-worker question into a precise rule: compute
 out of order if useful, but commit only the continuous global input prefix.
@@ -105,6 +109,15 @@ predecessor/sequence mismatches, account-local completion holes, and worker
 receipts for coordinator-only items. This is not live parallel execution: the
 cell payload, proof journal, global deltas, coordinator hash recomputation, and
 serial state commit remain explicit implementation gates.
+
+The first payload primitive is now executable as well. An anchored
+`CellUsageJournal` records worker-local reference paths and cell commitments.
+The coordinator resolves every path from its own immutable root before replaying
+it into the serial usage tree. Unit tests preserve the exact Merkle-proof hash,
+show arrival-order-independent journal union, and reject wrong anchors, paths,
+cells, and duplicates without partially mutating the coordinator tree. It is not
+wired to collator execution yet, and separate account-storage journals plus the
+Transaction/effects payload remain open.
 
 ## Dead ends and cautions
 

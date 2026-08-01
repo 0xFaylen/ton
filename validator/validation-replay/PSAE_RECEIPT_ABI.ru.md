@@ -1,8 +1,10 @@
 # PSAE worker receipt: контракт coordinator ↔ worker
 
 Статус: реализованы commitment header, детерминированная проверка account chain
-и unit tests. Execution payload, worker runtime и подключение к live collator
-ещё не реализованы. Поэтому этот код пока не ускоряет блок и не меняет state.
+и первый реальный компонент payload — hash-committed cell-usage journal с
+coordinator-side replay. Transaction/effects payload, worker runtime и
+подключение к live collator ещё не реализованы. Поэтому этот код пока не ускоряет
+блок и не меняет state.
 
 ## Зачем нужен receipt
 
@@ -48,6 +50,36 @@ Worker не получает validator keys и не применяет резу�
 prefix канонической очереди. `ProcessedUpto` обновляется только после такого
 commit, а не после завершения worker.
 
+## Реализованный proof journal
+
+Разбор исходного пути показал точную границу мутаций:
+
+- `Transaction` держит `const Account&`, а account меняется только в
+  `Transaction::commit()`;
+- но загрузки state cells во время TVM раньше commit уже отмечают общий
+  `CellUsageTree` и меняют оценку collated proof bytes через callback;
+- после исполнения coordinator ещё меняет `BlockLimitStatus`, account-dict
+  estimator, storage stats, new-message heap, max LT и value flow.
+
+`CellUsageJournal` изолирует первый из этих глобальных эффектов. Каждый local
+worker использует собственный `CellUsageTree` и записывает для загруженной cell:
+
+- hash immutable anchor root;
+- путь из reference indexes от anchor до cell;
+- ожидаемые cell hash и effective level.
+
+Journal имеет domain-separated SHA-256 commitment. При commit coordinator не
+доверяет присланной cell: он заново проходит путь от своей immutable pure root,
+сверяет anchor/hash/level и только затем воспроизводит load в своём serial
+`CellUsageTree`. Invalid path, wrong anchor, wrong cell и duplicate path
+отклоняются до изменения coordinator tree. Тесты подтверждают, что полученный
+Merkle proof равен serial proof, union двух worker journals не зависит от
+arrival order, а malformed journal не оставляет частично применённый proof.
+
+Это ещё не полная изоляция: отдельные journals для account storage proof должны
+быть привязаны к своим roots, затем объединены с state journal внутри receipt.
+Live collator пока продолжает использовать старый serial callback.
+
 ## Payload, который обязан появиться до P2
 
 Header сам по себе недостаточен. Канонический payload должен переносить:
@@ -56,7 +88,7 @@ Header сам по себе недостаточен. Канонический p
 - исходящие сообщения и изменения InMsg/OutMsg descriptors;
 - gas/value/LT и остальные вклады в глобальные limits;
 - account/storage dictionary deltas;
-- загруженные cells и изолированный proof/usage journal;
+- сериализованный набор anchored proof/usage journals;
 - все данные, нужные coordinator для повторного вычисления commitments.
 
 Coordinator обязан материализовать payload, заново вычислить все hashes,
@@ -86,7 +118,8 @@ network config vote или обновление контрактов. Remote sca
 ## Обязательные gates до включения
 
 1. Каноническая payload encoding и coordinator-side recomputation всех hashes.
-2. Изолированный `CellUsageTree`/proof context на lane и детерминированный union.
+2. Подключение уже проверенного isolated `CellUsageJournal` к state и account
+   storage contexts каждой lane; full-block deterministic union.
 3. Полное равенство Transaction, account, shard-state, Merkle-update и block
    roots против serial oracle на mainnet-derived copied state.
 4. Равенство `ProcessedUpto`, descriptors, gas/value flow и поведения на всех

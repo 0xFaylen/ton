@@ -181,6 +181,13 @@ commitment header: payload с ячейками и global deltas ещё не ре
 receipt не имеет права менять block state. Полный контракт и stop gates описаны
 в [`PSAE_RECEIPT_ABI.ru.md`](PSAE_RECEIPT_ABI.ru.md).
 
+Первый компонент payload уже реализован отдельно: anchored `CellUsageJournal`
+записывает worker-local cell paths, а coordinator повторно разрешает их от своей
+pure state root и сверяет cell hash/level. Synthetic-tree tests доказали равный
+serial Merkle proof, arrival-order-independent union и reject для подменённых
+anchor/path/cell. Этот primitive ещё не подключён к live execution и не закрывает
+account-storage journal, Transaction/effects payload или global limit merge.
+
 Gate на каждом block:
 
 - одинаковый serialized Transaction для каждого committed item;

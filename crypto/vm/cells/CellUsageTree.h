@@ -19,6 +19,8 @@
 #pragma once
 
 #include <functional>
+#include <optional>
+#include <vector>
 
 #include "td/utils/int_types.h"
 #include "td/utils/logging.h"
@@ -47,6 +49,7 @@ class CellUsageTree : public std::enable_shared_from_this<CellUsageTree> {
     NodePtr create_child(unsigned ref_id) const;
     bool mark_path(CellUsageTree* master_tree) const;
     bool is_from_tree(const CellUsageTree* master_tree) const;
+    std::optional<std::vector<td::uint8>> path() const;
 
    private:
     std::weak_ptr<CellUsageTree> tree_weak_;
@@ -67,6 +70,9 @@ class CellUsageTree : public std::enable_shared_from_this<CellUsageTree> {
   void set_cell_load_callback(std::function<void(const LoadedCell&)> f) {
     cell_load_callback_ = std::move(f);
   }
+  void set_cell_load_path_callback(std::function<void(const LoadedCell&)> f) {
+    cell_load_path_callback_ = std::move(f);
+  }
   void set_ignore_loads(bool value) {
     if (value) {
       ++ignore_loads_;
@@ -80,14 +86,17 @@ class CellUsageTree : public std::enable_shared_from_this<CellUsageTree> {
     bool is_loaded{false};
     bool has_mark{false};
     NodeId parent{0};
+    td::uint8 parent_ref_id{0};
     std::array<td::uint32, CellTraits::max_refs> children{};
   };
   bool use_mark_{false};
   std::vector<Node> nodes_{2};
   std::function<void(const LoadedCell&)> cell_load_callback_;
+  std::function<void(const LoadedCell&)> cell_load_path_callback_;
 
-  void on_load(NodeId node_id, const LoadedCell& loaded_cell);
-  NodeId create_node(NodeId parent);
+  void on_load(NodeId node_id, const LoadedCell& loaded_cell, const NodePtr& tree_node);
+  NodeId create_node(NodeId parent, unsigned parent_ref_id);
+  std::vector<td::uint8> get_path(NodeId node_id) const;
   int ignore_loads_ = 0;
 };
 }  // namespace vm
