@@ -13,6 +13,9 @@ target_include_directories(pack-viewer PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_
 
 add_executable(tvm-replay-bundle
   tvm-replay-bundle.cpp
+  ../validator/impl/parallel-inbound-scheduler.cpp
+  ../validator/impl/parallel-cell-usage-journal.cpp
+  ../validator/impl/parallel-transaction-payload.cpp
   ../validator/db/fileref.cpp
   ../validator/db/package.cpp
 )

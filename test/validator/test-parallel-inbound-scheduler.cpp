@@ -240,7 +240,7 @@ TEST(ParallelInboundScheduler, RejectsTamperedReceiptHeaderBeforeCommit) {
   ASSERT_EQ(result.error, ReceiptError::pre_state_mismatch);
   ASSERT_EQ(result.verified_receipts, 0u);
 
-  tampered = receipt(items[0], 10, 0, 100, 101, 10, 15);
+  tampered = receipt(items[0], 10, 0, 100, 101, 9, 15);
   result = validate_receipt_set(items, {tampered}, initial);
   ASSERT_EQ(result.error, ReceiptError::invalid_logical_time);
 
@@ -293,6 +293,15 @@ TEST(ParallelInboundScheduler, RejectsMalformedReceiptBindingsAndChains) {
 
   malformed = valid;
   malformed.transaction_end_lt = 10;
+  ASSERT_EQ(validate_receipt_set(items, {malformed}, initial).error, ReceiptError::invalid_logical_time);
+
+  malformed = valid;
+  malformed.transaction_start_lt = 10;
+  malformed.transaction_end_lt = 11;
+  ASSERT_TRUE(validate_receipt_set(items, {malformed}, initial));
+
+  malformed = valid;
+  malformed.transaction_end_lt = malformed.transaction_start_lt;
   ASSERT_EQ(validate_receipt_set(items, {malformed}, initial).error, ReceiptError::invalid_logical_time);
 }
 

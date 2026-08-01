@@ -25,6 +25,7 @@
 */
 
 #include <cstdlib>
+#include <cstring>
 #include <iostream>
 #include <map>
 #include <memory>
@@ -48,6 +49,7 @@
 #include "validator/db/fileref.hpp"
 #include "validator/db/package.hpp"
 #include "validator/impl/parallel-inbound-scheduler.h"
+#include "validator/impl/parallel-transaction-payload.h"
 #include "validator/interfaces/tvm-hotpath-stats.h"
 #include "vm/boc.h"
 #include "vm/cells/DataCell.h"
@@ -61,6 +63,15 @@ using ton::BlockId;
 using ton::BlockIdExt;
 using ton::StdSmcAddress;
 using ton::validator::TvmHotpathStats;
+using ton::validator::parallel_inbound::CanonicalTransactionPayload;
+using ton::validator::parallel_inbound::Hash256;
+using ton::validator::parallel_inbound::inspect_transaction_payload;
+
+Hash256 as_hash256(const td::Bits256& value) {
+  Hash256 result{};
+  std::memcpy(result.data(), value.as_slice().data(), result.size());
+  return result;
+}
 
 // Core's persistent-state serializer requires split_depth <= 63. This CLI uses
 // whole hexadecimal digits, so 60 is the largest representable supported depth.
@@ -120,6 +131,8 @@ struct ReplayResult {
   std::size_t skipped_accounts = 0;
   std::size_t transactions = 0;
   std::size_t tvm_transactions = 0;
+  std::size_t canonical_payloads_validated = 0;
+  std::size_t canonical_payload_out_messages = 0;
   TvmHotpathStats hotpaths;
   std::map<StdSmcAddress, AccountWork> account_work;
 
@@ -737,6 +750,7 @@ td::Result<ReplayResult> replay_transactions(const BlockContext& target, const L
               return false;
             }
           }
+          const auto pre_account_state_hash = account.total_state->get_hash().as_bits256();
           auto emulation = emulator.emulate_transaction(std::move(account), transaction);
           if (emulation.is_error()) {
             replay_status = emulation.move_as_error_prefix(PSTRING() << "transaction " << tx_key.get_uint(64) << " of "
@@ -744,6 +758,31 @@ td::Result<ReplayResult> replay_transactions(const BlockContext& target, const L
             return false;
           }
           auto emulated = emulation.move_as_ok();
+          CanonicalTransactionPayload canonical_payload{.transaction_root = emulated.transaction,
+                                                        .post_account_state = emulated.account.total_state,
+                                                        .proof_journals = {}};
+          auto payload_result = inspect_transaction_payload(canonical_payload);
+          if (!payload_result) {
+            replay_status = td::Status::Error(
+                PSTRING() << "canonical PSAE payload validation failed for transaction " << tx_key.get_uint(64)
+                          << " of " << address.to_hex() << ": "
+                          << ton::validator::parallel_inbound::to_string(payload_result.error));
+            return false;
+          }
+          const auto& payload_effects = payload_result.effects.value();
+          if (payload_effects.account != as_hash256(address) ||
+              payload_effects.pre_account_state_hash != as_hash256(pre_account_state_hash) ||
+              payload_effects.transaction_hash != as_hash256(transaction->get_hash().as_bits256()) ||
+              payload_effects.post_account_state_hash !=
+                  as_hash256(emulated.account.total_state->get_hash().as_bits256()) ||
+              payload_effects.gas_used != emulated.vm.billed_gas_used) {
+            replay_status = td::Status::Error(
+                PSTRING() << "canonical PSAE payload fields disagree with replay for transaction "
+                          << tx_key.get_uint(64) << " of " << address.to_hex());
+            return false;
+          }
+          ++result.canonical_payloads_validated;
+          result.canonical_payload_out_messages += payload_effects.outbound_messages.size();
           ++result.transactions;
           auto& account_work = result.account_work[address];
           ++account_work.transactions;
@@ -898,7 +937,11 @@ std::string replay_json(const BlockContext& target, const LoadedState* account_s
       << "\",\"target_accounts\":" << replay.target_accounts << ",\"accounts\":" << replay.accounts
       << ",\"skipped_accounts\":" << replay.skipped_accounts << ",\"transactions\":" << replay.transactions
       << ",\"tvm_transactions\":" << replay.tvm_transactions << ",\"ed25519_profiled\":" << profile_ed25519
-      << ",\"equivalence\":\"transaction_hash_and_account_state_hash\",\"hotpaths_wall\":"
+      << ",\"equivalence\":\"transaction_hash_and_account_state_hash\""
+      << ",\"psae_payload_validation\":{\"canonical_payloads\":" << replay.canonical_payloads_validated
+      << ",\"ordered_out_messages\":" << replay.canonical_payload_out_messages
+      << ",\"proof_journals\":\"empty_in_transaction_replay\",\"global_effects\":\"not_applied\"}"
+      << ",\"hotpaths_wall\":"
       << replay.hotpaths.to_json(false, 0, replay.hotpaths.size());
 #if TD_WINDOWS
   out << ",\"hotpaths_cpu\":null,\"cpu_metric_status\":\"unsupported_windows_timer_resolution\"";

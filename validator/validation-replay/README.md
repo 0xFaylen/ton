@@ -112,6 +112,14 @@ verification to every code-hash entry. It does not bypass signature checking or
 change gas accounting. The replay still requires exact transaction and
 resulting account-state hashes.
 
+Each replayed transaction is also passed through the in-process PSAE canonical
+payload validator. It reparses the Transaction and post-account cells, derives
+state/transaction hashes, gas and LT, validates the contiguous out-message
+dictionary, and reports counts under `psae_payload_validation`. This field is
+an ABI/equivalence check, not parallel execution: transaction replay supplies
+no proof journals and applies no global descriptor, limit, queue, or state-merge
+effects.
+
 The replay JSON also contains `account_lane_ceiling`. It groups measured
 transaction and TVM wall time by account and reports greedy ideal makespans for
 1/2/4/8/16 workers. This is an execution-only ceiling: it excludes worker

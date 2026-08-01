@@ -31,3 +31,17 @@ target_link_libraries(test-parallel-cell-usage-journal PRIVATE
 )
 target_include_directories(test-parallel-cell-usage-journal PRIVATE ${CMAKE_SOURCE_DIR}/validator)
 ton_test(test-parallel-cell-usage-journal)
+
+add_executable(test-parallel-transaction-payload
+    test-parallel-transaction-payload.cpp
+    ${CMAKE_SOURCE_DIR}/validator/impl/parallel-inbound-scheduler.cpp
+    ${CMAKE_SOURCE_DIR}/validator/impl/parallel-cell-usage-journal.cpp
+    ${CMAKE_SOURCE_DIR}/validator/impl/parallel-transaction-payload.cpp
+)
+target_link_libraries(test-parallel-transaction-payload PRIVATE
+    td-test-main
+    tdutils
+    ton_crypto
+)
+target_include_directories(test-parallel-transaction-payload PRIVATE ${CMAKE_SOURCE_DIR}/validator)
+ton_test(test-parallel-transaction-payload)

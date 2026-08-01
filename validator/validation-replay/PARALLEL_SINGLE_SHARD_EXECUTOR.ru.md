@@ -176,17 +176,23 @@ fallback с исходного predecessor state.
 destination account, account-local sequence, pre/post state commitments,
 transaction/effects/proof-journal commitments, LT interval и gas. Coordinator
 детерминированно отклоняет неканонический input, разрыв account chain,
-неверный predecessor и receipt для coordinator-only work. Это пока только
-commitment header: payload с ячейками и global deltas ещё не реализован, поэтому
-receipt не имеет права менять block state. Полный контракт и stop gates описаны
-в [`PSAE_RECEIPT_ABI.ru.md`](PSAE_RECEIPT_ABI.ru.md).
+неверный predecessor и receipt для coordinator-only work. Immutable cell payload
+теперь тоже реализован: canonical Transaction root, post-account cell и
+упорядоченный набор journals. Coordinator повторно разбирает TL-B, выводит
+state/transaction hashes, LT, gas и out-messages и пересчитывает commitments.
+Batch precommit при любой ошибке возвращает исходные checkpoints. Receipt всё
+ещё не имеет права менять block state, потому что global deltas не реализованы.
+Полный контракт и stop gates описаны в
+[`PSAE_RECEIPT_ABI.ru.md`](PSAE_RECEIPT_ABI.ru.md).
 
 Первый компонент payload уже реализован отдельно: anchored `CellUsageJournal`
 записывает worker-local cell paths, а coordinator повторно разрешает их от своей
 pure state root и сверяет cell hash/level. Synthetic-tree tests доказали равный
 serial Merkle proof, arrival-order-independent union и reject для подменённых
 anchor/path/cell. Этот primitive ещё не подключён к live execution и не закрывает
-account-storage journal, Transaction/effects payload или global limit merge.
+account-storage journal или global limit merge. Отдельный copied-mainnet replay
+проверил новый Transaction payload на 51/51 транзакциях и 42 out-messages блока
+`87341675`; journals там были пустыми, global effects не применялись.
 
 Gate на каждом block:
 

@@ -1,10 +1,11 @@
 # PSAE worker receipt: контракт coordinator ↔ worker
 
-Статус: реализованы commitment header, детерминированная проверка account chain
-и первый реальный компонент payload — hash-committed cell-usage journal с
-coordinator-side replay. Transaction/effects payload, worker runtime и
-подключение к live collator ещё не реализованы. Поэтому этот код пока не ускоряет
-блок и не меняет state.
+Статус: реализованы commitment header, детерминированная проверка account chain,
+hash-committed cell-usage journal и первая каноническая версия immutable
+Transaction payload. Coordinator заново разбирает TL-B и вычисляет commitments,
+а batch precommit не публикует частичный account frontier при ошибке. Global
+effects, worker runtime и подключение к live collator ещё не реализованы.
+Поэтому этот код пока не ускоряет блок и не меняет state.
 
 ## Зачем нужен receipt
 
@@ -12,9 +13,10 @@ TON-транзакция обрабатывает одно сообщение и
 PSAE использует это как заранее известную границу сериализации: разные accounts
 можно вычислять независимо, а транзакции одного account образуют строгую цепочку.
 Worker не получает validator keys и не применяет результат к глобальному state.
-Он возвращает immutable-by-convention commitment header и, на следующем этапе,
-канонический payload. Только coordinator может проверить и последовательно
-зафиксировать готовый глобальный prefix.
+Он возвращает materialized immutable cell payload и commitment header. Payload
+не может хранить `Transaction&` или ссылку на lane-local `Account`: после каждой
+транзакции остаются только canonical cells и journals. Только coordinator может
+проверить и последовательно зафиксировать готовый глобальный prefix.
 
 ## Реализованный header
 
@@ -77,19 +79,50 @@ Merkle proof равен serial proof, union двух worker journals не зав
 arrival order, а malformed journal не оставляет частично применённый proof.
 
 Это ещё не полная изоляция: отдельные journals для account storage proof должны
-быть привязаны к своим roots, затем объединены с state journal внутри receipt.
-Live collator пока продолжает использовать старый serial callback.
+быть привязаны к своим roots. `CanonicalTransactionPayload` уже принимает
+строго отсортированный набор anchored journals и вычисляет общий commitment, но
+offline transaction replay пока передаёт пустой набор, а live collator продолжает
+использовать старый serial callback.
 
-## Payload, который обязан появиться до P2
+## Реализованный canonical Transaction payload
 
-Header сам по себе недостаточен. Канонический payload должен переносить:
+`CanonicalTransactionPayload` переносит:
 
-- сериализованную Transaction и post-transaction Account;
-- исходящие сообщения и изменения InMsg/OutMsg descriptors;
-- gas/value/LT и остальные вклады в глобальные limits;
-- account/storage dictionary deltas;
-- сериализованный набор anchored proof/usage journals;
-- все данные, нужные coordinator для повторного вычисления commitments.
+- canonical Transaction root;
+- post-transaction Account cell;
+- канонически упорядоченный набор anchored proof/usage journals.
+
+`inspect_transaction_payload()` не доверяет header и заново:
+
+1. разбирает `Transaction` и `HASH_UPDATE Account`;
+2. проверяет TL-B post-account и совпадение его hash с `new_hash`;
+3. выводит account, pre/post state hashes и transaction hash;
+4. выводит `start_lt`, `end_lt = start_lt + outmsg_cnt + 1` и gas из
+   `TransactionDescr/TrComputePhase`;
+5. требует точные последовательные индексы `0..outmsg_cnt-1`, валидный
+   `Message Any` и сохраняет порядок/логический time всех out-messages;
+6. пересчитывает domain-separated effects и proof-journal commitments.
+
+`validate_precommit_set()` сначала проверяет каждый payload против receipt,
+затем всю account chain. На любой ошибке он возвращает исходные checkpoints, а
+не частично продвинутый frontier. Unit tests подменяют каждое выводимое поле,
+ломают cells и journal order, а также проверяют атомарность batch reject.
+
+На copied mainnet corpus block `87341675` offline replay повторно проверил 51/51
+canonical payloads, включая 42 упорядоченных out-messages, при прежнем точном
+совпадении transaction hash и account-state hash. Proof journals в этом прогоне
+пусты, global effects не применяются.
+
+## Payload/effects, которые ещё обязательны до P2
+
+Текущий payload подтверждает account-local consensus-visible output, но пока не
+переносит и не применяет:
+
+- изменения InMsg/OutMsg descriptors и new-message heap;
+- точные вклады в `BlockLimitStatus`, value flow, max LT и storage estimators;
+- account/storage dictionary deltas и полный state merge;
+- фактические state/account-storage journals из worker execution;
+- wire encoding и bounded transport для отдельного worker process.
 
 Coordinator обязан материализовать payload, заново вычислить все hashes,
 проверить текущий `BlockLimitStatus`, а затем применить его в serial canonical
@@ -117,7 +150,8 @@ network config vote или обновление контрактов. Remote sca
 
 ## Обязательные gates до включения
 
-1. Каноническая payload encoding и coordinator-side recomputation всех hashes.
+1. Зафиксировать wire encoding текущего canonical payload и bounded transport;
+   in-process TL-B recomputation уже реализован.
 2. Подключение уже проверенного isolated `CellUsageJournal` к state и account
    storage contexts каждой lane; full-block deterministic union.
 3. Полное равенство Transaction, account, shard-state, Merkle-update и block

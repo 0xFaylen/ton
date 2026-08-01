@@ -133,8 +133,11 @@ ReceiptValidationResult validate_receipt_set(const std::vector<WorkItem>& items,
       result.item_index = i;
       return result;
     }
-    if (receipt->transaction_start_lt <= checkpoint->second.last_transaction_end_lt ||
-        receipt->transaction_end_lt < receipt->transaction_start_lt) {
+    // Transaction LT intervals are half-open. ValidateQuery accepts the next
+    // transaction at exactly prev_start + prev_outmsg_count + 1, which is the
+    // previous end_lt; only overlap and empty/reversed intervals are invalid.
+    if (receipt->transaction_start_lt < checkpoint->second.last_transaction_end_lt ||
+        receipt->transaction_end_lt <= receipt->transaction_start_lt) {
       result.error = ReceiptError::invalid_logical_time;
       result.item_index = i;
       return result;

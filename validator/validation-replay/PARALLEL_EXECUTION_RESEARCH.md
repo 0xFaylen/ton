@@ -106,9 +106,9 @@ the latency-sensitive live node is explicitly out of scope.
 The scheduler now also has an executable immutable worker-receipt header and a
 deterministic account-chain validator. It rejects non-canonical input order,
 predecessor/sequence mismatches, account-local completion holes, and worker
-receipts for coordinator-only items. This is not live parallel execution: the
-cell payload, proof journal, global deltas, coordinator hash recomputation, and
-serial state commit remain explicit implementation gates.
+receipts for coordinator-only items. This is not live parallel execution:
+global deltas, worker runtime, descriptor/limit application, and serial state
+commit remain explicit implementation gates.
 
 The first payload primitive is now executable as well. An anchored
 `CellUsageJournal` records worker-local reference paths and cell commitments.
@@ -116,8 +116,20 @@ The coordinator resolves every path from its own immutable root before replaying
 it into the serial usage tree. Unit tests preserve the exact Merkle-proof hash,
 show arrival-order-independent journal union, and reject wrong anchors, paths,
 cells, and duplicates without partially mutating the coordinator tree. It is not
-wired to collator execution yet, and separate account-storage journals plus the
-Transaction/effects payload remain open.
+wired to collator execution yet, and separate account-storage journals remain
+open.
+
+The first immutable Transaction payload is now executable. It materializes the
+canonical Transaction root, post-account cell, and an ordered journal set; it
+never retains the mutable Transaction/Account objects. The coordinator reparses
+TL-B, derives account/pre/post/transaction hashes, gas, LT interval, and ordered
+out-messages, then recomputes effects and journal commitments. A pure batch
+precommit gate returns the initial checkpoints on any payload or receipt-chain
+failure. Unit tests tamper every derived header field. A copied full-block
+mainnet replay validated all 51 payloads and 42 ordered out-messages while
+preserving exact transaction/account-state hashes. Journals were empty and
+global effects were not applied in that replay, so this is an ABI/equivalence
+gate rather than measured parallel execution.
 
 ## Dead ends and cautions
 
