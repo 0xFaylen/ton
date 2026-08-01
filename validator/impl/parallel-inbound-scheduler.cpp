@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <map>
+#include <set>
 
 #include "parallel-inbound-scheduler.h"
 
@@ -68,6 +69,85 @@ PlanResult build_lane_plan(const std::vector<WorkItem>& items, std::size_t worke
   return {std::move(plan), PlanError::none};
 }
 
+ReceiptValidationResult validate_receipt_set(const std::vector<WorkItem>& items,
+                                             const std::vector<std::optional<WorkerReceipt>>& receipts,
+                                             const std::map<Hash256, AccountCheckpoint>& initial_checkpoints) {
+  ReceiptValidationResult result;
+  result.checkpoints = initial_checkpoints;
+  if (items.size() != receipts.size()) {
+    result.error = ReceiptError::size_mismatch;
+    return result;
+  }
+  for (std::size_t i = 1; i < items.size(); ++i) {
+    if (!(items[i - 1].key < items[i].key)) {
+      result.error = ReceiptError::non_canonical_input;
+      result.item_index = i;
+      return result;
+    }
+  }
+
+  std::set<Hash256> accounts_with_holes;
+  for (std::size_t i = 0; i < items.size(); ++i) {
+    const auto& item = items[i];
+    const auto& receipt = receipts[i];
+    if (!item.account) {
+      if (receipt) {
+        result.error = ReceiptError::unexpected_coordinator_receipt;
+        result.item_index = i;
+        return result;
+      }
+      continue;
+    }
+    if (!receipt) {
+      accounts_with_holes.insert(*item.account);
+      continue;
+    }
+    if (accounts_with_holes.count(*item.account) != 0) {
+      result.error = ReceiptError::missing_account_predecessor;
+      result.item_index = i;
+      return result;
+    }
+    if (!(receipt->input == item.key)) {
+      result.error = ReceiptError::input_key_mismatch;
+      result.item_index = i;
+      return result;
+    }
+    if (receipt->account != *item.account) {
+      result.error = ReceiptError::account_mismatch;
+      result.item_index = i;
+      return result;
+    }
+    auto checkpoint = result.checkpoints.find(*item.account);
+    if (checkpoint == result.checkpoints.end()) {
+      result.error = ReceiptError::missing_initial_checkpoint;
+      result.item_index = i;
+      return result;
+    }
+    if (receipt->account_sequence != checkpoint->second.next_sequence) {
+      result.error = ReceiptError::account_sequence_mismatch;
+      result.item_index = i;
+      return result;
+    }
+    if (receipt->pre_account_state_hash != checkpoint->second.state_hash) {
+      result.error = ReceiptError::pre_state_mismatch;
+      result.item_index = i;
+      return result;
+    }
+    if (receipt->transaction_start_lt <= checkpoint->second.last_transaction_end_lt ||
+        receipt->transaction_end_lt < receipt->transaction_start_lt) {
+      result.error = ReceiptError::invalid_logical_time;
+      result.item_index = i;
+      return result;
+    }
+
+    checkpoint->second.state_hash = receipt->post_account_state_hash;
+    ++checkpoint->second.next_sequence;
+    checkpoint->second.last_transaction_end_lt = receipt->transaction_end_lt;
+    ++result.verified_receipts;
+  }
+  return result;
+}
+
 const char* to_string(PlanError error) {
   switch (error) {
     case PlanError::none:
@@ -92,6 +172,34 @@ const char* to_string(PrefixStopReason reason) {
       return "block_limit";
     case PrefixStopReason::commit_failure:
       return "commit_failure";
+  }
+  return "unknown";
+}
+
+const char* to_string(ReceiptError error) {
+  switch (error) {
+    case ReceiptError::none:
+      return "none";
+    case ReceiptError::size_mismatch:
+      return "size_mismatch";
+    case ReceiptError::non_canonical_input:
+      return "non_canonical_input";
+    case ReceiptError::unexpected_coordinator_receipt:
+      return "unexpected_coordinator_receipt";
+    case ReceiptError::missing_initial_checkpoint:
+      return "missing_initial_checkpoint";
+    case ReceiptError::missing_account_predecessor:
+      return "missing_account_predecessor";
+    case ReceiptError::input_key_mismatch:
+      return "input_key_mismatch";
+    case ReceiptError::account_mismatch:
+      return "account_mismatch";
+    case ReceiptError::account_sequence_mismatch:
+      return "account_sequence_mismatch";
+    case ReceiptError::pre_state_mismatch:
+      return "pre_state_mismatch";
+    case ReceiptError::invalid_logical_time:
+      return "invalid_logical_time";
   }
   return "unknown";
 }

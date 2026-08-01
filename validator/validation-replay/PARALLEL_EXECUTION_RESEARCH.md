@@ -91,12 +91,20 @@ equivalence and must be fixed before performance publication.
 
 The next shadow instrumentation is now implemented but not yet measured. Exact
 offline collation records only successful ordinary-transaction creation wall by
-destination account; the ValidationReplayer output combines that with its outer
-collation wall and reports `serial residue + greedy account critical path` for
-1/2/4/8/16 workers. Default online collection remains bounded and stores no
-per-account work map. A full run requires a copied validator database with the
-historical queues/states; the latency-sensitive live node is explicitly out of
-scope.
+destination account and phase. The ValidationReplayer reports separate
+`inbound_internal`, `external`, `new_or_deferred`, `special`, and `all_ordinary`
+ceilings as `serial residue + greedy account critical path` for 1/2/4/8/16
+workers. The all-phase view merges the same account before lane planning.
+Default online collection remains bounded and stores no per-account work map. A
+full run requires a copied validator database with the historical queues/states;
+the latency-sensitive live node is explicitly out of scope.
+
+The scheduler now also has an executable immutable worker-receipt header and a
+deterministic account-chain validator. It rejects non-canonical input order,
+predecessor/sequence mismatches, account-local completion holes, and worker
+receipts for coordinator-only items. This is not live parallel execution: the
+cell payload, proof journal, global deltas, coordinator hash recomputation, and
+serial state commit remain explicit implementation gates.
 
 ## Dead ends and cautions
 

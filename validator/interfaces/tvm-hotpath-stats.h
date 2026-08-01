@@ -42,6 +42,14 @@ class TvmHotpathStats {
   static constexpr std::size_t default_output_limit = 10;
   static constexpr std::size_t exact_capacity = std::numeric_limits<std::size_t>::max();
 
+  enum class AccountWorkPhase : td::uint8 {
+    inbound_internal,
+    external,
+    new_or_deferred,
+    special,
+    unspecified,
+  };
+
   struct AccountId {
     WorkchainId workchain = workchainInvalid;
     StdSmcAddress address = StdSmcAddress::zero();
@@ -58,9 +66,19 @@ class TvmHotpathStats {
   };
 
   struct AccountWorkEntry {
+    AccountWorkPhase phase = AccountWorkPhase::unspecified;
     AccountId account;
     td::uint64 executions = 0;
     td::RealCpuTimer::Time observed_time;
+  };
+
+  struct AccountWorkKey {
+    AccountWorkPhase phase = AccountWorkPhase::unspecified;
+    AccountId account;
+
+    bool operator<(const AccountWorkKey& other) const {
+      return phase < other.phase || (phase == other.phase && account < other.account);
+    }
   };
 
   struct Entry {
@@ -281,13 +299,15 @@ class TvmHotpathStats {
   // Exact replay only: records the account-local portion that can move to a
   // PSAE worker. The default bounded online hotpath sketch deliberately keeps
   // no per-account timing map and therefore pays no cardinality cost.
-  void record_account_work(WorkchainId workchain, const StdSmcAddress& account, td::RealCpuTimer::Time time) {
+  void record_account_work(AccountWorkPhase phase, WorkchainId workchain, const StdSmcAddress& account,
+                           td::RealCpuTimer::Time time) {
     if (!exact_) {
       return;
     }
-    AccountId id{workchain, account};
-    auto& entry = exact_account_work_[id];
-    entry.account = id;
+    AccountWorkKey key{phase, {workchain, account}};
+    auto& entry = exact_account_work_[key];
+    entry.phase = phase;
+    entry.account = key.account;
     ++entry.executions;
     entry.observed_time += time;
   }
@@ -304,9 +324,10 @@ class TvmHotpathStats {
     exact_complete_ = exact_complete_ && (!exact_ || (other.exact_ && other.exact_complete_));
     if (exact_) {
       if (other.exact_) {
-        for (const auto& [account, incoming] : other.exact_account_work_) {
-          auto& entry = exact_account_work_[account];
-          entry.account = account;
+        for (const auto& [key, incoming] : other.exact_account_work_) {
+          auto& entry = exact_account_work_[key];
+          entry.phase = key.phase;
+          entry.account = key.account;
           entry.executions += incoming.executions;
           entry.observed_time += incoming.observed_time;
         }
@@ -568,7 +589,7 @@ class TvmHotpathStats {
   std::size_t capacity_;
   std::vector<Entry> entries_;
   std::map<td::Bits256, std::size_t> exact_entry_index_;
-  std::map<AccountId, AccountWorkEntry> exact_account_work_;
+  std::map<AccountWorkKey, AccountWorkEntry> exact_account_work_;
   bool exact_ = false;
   bool exact_complete_ = true;
   bool account_work_complete_ = true;

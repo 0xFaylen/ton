@@ -133,10 +133,10 @@ Gas складывается просто, но bytes/proofs не являютс
 - hole/failure/limit tests;
 - никаких изменений live path.
 
-Gate: 11 model tests проходят, включая промежуточные completion permutations,
+Gate: 18 model tests проходят, включая промежуточные completion permutations,
 worker/commit failure, limit boundary, account affinity и full-wall projection.
 
-### P1. Shadow full-wall planner — инструментация готова, corpus run ожидается
+### P1. Phase-aware shadow full-wall planner — инструментация готова, corpus run ожидается
 
 В offline replay serial collator продолжает строить настоящий block. В режиме
 `--exact-tvm-hotpaths` успешная ordinary transaction записывает полный
@@ -151,9 +151,10 @@ account-local creation wall (`TVM + storage/action/serialization`), но не м
 - флаг несогласованного измерения, если вложенные account timers неожиданно
   превышают outer wall.
 
-Первая метрика объединяет inbound, external и newly generated ordinary
-transactions. Поэтому это потолок полной архитектуры после P4, а не результат
-ограниченного P2. До P2 gate статистика должна получить phase split.
+Метрика теперь разделена на `inbound_internal`, `external`, `new_or_deferred`,
+`special` и `all_ordinary`. Для `all_ordinary` время одного account суммируется
+между фазами до планирования lane. Поэтому `inbound_internal` — честный потолок
+ограниченного P2, а `all_ordinary` — потолок полной архитектуры после P4.
 
 Default online mode не хранит per-account timing map. Профилирование запускается
 только на отдельной копии validator DB, не на нашей production/mainnet ноде.
@@ -170,6 +171,15 @@ Gate: shadow не меняет ни один root; overhead не более 2% �
 Workers исполняют account lanes на изолированных state/proof contexts.
 Coordinator применяет готовый prefix. На любом расхождении или timeout — serial
 fallback с исходного predecessor state.
+
+Исполняемый заголовок worker receipt уже фиксирует canonical input key,
+destination account, account-local sequence, pre/post state commitments,
+transaction/effects/proof-journal commitments, LT interval и gas. Coordinator
+детерминированно отклоняет неканонический input, разрыв account chain,
+неверный predecessor и receipt для coordinator-only work. Это пока только
+commitment header: payload с ячейками и global deltas ещё не реализован, поэтому
+receipt не имеет права менять block state. Полный контракт и stop gates описаны
+в [`PSAE_RECEIPT_ABI.ru.md`](PSAE_RECEIPT_ABI.ru.md).
 
 Gate на каждом block:
 

@@ -15,6 +15,7 @@
     along with TON Blockchain Library.  If not, see <http://www.gnu.org/licenses/>.
 */
 #include <deque>
+#include <map>
 
 #include "impl/parallel-inbound-scheduler.h"
 #include "ton/ton-io.hpp"
@@ -31,37 +32,28 @@ namespace ton::validator {
 
 namespace {
 
-std::string account_lane_ceiling_json(const TvmHotpathStats& stats, bool is_cpu,
-                                      std::optional<double> full_collation_wall) {
+using AccountWorkMap = std::map<TvmHotpathStats::AccountId, double>;
+
+std::string account_lane_scope_json(const char* scope, const AccountWorkMap& work_by_account,
+                                    std::optional<double> full_collation_wall) {
   td::StringBuilder out;
-  if (!stats.is_exact()) {
-    out << "{\"available\":false,\"reason\":\"exact_replay_required\"}";
-    return out.as_cslice().str();
-  }
-  if (!stats.account_work_complete()) {
-    out << "{\"available\":false,\"reason\":\"account_work_incomplete\"}";
-    return out.as_cslice().str();
-  }
-  const auto entries = stats.account_work_entries();
-  if (entries.empty()) {
-    out << "{\"available\":false,\"reason\":\"no_successful_ordinary_transactions\"}";
+  if (work_by_account.empty()) {
+    out << "{\"available\":false,\"scope\":\"" << scope << "\",\"reason\":\"no_transactions_in_scope\"}";
     return out.as_cslice().str();
   }
 
   std::vector<double> account_work;
-  account_work.reserve(entries.size());
+  account_work.reserve(work_by_account.size());
   double total_account_work = 0.0;
   double max_account_work = 0.0;
-  for (const auto& entry : entries) {
-    const auto work = entry.observed_time.get(is_cpu);
+  for (const auto& [_, work] : work_by_account) {
     account_work.push_back(work);
     total_account_work += work;
     max_account_work = std::max(max_account_work, work);
   }
 
-  out << "{\"available\":true,\"scope\":\"all_successful_ordinary_transaction_creation\",\"metric\":\""
-      << (is_cpu ? "cpu" : "wall") << "\",\"method\":\"greedy_lpt_account_totals\""
-      << ",\"distinct_accounts\":" << entries.size() << ",\"account_serial_seconds\":" << total_account_work
+  out << "{\"available\":true,\"scope\":\"" << scope << "\",\"method\":\"greedy_lpt_account_totals\""
+      << ",\"distinct_accounts\":" << work_by_account.size() << ",\"account_serial_seconds\":" << total_account_work
       << ",\"max_account_share\":" << (total_account_work > 0.0 ? max_account_work / total_account_work : 0.0)
       << ",\"full_collation_wall_seconds\":";
   if (full_collation_wall) {
@@ -91,7 +83,59 @@ std::string account_lane_ceiling_json(const TvmHotpathStats& stats, bool is_cpu,
     }
     out << "}";
   }
-  out << "],\"excludes\":[\"worker_contention\",\"receipt_merge_overhead\"]}";
+  out << "]}";
+  return out.as_cslice().str();
+}
+
+std::string account_lane_ceiling_json(const TvmHotpathStats& stats, bool is_cpu,
+                                      std::optional<double> full_collation_wall) {
+  td::StringBuilder out;
+  if (!stats.is_exact()) {
+    out << "{\"available\":false,\"reason\":\"exact_replay_required\"}";
+    return out.as_cslice().str();
+  }
+  if (!stats.account_work_complete()) {
+    out << "{\"available\":false,\"reason\":\"account_work_incomplete\"}";
+    return out.as_cslice().str();
+  }
+
+  AccountWorkMap all;
+  AccountWorkMap inbound_internal;
+  AccountWorkMap external;
+  AccountWorkMap new_or_deferred;
+  AccountWorkMap special;
+  for (const auto& entry : stats.account_work_entries()) {
+    const auto work = entry.observed_time.get(is_cpu);
+    all[entry.account] += work;
+    switch (entry.phase) {
+      case TvmHotpathStats::AccountWorkPhase::inbound_internal:
+        inbound_internal[entry.account] += work;
+        break;
+      case TvmHotpathStats::AccountWorkPhase::external:
+        external[entry.account] += work;
+        break;
+      case TvmHotpathStats::AccountWorkPhase::new_or_deferred:
+        new_or_deferred[entry.account] += work;
+        break;
+      case TvmHotpathStats::AccountWorkPhase::special:
+        special[entry.account] += work;
+        break;
+      case TvmHotpathStats::AccountWorkPhase::unspecified:
+        break;
+    }
+  }
+  if (all.empty()) {
+    out << "{\"available\":false,\"reason\":\"no_successful_ordinary_transactions\"}";
+    return out.as_cslice().str();
+  }
+
+  out << "{\"available\":true,\"metric\":\"" << (is_cpu ? "cpu" : "wall") << "\",\"scopes\":["
+      << account_lane_scope_json("all_ordinary", all, full_collation_wall) << ","
+      << account_lane_scope_json("inbound_internal", inbound_internal, full_collation_wall) << ","
+      << account_lane_scope_json("external", external, full_collation_wall) << ","
+      << account_lane_scope_json("new_or_deferred", new_or_deferred, full_collation_wall) << ","
+      << account_lane_scope_json("special", special, full_collation_wall)
+      << "],\"excludes\":[\"worker_contention\",\"receipt_merge_overhead\"]}";
   return out.as_cslice().str();
 }
 

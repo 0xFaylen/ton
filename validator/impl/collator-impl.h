@@ -116,7 +116,8 @@ class Collator final : public td::actor::Actor {
       Ref<vm::Cell> msg_root, block::Account* acc, UnixTime utime, LogicalTime lt,
       block::StoragePhaseConfig* storage_phase_cfg, block::ComputePhaseConfig* compute_phase_cfg,
       block::ActionPhaseConfig* action_phase_cfg, block::SerializeConfig* serialize_cfg, bool external,
-      LogicalTime after_lt, CollationStats* stats = nullptr);
+      LogicalTime after_lt, CollationStats* stats = nullptr,
+      TvmHotpathStats::AccountWorkPhase account_work_phase = TvmHotpathStats::AccountWorkPhase::unspecified);
 
  private:
   void start_up() override;
@@ -315,7 +316,8 @@ class Collator final : public td::actor::Actor {
   bool create_ticktock_transactions(int mask);
   bool create_ticktock_transaction(const ton::StdSmcAddress& smc_addr, ton::LogicalTime req_start_lt, int mask);
   Ref<vm::Cell> create_ordinary_transaction(Ref<vm::Cell> msg_root, td::optional<block::MsgMetadata> msg_metadata,
-                                            LogicalTime after_lt, bool is_special_tx = false);
+                                            LogicalTime after_lt, TvmHotpathStats::AccountWorkPhase account_work_phase,
+                                            bool is_special_tx = false);
   bool check_cur_validator_set();
   bool unpack_last_mc_state();
   bool unpack_last_state();

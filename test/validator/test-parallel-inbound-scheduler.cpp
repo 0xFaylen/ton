@@ -23,6 +23,21 @@ WorkItem item(std::uint64_t lt, std::uint64_t message_hash, std::optional<std::u
   return {{lt, hash(message_hash)}, account ? std::optional<Hash256>{hash(*account)} : std::nullopt};
 }
 
+WorkerReceipt receipt(const WorkItem& work, std::uint64_t account, std::uint64_t sequence, std::uint64_t pre_state,
+                      std::uint64_t post_state, std::uint64_t start_lt, std::uint64_t end_lt) {
+  return {.input = work.key,
+          .account = hash(account),
+          .account_sequence = sequence,
+          .pre_account_state_hash = hash(pre_state),
+          .transaction_hash = hash(1000 + sequence),
+          .post_account_state_hash = hash(post_state),
+          .effects_hash = hash(2000 + sequence),
+          .proof_journal_hash = hash(3000 + sequence),
+          .transaction_start_lt = start_lt,
+          .transaction_end_lt = end_lt,
+          .gas_used = 100 + sequence};
+}
+
 TEST(ParallelInboundScheduler, RejectsNonCanonicalInputAndZeroWorkers) {
   const std::vector<WorkItem> ordered{item(1, 1, 10), item(1, 2, 20)};
   ASSERT_EQ(build_lane_plan(ordered, 0).error, PlanError::no_workers);
@@ -166,6 +181,119 @@ TEST(ParallelInboundScheduler, AccountLanesAreEquivalentToSerialAccountState) {
   }
   ASSERT_EQ(seen.size(), items.size());
   ASSERT_EQ(lane_state, serial_state);
+}
+
+TEST(ParallelInboundScheduler, ValidatesInterleavedReceiptChainsPerAccount) {
+  const std::vector<WorkItem> items{item(1, 1, 10), item(1, 2, 20), item(1, 3, 10), item(1, 4, std::nullopt),
+                                    item(1, 5, 20)};
+  const std::vector<std::optional<WorkerReceipt>> receipts{
+      receipt(items[0], 10, 0, 100, 101, 11, 15), receipt(items[1], 20, 0, 200, 201, 21, 25),
+      receipt(items[2], 10, 1, 101, 102, 16, 20), std::nullopt, receipt(items[4], 20, 1, 201, 202, 26, 30)};
+  const std::map<Hash256, AccountCheckpoint> initial{
+      {hash(10), {.state_hash = hash(100), .next_sequence = 0, .last_transaction_end_lt = 10}},
+      {hash(20), {.state_hash = hash(200), .next_sequence = 0, .last_transaction_end_lt = 20}}};
+
+  auto result = validate_receipt_set(items, receipts, initial);
+  ASSERT_TRUE(result);
+  ASSERT_EQ(result.verified_receipts, 4u);
+  ASSERT_EQ(result.checkpoints.at(hash(10)).state_hash, hash(102));
+  ASSERT_EQ(result.checkpoints.at(hash(10)).next_sequence, 2u);
+  ASSERT_EQ(result.checkpoints.at(hash(20)).state_hash, hash(202));
+  ASSERT_EQ(result.checkpoints.at(hash(20)).last_transaction_end_lt, 30u);
+}
+
+TEST(ParallelInboundScheduler, AllowsOtherAccountsToProgressAcrossAPendingAccount) {
+  const std::vector<WorkItem> items{item(1, 1, 10), item(1, 2, 20), item(1, 3, 10), item(1, 4, 20)};
+  const std::vector<std::optional<WorkerReceipt>> receipts{std::nullopt, receipt(items[1], 20, 0, 200, 201, 21, 25),
+                                                           std::nullopt, receipt(items[3], 20, 1, 201, 202, 26, 30)};
+  const std::map<Hash256, AccountCheckpoint> initial{
+      {hash(10), {.state_hash = hash(100), .next_sequence = 0, .last_transaction_end_lt = 10}},
+      {hash(20), {.state_hash = hash(200), .next_sequence = 0, .last_transaction_end_lt = 20}}};
+
+  auto result = validate_receipt_set(items, receipts, initial);
+  ASSERT_TRUE(result);
+  ASSERT_EQ(result.verified_receipts, 2u);
+  ASSERT_EQ(result.checkpoints.at(hash(10)).state_hash, hash(100));
+  ASSERT_EQ(result.checkpoints.at(hash(20)).state_hash, hash(202));
+}
+
+TEST(ParallelInboundScheduler, RejectsReceiptAfterAnAccountLocalHole) {
+  const std::vector<WorkItem> items{item(1, 1, 10), item(1, 2, 20), item(1, 3, 10)};
+  const std::vector<std::optional<WorkerReceipt>> receipts{std::nullopt, receipt(items[1], 20, 0, 200, 201, 21, 25),
+                                                           receipt(items[2], 10, 0, 100, 101, 11, 15)};
+  const std::map<Hash256, AccountCheckpoint> initial{
+      {hash(10), {.state_hash = hash(100), .next_sequence = 0, .last_transaction_end_lt = 10}},
+      {hash(20), {.state_hash = hash(200), .next_sequence = 0, .last_transaction_end_lt = 20}}};
+
+  auto result = validate_receipt_set(items, receipts, initial);
+  ASSERT_EQ(result.error, ReceiptError::missing_account_predecessor);
+  ASSERT_EQ(result.item_index, std::optional<std::size_t>{2});
+}
+
+TEST(ParallelInboundScheduler, RejectsTamperedReceiptHeaderBeforeCommit) {
+  const std::vector<WorkItem> items{item(1, 1, 10)};
+  const std::map<Hash256, AccountCheckpoint> initial{
+      {hash(10), {.state_hash = hash(100), .next_sequence = 0, .last_transaction_end_lt = 10}}};
+
+  auto tampered = receipt(items[0], 10, 0, 999, 101, 11, 15);
+  auto result = validate_receipt_set(items, {tampered}, initial);
+  ASSERT_EQ(result.error, ReceiptError::pre_state_mismatch);
+  ASSERT_EQ(result.verified_receipts, 0u);
+
+  tampered = receipt(items[0], 10, 0, 100, 101, 10, 15);
+  result = validate_receipt_set(items, {tampered}, initial);
+  ASSERT_EQ(result.error, ReceiptError::invalid_logical_time);
+
+  tampered = receipt(items[0], 20, 0, 100, 101, 11, 15);
+  result = validate_receipt_set(items, {tampered}, initial);
+  ASSERT_EQ(result.error, ReceiptError::account_mismatch);
+}
+
+TEST(ParallelInboundScheduler, RejectsReceiptForCoordinatorOnlyWork) {
+  const std::vector<WorkItem> items{item(1, 1, std::nullopt)};
+  auto unexpected = receipt(item(1, 1, 10), 10, 0, 100, 101, 11, 15);
+  auto result = validate_receipt_set(items, {unexpected}, {});
+  ASSERT_EQ(result.error, ReceiptError::unexpected_coordinator_receipt);
+  ASSERT_EQ(result.item_index, std::optional<std::size_t>{0});
+}
+
+TEST(ParallelInboundScheduler, RejectsReceiptsOutsideCanonicalQueueOrder) {
+  const std::vector<WorkItem> items{item(1, 2, 10), item(1, 1, 10)};
+  const std::vector<std::optional<WorkerReceipt>> receipts{receipt(items[0], 10, 0, 100, 101, 11, 15),
+                                                           receipt(items[1], 10, 1, 101, 102, 16, 20)};
+  const std::map<Hash256, AccountCheckpoint> initial{
+      {hash(10), {.state_hash = hash(100), .next_sequence = 0, .last_transaction_end_lt = 10}}};
+
+  auto result = validate_receipt_set(items, receipts, initial);
+  ASSERT_EQ(result.error, ReceiptError::non_canonical_input);
+  ASSERT_EQ(result.item_index, std::optional<std::size_t>{1});
+  ASSERT_EQ(result.verified_receipts, 0u);
+
+  const std::vector<WorkItem> duplicate{item(1, 1, 10), item(1, 1, 10)};
+  result = validate_receipt_set(duplicate, {std::nullopt, std::nullopt}, initial);
+  ASSERT_EQ(result.error, ReceiptError::non_canonical_input);
+}
+
+TEST(ParallelInboundScheduler, RejectsMalformedReceiptBindingsAndChains) {
+  const std::vector<WorkItem> items{item(1, 1, 10)};
+  const std::map<Hash256, AccountCheckpoint> initial{
+      {hash(10), {.state_hash = hash(100), .next_sequence = 0, .last_transaction_end_lt = 10}}};
+  auto valid = receipt(items[0], 10, 0, 100, 101, 11, 15);
+
+  ASSERT_EQ(validate_receipt_set(items, {}, initial).error, ReceiptError::size_mismatch);
+  ASSERT_EQ(validate_receipt_set(items, {valid}, {}).error, ReceiptError::missing_initial_checkpoint);
+
+  auto malformed = valid;
+  malformed.input = item(1, 2, 10).key;
+  ASSERT_EQ(validate_receipt_set(items, {malformed}, initial).error, ReceiptError::input_key_mismatch);
+
+  malformed = valid;
+  malformed.account_sequence = 1;
+  ASSERT_EQ(validate_receipt_set(items, {malformed}, initial).error, ReceiptError::account_sequence_mismatch);
+
+  malformed = valid;
+  malformed.transaction_end_lt = 10;
+  ASSERT_EQ(validate_receipt_set(items, {malformed}, initial).error, ReceiptError::invalid_logical_time);
 }
 
 TEST(ParallelInboundScheduler, ReportsOnlyAnIdealOfflineAccountLaneCeiling) {

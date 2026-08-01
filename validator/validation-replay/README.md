@@ -4,7 +4,9 @@ The large single-shard execution track is documented in
 [`PARALLEL_SINGLE_SHARD_EXECUTOR.ru.md`](PARALLEL_SINGLE_SHARD_EXECUTOR.ru.md).
 Its first artifact is a pure prefix-safe account-lane scheduler with regression
 tests. It is not wired into the live collator yet. The bounded source review is
-kept in [`PARALLEL_EXECUTION_RESEARCH.md`](PARALLEL_EXECUTION_RESEARCH.md).
+kept in [`PARALLEL_EXECUTION_RESEARCH.md`](PARALLEL_EXECUTION_RESEARCH.md). The
+current worker/coordinator commitment contract and its remaining safety gates
+are specified in [`PSAE_RECEIPT_ABI.ru.md`](PSAE_RECEIPT_ABI.ru.md).
 
 `ValidationReplayer` reruns collation, validation, or both against blocks and
 states already present in a C++ validator database. It is intended for
@@ -49,16 +51,17 @@ vrp run --mode collate --exact-tvm-hotpaths '(0,8000000000000000,SEQNO)'
 vrp hotpaths <run_id> --source collate --metric wall --offset 0 --limit 100
 ```
 
-The response then includes `account_lane_ceiling`. It measures successful
-ordinary-transaction creation by destination account and models the full outer
-collation wall as unchanged serial residue plus a greedy 1/2/4/8/16-worker
-account critical path. The projection excludes worker contention and receipt
-merge overhead; it is not a measured parallel speedup. This first ceiling
-includes inbound, external, and newly generated ordinary transactions, so it
-describes the P4 end state and must not be reported as a P2 inbound-only result.
-Bounded online mode retains no per-account timing map. Do not run this profiling
-mode on a validator participating in consensus or on a latency-sensitive
-production node.
+The response then includes phase-separated `account_lane_ceiling` scopes:
+`inbound_internal`, `external`, `new_or_deferred`, `special`, and
+`all_ordinary`. Each scope measures successful ordinary-transaction creation by
+destination account and models the full outer collation wall as unchanged
+serial residue plus a greedy 1/2/4/8/16-worker account critical path. The
+`inbound_internal` scope is the honest P2 ceiling; `all_ordinary` describes the
+later P4 end state and merges work for the same account across phases. The
+projection excludes worker contention and receipt/state/proof merge overhead;
+it is not a measured parallel speedup. Bounded online mode retains no
+per-account timing map. Do not run this profiling mode on a validator
+participating in consensus or on a latency-sensitive production node.
 
 Collection work is timed separately as `trx_tvm_profile`; it is not included in
 the per-code `time_tvm` values. Exact maps can make the replay itself slower,

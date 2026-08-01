@@ -3320,6 +3320,7 @@ bool Collator::create_ticktock_transaction(const ton::StdSmcAddress& smc_addr, t
  */
 Ref<vm::Cell> Collator::create_ordinary_transaction(Ref<vm::Cell> msg_root,
                                                     td::optional<block::MsgMetadata> msg_metadata, LogicalTime after_lt,
+                                                    TvmHotpathStats::AccountWorkPhase account_work_phase,
                                                     bool is_special_tx) {
   ton::StdSmcAddress addr;
   auto cs = vm::load_cell_slice(msg_root);
@@ -3373,7 +3374,8 @@ Ref<vm::Cell> Collator::create_ordinary_transaction(Ref<vm::Cell> msg_root,
   }
   set_current_tx_storage_dict(*acc);
   auto res = impl_create_ordinary_transaction(msg_root, acc, now_, start_lt, &storage_phase_cfg_, &compute_phase_cfg_,
-                                              &action_phase_cfg_, &serialize_cfg_, external, after_lt, &stats_);
+                                              &action_phase_cfg_, &serialize_cfg_, external, after_lt, &stats_,
+                                              account_work_phase);
   if (res.is_error()) {
     auto error = res.move_as_error();
     if (error.code() == -701) {
@@ -3439,7 +3441,7 @@ td::Result<std::unique_ptr<block::transaction::Transaction>> Collator::impl_crea
     Ref<vm::Cell> msg_root, block::Account* acc, UnixTime utime, LogicalTime lt,
     block::StoragePhaseConfig* storage_phase_cfg, block::ComputePhaseConfig* compute_phase_cfg,
     block::ActionPhaseConfig* action_phase_cfg, block::SerializeConfig* serialize_cfg, bool external,
-    LogicalTime after_lt, CollationStats* stats) {
+    LogicalTime after_lt, CollationStats* stats, TvmHotpathStats::AccountWorkPhase account_work_phase) {
   if (acc->last_trans_end_lt_ >= lt && acc->transactions.empty()) {
     return td::Status::Error(-669, PSTRING() << "last transaction time in the state of account " << acc->workchain
                                              << ":" << acc->addr.to_hex() << " is too large");
@@ -3468,7 +3470,8 @@ td::Result<std::unique_ptr<block::transaction::Transaction>> Collator::impl_crea
           stats->work_time.trx_tvm_profile += trans->time_tvm_profile + profile_timer.elapsed_both();
         }
         if (transaction_ready) {
-          stats->work_time.tvm_hotpath.record_account_work(trans->account.workchain, trans->account.addr, elapsed);
+          stats->work_time.tvm_hotpath.record_account_work(account_work_phase, trans->account.workchain,
+                                                           trans->account.addr, elapsed);
         }
       }
     };
@@ -3733,7 +3736,10 @@ int Collator::process_one_new_message(block::NewOutMsg msg, bool enqueue_only, R
     return -1;
   }
   // 1. create a Transaction processing this Message
-  auto trans_root = create_ordinary_transaction(msg.msg, msg.metadata, msg.lt, is_special != nullptr);
+  auto trans_root = create_ordinary_transaction(
+      msg.msg, msg.metadata, msg.lt,
+      is_special ? TvmHotpathStats::AccountWorkPhase::special : TvmHotpathStats::AccountWorkPhase::new_or_deferred,
+      is_special != nullptr);
   if (trans_root.is_null()) {
     fatal_error("cannot create transaction for re-processing output message");
     return -1;
@@ -4100,7 +4106,8 @@ bool Collator::process_inbound_message(Ref<vm::CellSlice> enq_msg, ton::LogicalT
   // process the message by an ordinary transaction similarly to process_one_new_message()
   //
   // 8. create a Transaction processing this Message
-  auto trans_root = create_ordinary_transaction(env.msg, env.metadata, 0);
+  auto trans_root =
+      create_ordinary_transaction(env.msg, env.metadata, 0, TvmHotpathStats::AccountWorkPhase::inbound_internal);
   if (trans_root.is_null()) {
     return fatal_error("cannot create transaction for processing inbound message");
   }
@@ -4395,7 +4402,8 @@ int Collator::process_external_message(Ref<vm::Cell> msg) {
   }
   // process message by a transaction in this block:
   // 1. create a Transaction processing this Message
-  auto trans_root = create_ordinary_transaction(msg, /* metadata = */ {}, 0);
+  auto trans_root =
+      create_ordinary_transaction(msg, /* metadata = */ {}, 0, TvmHotpathStats::AccountWorkPhase::external);
   if (trans_root.is_null()) {
     if (busy_) {
       // transaction rejected by account

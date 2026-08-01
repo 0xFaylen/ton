@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <numeric>
 #include <optional>
 #include <string>
@@ -27,6 +28,63 @@ struct WorkItem {
   MessageKey key;
   std::optional<Hash256> account;
 };
+
+// Immutable-by-convention commitment header returned by an account worker.
+// The future payload contains the referenced cells and global deltas; the
+// coordinator must materialize and hash that payload before committing it.
+// A header alone is never sufficient to mutate block state.
+struct WorkerReceipt {
+  MessageKey input;
+  Hash256 account{};
+  std::uint64_t account_sequence{0};
+  Hash256 pre_account_state_hash{};
+  Hash256 transaction_hash{};
+  Hash256 post_account_state_hash{};
+  Hash256 effects_hash{};
+  Hash256 proof_journal_hash{};
+  std::uint64_t transaction_start_lt{0};
+  std::uint64_t transaction_end_lt{0};
+  std::uint64_t gas_used{0};
+};
+
+struct AccountCheckpoint {
+  Hash256 state_hash{};
+  std::uint64_t next_sequence{0};
+  std::uint64_t last_transaction_end_lt{0};
+};
+
+enum class ReceiptError {
+  none,
+  size_mismatch,
+  non_canonical_input,
+  unexpected_coordinator_receipt,
+  missing_initial_checkpoint,
+  missing_account_predecessor,
+  input_key_mismatch,
+  account_mismatch,
+  account_sequence_mismatch,
+  pre_state_mismatch,
+  invalid_logical_time,
+};
+
+struct ReceiptValidationResult {
+  ReceiptError error{ReceiptError::none};
+  std::optional<std::size_t> item_index;
+  std::size_t verified_receipts{0};
+  std::map<Hash256, AccountCheckpoint> checkpoints;
+
+  explicit operator bool() const {
+    return error == ReceiptError::none;
+  }
+};
+
+// Validates completed receipt headers without changing block state. Missing
+// receipts are allowed, but a later receipt for the same account cannot cross
+// that account-local hole. Global commit order remains the separate
+// commit_ready_prefix() invariant.
+ReceiptValidationResult validate_receipt_set(const std::vector<WorkItem>& items,
+                                             const std::vector<std::optional<WorkerReceipt>>& receipts,
+                                             const std::map<Hash256, AccountCheckpoint>& initial_checkpoints);
 
 struct LanePlan {
   std::vector<std::vector<std::size_t>> account_lanes;
@@ -175,5 +233,6 @@ PrefixDecision commit_ready_prefix(const std::vector<CompletionStatus>& completi
 
 const char* to_string(PlanError error);
 const char* to_string(PrefixStopReason reason);
+const char* to_string(ReceiptError error);
 
 }  // namespace ton::validator::parallel_inbound

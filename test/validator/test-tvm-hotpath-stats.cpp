@@ -168,8 +168,9 @@ TEST(TvmHotpathStats, ExactModeMergesAndExportsPaginatedJson) {
 }
 
 TEST(TvmHotpathStats, RecordsAccountWorkOnlyInExactReplayMode) {
+  using Phase = TvmHotpathStats::AccountWorkPhase;
   TvmHotpathStats bounded;
-  bounded.record_account_work(basechainId, make_hash(100), make_time(1.0, 0.8));
+  bounded.record_account_work(Phase::inbound_internal, basechainId, make_hash(100), make_time(1.0, 0.8));
   ASSERT_TRUE(bounded.account_work_entries().empty());
   ASSERT_TRUE(!bounded.account_work_complete());
 
@@ -177,22 +178,29 @@ TEST(TvmHotpathStats, RecordsAccountWorkOnlyInExactReplayMode) {
   TvmHotpathStats second;
   first.enable_exact();
   second.enable_exact();
-  first.record_account_work(basechainId, make_hash(100), make_time(0.3, 0.2));
-  second.record_account_work(basechainId, make_hash(100), make_time(0.2, 0.1));
-  second.record_account_work(basechainId, make_hash(200), make_time(0.5, 0.4));
+  first.record_account_work(Phase::inbound_internal, basechainId, make_hash(100), make_time(0.3, 0.2));
+  second.record_account_work(Phase::inbound_internal, basechainId, make_hash(100), make_time(0.2, 0.1));
+  second.record_account_work(Phase::external, basechainId, make_hash(100), make_time(0.5, 0.4));
+  second.record_account_work(Phase::new_or_deferred, basechainId, make_hash(200), make_time(0.4, 0.3));
 
   first.merge(second);
   first.scale(0.5);
 
   ASSERT_TRUE(first.account_work_complete());
   const auto work = first.account_work_entries();
-  ASSERT_EQ(work.size(), 2u);
+  ASSERT_EQ(work.size(), 3u);
+  ASSERT_EQ(work[0].phase, Phase::inbound_internal);
   ASSERT_EQ(work[0].executions, 1u);
   ASSERT_TRUE(std::abs(work[0].observed_time.real - 0.25) < 1e-12);
   ASSERT_TRUE(std::abs(work[0].observed_time.cpu - 0.15) < 1e-12);
+  ASSERT_EQ(work[1].phase, Phase::external);
   ASSERT_EQ(work[1].executions, 1u);
   ASSERT_TRUE(std::abs(work[1].observed_time.real - 0.25) < 1e-12);
   ASSERT_TRUE(std::abs(work[1].observed_time.cpu - 0.2) < 1e-12);
+  ASSERT_EQ(work[2].phase, Phase::new_or_deferred);
+  ASSERT_EQ(work[2].account.address, make_hash(200));
+  ASSERT_TRUE(std::abs(work[2].observed_time.real - 0.2) < 1e-12);
+  ASSERT_TRUE(std::abs(work[2].observed_time.cpu - 0.15) < 1e-12);
 }
 
 TEST(TvmHotpathStats, TreatsSameAddressInDifferentWorkchainsAsDistinctAccounts) {
