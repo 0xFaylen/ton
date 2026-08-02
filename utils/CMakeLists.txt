@@ -15,6 +15,7 @@ add_executable(tvm-replay-bundle
   tvm-replay-bundle.cpp
   ../validator/impl/parallel-coordinator-shadow.cpp
   ../validator/impl/parallel-inbound-scheduler.cpp
+  ../validator/impl/parallel-merkle-proof-merge.cpp
   ../validator/impl/parallel-cell-usage-journal.cpp
   ../validator/impl/parallel-transaction-payload.cpp
   ../validator/impl/parallel-worker-pool.cpp

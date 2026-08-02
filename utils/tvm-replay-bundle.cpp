@@ -55,6 +55,7 @@
 #include "validator/db/package.hpp"
 #include "validator/impl/parallel-coordinator-shadow.h"
 #include "validator/impl/parallel-inbound-scheduler.h"
+#include "validator/impl/parallel-merkle-proof-merge.h"
 #include "validator/impl/parallel-transaction-payload.h"
 #include "validator/impl/parallel-worker-pool.h"
 #include "validator/interfaces/tvm-hotpath-stats.h"
@@ -259,6 +260,12 @@ struct ReplayResult {
   double phase_block_limits_seconds = 0.0;
   double phase_coordinator_seconds = 0.0;
   double phase_augmented_roots_seconds = 0.0;
+  double phase_root_inputs_seconds = 0.0;
+  double phase_root_predecessor_proof_seconds = 0.0;
+  double phase_root_descriptor_baseline_seconds = 0.0;
+  double phase_root_account_binding_seconds = 0.0;
+  double phase_root_state_transition_seconds = 0.0;
+  double phase_root_commit_seconds = 0.0;
   double replay_total_seconds = 0.0;
   TvmHotpathStats hotpaths;
   std::map<StdSmcAddress, AccountWork> account_work;
@@ -1302,18 +1309,15 @@ td::Result<Ref<vm::Cell>> build_predecessor_accounts_proof(const std::string& ar
     return td::Status::Error("cannot build ShardAccounts proof without account proofs");
   }
   const auto base_block = proofs.front().shard_block;
-  Ref<vm::Cell> combined;
+  std::vector<Ref<vm::Cell>> state_proofs;
+  state_proofs.reserve(proofs.size());
   for (const auto& proof : proofs) {
     if (proof.shard_block != base_block || proof.state_proof.is_null()) {
       return td::Status::Error("account proofs do not share one shard-state root");
     }
-    if (combined.is_null()) {
-      combined = proof.state_proof;
-    } else {
-      TRY_RESULT(next, vm::MerkleProof::combine(std::move(combined), proof.state_proof));
-      combined = std::move(next);
-    }
+    state_proofs.push_back(proof.state_proof);
   }
+  TRY_RESULT(combined, ton::validator::parallel_inbound::merge_merkle_proofs_fast(state_proofs));
 
   vm::CellSlice combined_proof{vm::NoVm(), combined};
   if (combined_proof.special_type() != vm::Cell::SpecialType::MerkleProof || combined_proof.size_refs() != 1) {
@@ -1957,6 +1961,13 @@ td::Result<ReplayResult> replay_transactions(
 
   if (validate_augmented_roots && result.skipped_accounts == 0 && !account_proofs.empty()) {
     std::string root_stage = "extract_update_views";
+    td::Timer augmented_root_timer;
+    double augmented_root_checkpoint = 0.0;
+    const auto record_root_phase = [&](double& destination) {
+      const auto now = augmented_root_timer.elapsed();
+      destination += now - augmented_root_checkpoint;
+      augmented_root_checkpoint = now;
+    };
     try {
       TRY_RESULT(update_views, extract_state_update_views(target));
       result.collated_predecessor_witness_loaded = collated_predecessor_witness.not_null();
@@ -1971,12 +1982,14 @@ td::Result<ReplayResult> replay_transactions(
       }
       root_stage = "extract_predecessor_accounts_root";
       TRY_RESULT(target_predecessor_accounts_root, extract_partial_shard_accounts_root(update_views.first));
+      record_root_phase(result.phase_root_inputs_seconds);
       root_stage = "build_predecessor_accounts_proof";
       TRY_RESULT(predecessor_accounts_root, build_predecessor_accounts_proof(archive, history, target, account_proofs));
       if (predecessor_accounts_root->get_hash() != target_predecessor_accounts_root->get_hash()) {
         return td::Status::Error("combined account proof disagrees with target Merkle-update predecessor root");
       }
       result.shard_accounts_predecessor_root_bound = true;
+      record_root_phase(result.phase_root_predecessor_proof_seconds);
 
       root_stage = "strip_target_descriptors";
       block::tlb::Aug_InMsgDescr in_augmentation{config->get_global_version()};
@@ -2003,6 +2016,7 @@ td::Result<ReplayResult> replay_transactions(
           return td::Status::Error("canonical OutMsg descriptor value disagrees with target root");
         }
       }
+      record_root_phase(result.phase_root_descriptor_baseline_seconds);
 
       std::vector<ton::validator::parallel_inbound::QueueDictionaryDelta> queue_deltas;
 
@@ -2028,6 +2042,7 @@ td::Result<ReplayResult> replay_transactions(
           return td::Status::Error("replayed account existence disagrees with predecessor ShardAccounts root");
         }
       }
+      record_root_phase(result.phase_root_account_binding_seconds);
 
       if (collated_predecessor_witness.not_null()) {
         root_stage = "apply_account_state_transition";
@@ -2157,6 +2172,7 @@ td::Result<ReplayResult> replay_transactions(
         result.shard_accounts_transition_status = "requires_collated_data_predecessor_witness";
         result.out_msg_queue_transition_status = "requires_collated_data_predecessor_witness";
       }
+      record_root_phase(result.phase_root_state_transition_seconds);
 
       root_stage = "apply_augmented_deltas";
       const bool complete_state_transition = collated_predecessor_witness.not_null() &&
@@ -2199,6 +2215,7 @@ td::Result<ReplayResult> replay_transactions(
       } else {
         result.augmented_dictionary_roots_validated = 2;
       }
+      record_root_phase(result.phase_root_commit_seconds);
     } catch (vm::VmVirtError& error) {
       return td::Status::Error(PSTRING() << "augmented root gate virtualization error at " << root_stage << ": "
                                          << error.get_msg());
@@ -2911,7 +2928,8 @@ std::string account_lane_ceiling_json(const ReplayResult& replay) {
 }
 
 std::string single_shard_capacity_json(const BlockContext& target, const ReplayResult& replay,
-                                       const ParallelAccountReplayProbe* parallel_probe) {
+                                       const ParallelAccountReplayProbe* parallel_probe,
+                                       const OfflineCollatorReplayProbe* offline_collator_probe) {
   const bool full_block = replay.skipped_accounts == 0 && replay.accounts == replay.target_accounts;
   const double target_rate_seconds = static_cast<double>(replay.consensus_target_rate_ms) / 1000.0;
   const double bytes_per_raw_transaction =
@@ -2987,6 +3005,24 @@ std::string single_shard_capacity_json(const BlockContext& target, const ReplayR
   } else {
     out << "null";
   }
+  out << ",\"serial_full_replay_raw_tps\":";
+  if (full_block && replay.replay_total_seconds > 0.0) {
+    out << static_cast<double>(replay.transactions) / replay.replay_total_seconds;
+  } else {
+    out << "null";
+  }
+  out << ",\"offline_collator_full_replay_raw_tps\":";
+  if (full_block && offline_collator_probe != nullptr && offline_collator_probe->total_seconds > 0.0) {
+    out << static_cast<double>(offline_collator_probe->transactions) / offline_collator_probe->total_seconds;
+  } else {
+    out << "null";
+  }
+  out << ",\"offline_collator_full_replay_speedup\":";
+  if (offline_collator_probe != nullptr) {
+    out << offline_collator_probe->speedup();
+  } else {
+    out << "null";
+  }
   out << ",\"mainnet_sustainable_raw_tps\":null"
       << ",\"missing_gates\":[\"live_collator_integration\",\"validate_query_wall\","
          "\"four_root_commit_wall\",\"active_config23_dimension_under_saturation\","
@@ -2994,6 +3030,7 @@ std::string single_shard_capacity_json(const BlockContext& target, const ReplayR
          "\"network_candidate_delivery\"]"
       << ",\"warnings\":[\"linear_block_boc_density_projection\",\"mixed_raw_transaction_workload\","
          "\"isolated_replay_is_not_collation\",\"offline_root_probe_is_not_live_collator_commit\","
+         "\"offline_full_replay_rate_is_not_sustainable_mainnet_tps\","
          "\"three_transaction_operation_is_not_workload_classification\","
          "\"billed_gas_sum_excludes_unreconstructed_special_context\","
          "\"target_rate_is_not_observed_block_interval\",\"max_block_bytes_may_not_be_active_limit\","
@@ -3060,7 +3097,13 @@ std::string replay_json(const BlockContext& target, const LoadedState* account_s
       << ",\"shadow_coordinator_queue_scope\":\"descriptor_derived_deletion_subset\""
       << ",\"collated_predecessor_witness_loaded\":" << (replay.collated_predecessor_witness_loaded ? "true" : "false")
       << ",\"predecessor_state_witness_source\":\"" << replay.predecessor_state_witness_source << "\""
-      << ",\"shard_account_proof_values_bound\":" << replay.shard_account_proof_values_bound
+      << ",\"predecessor_proof_merge_algorithm\":";
+  if (replay.shard_accounts_predecessor_root_bound) {
+    out << "\"ton_merkle_proof_combine_fast_incremental\"";
+  } else {
+    out << "null";
+  }
+  out << ",\"shard_account_proof_values_bound\":" << replay.shard_account_proof_values_bound
       << ",\"shard_accounts_predecessor_root_bound\":"
       << (replay.shard_accounts_predecessor_root_bound ? "true" : "false")
       << ",\"shard_accounts_transition_validated\":" << (replay.shard_accounts_transition_validated ? "true" : "false")
@@ -3099,6 +3142,12 @@ std::string replay_json(const BlockContext& target, const LoadedState* account_s
       << ",\"block_limits_seconds\":" << replay.phase_block_limits_seconds
       << ",\"coordinator_seconds\":" << replay.phase_coordinator_seconds
       << ",\"augmented_roots_seconds\":" << replay.phase_augmented_roots_seconds
+      << ",\"augmented_root_subphases\":{\"inputs_seconds\":" << replay.phase_root_inputs_seconds
+      << ",\"predecessor_proof_seconds\":" << replay.phase_root_predecessor_proof_seconds
+      << ",\"descriptor_baseline_seconds\":" << replay.phase_root_descriptor_baseline_seconds
+      << ",\"account_binding_seconds\":" << replay.phase_root_account_binding_seconds
+      << ",\"state_transition_seconds\":" << replay.phase_root_state_transition_seconds
+      << ",\"root_commit_seconds\":" << replay.phase_root_commit_seconds << "}"
       << ",\"augmented_roots_validated\":" << replay.augmented_dictionary_roots_validated
       << ",\"total_seconds\":" << replay.replay_total_seconds << "}"
       << ",\"hotpaths_wall\":" << replay.hotpaths.to_json(false, 0, replay.hotpaths.size());
@@ -3204,7 +3253,8 @@ std::string replay_json(const BlockContext& target, const LoadedState* account_s
         << ",\"excludes\":[\"worker_pool_startup\",\"live_collator_mutation\",\"block_candidate_serialization\","
            "\"validate_query\",\"network\",\"consensus\"]}";
   }
-  out << ",\"single_shard_capacity\":" << single_shard_capacity_json(target, replay, parallel_probe) << "}";
+  out << ",\"single_shard_capacity\":"
+      << single_shard_capacity_json(target, replay, parallel_probe, offline_collator_probe) << "}";
   return out.as_cslice().str();
 }
 

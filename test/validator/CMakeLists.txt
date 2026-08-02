@@ -31,6 +31,18 @@ target_link_libraries(test-parallel-worker-pool PRIVATE
 target_include_directories(test-parallel-worker-pool PRIVATE ${CMAKE_SOURCE_DIR}/validator)
 ton_test(test-parallel-worker-pool)
 
+add_executable(test-parallel-merkle-proof-merge
+    test-parallel-merkle-proof-merge.cpp
+    ${CMAKE_SOURCE_DIR}/validator/impl/parallel-merkle-proof-merge.cpp
+)
+target_link_libraries(test-parallel-merkle-proof-merge PRIVATE
+    td-test-main
+    tdutils
+    ton_crypto
+)
+target_include_directories(test-parallel-merkle-proof-merge PRIVATE ${CMAKE_SOURCE_DIR}/validator)
+ton_test(test-parallel-merkle-proof-merge)
+
 add_executable(test-parallel-cell-usage-journal
     test-parallel-cell-usage-journal.cpp
     ${CMAKE_SOURCE_DIR}/validator/impl/parallel-cell-usage-journal.cpp

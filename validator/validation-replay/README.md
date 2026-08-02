@@ -260,28 +260,45 @@ remain in the measured path. The probe is opt-in, offline-only, and requires a
 complete account-proof replay. It does not mutate a Collator, submit a
 candidate, or participate in consensus.
 
-Two batches of five independent Release processes on copied block `88028077`
-used four workers and passed exact merged-artifact and final replay-result
-checks for all 138 ordinary transactions across 108 accounts. The first batch
-measured separate median account times of 165.1 ms serial and 50.0 ms parallel,
-a 3.30x ratio, but its paired whole-path median was 0.989x. After lane planning
-and merge were added to the reported total, the second batch measured 157.3 ms
-serial and 55.2 ms parallel, a 2.85x ratio. Median planning and merge costs were
-0.362 and 0.333 ms. Its paired whole-path median was 1.083x.
+Root subphase instrumentation invalidated those initial whole-path results. Of
+the apparent 3.08 s augmented-root median, approximately 2.89 s came from this
+offline utility incrementally joining 108 lite-server account proofs with
+`MerkleProof::combine()`. Live Collator does not perform that operation. The
+utility now uses TON's `combine_fast()` implementation, also used by lite-client,
+and a checked-in test requires fast/slow virtual-root equivalence, deterministic
+repeat output, accessible merged paths, and fail-closed invalid inputs.
 
-These whole-path medians do not establish a speedup. Every invocation must
-first obtain the serial reference artifacts and only then runs the parallel
-path in the same process; the JSON declares this cache/order bias. The two
-batches straddle 1.0 because augmented-root time varies by more than the saved
-account time. In the second batch the serial augmented-root stage alone had a
-3.082 s median, versus 3.246 s for the complete serial replay. Only the two
-descriptor roots were available because the copied corpus has no matching
-candidate collated-data witness; all four roots remain a required later gate.
+Three exact serial replays reduced predecessor-proof assembly from
+2.882-2.898 s to 8.637-8.976 ms. Complete serial replay fell from
+3.055-3.075 s to 178.5-199.7 ms without changing any historical transaction,
+account-state, or available root result. This is a benchmark-harness correction,
+not a blockchain speedup.
 
-This result invalidates any claim that account TVM parallelism alone already
-raises sustainable shard TPS. It instead selects prefix-safe parallel
-state-dictionary construction and deterministic root merge as the next
-executor gate. `mainnet_sustainable_raw_tps` remains `null`.
+Five subsequent Release processes exercised the complete offline path with four
+workers. All matched 138 ordinary transactions across 108 accounts, the full
+serial artifact/result set, and both available descriptor roots. Median serial
+wall was 196.5 ms; median parallel-account plus serial-commit wall was 84.5 ms.
+Every paired result was between 1.91x and 2.75x, with a 2.21x median. On this
+exact workload those medians correspond to 702 and 1,634 raw tx/s of offline
+replay throughput. The JSON exposes these as full-replay diagnostic rates and
+retains the serial-first/shared-cache warning. These observations came from a
+local copied-mainnet corpus; the corpus and raw run logs are not included in
+this repository.
+
+A separate single-sample worker sweep on the same corpus produced 225.5,
+120.7, 81.6, and 74.2 ms prepared-path walls for 1, 2, 4, and 8 workers. The
+corresponding diagnostic rates were 612, 1,144, 1,692, and 1,859 raw tx/s, and
+every sample passed the same artifact, result, and two-root gates. The small
+4-to-8-worker gain is consistent with the remaining approximately 39 ms serial
+commit, but the sweep is not a statistical capacity measurement and its raw
+outputs are not published here.
+
+Only the two descriptor roots were available because the copied corpus has no
+matching candidate collated-data witness; all four roots remain a required
+later gate. The measured offline rate is not sustainable shard TPS, and
+`mainnet_sustainable_raw_tps` remains `null`. The next executor gate is disabled
+live-Collator wiring on copied validator state plus exact candidate and
+`ValidateQuery` equivalence, not another projection from this proof corpus.
 
 The output also contains `single_shard_capacity`. It reads Config 23/29/30 from
 the state-bound masterchain proof and reports the exact archive block-file size.

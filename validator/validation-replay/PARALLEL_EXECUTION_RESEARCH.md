@@ -506,39 +506,49 @@ or merge description makes the current probe fail closed; separating those
 descriptions into serial coordinator work remains an integration gate. The
 64-worker CLI bound is only a local resource guard.
 
-Two batches of five independent Release processes replayed copied basechain
-block `88028077` with four workers. Every run covered 138 ordinary transactions
-and 108 accounts, matched the serial transaction/account effects exactly, and
-reproduced the same two available descriptor roots.
+Subphase instrumentation invalidated those initial whole-path numbers as a TON
+performance result. Three serial runs spent 2.890, 2.882, and 2.898 s inside
+predecessor-proof assembly, out of 2.899, 2.890, and 2.907 s for the complete
+augmented-root phase. The actual descriptor baseline took about 1.2 ms, account
+binding about 5.3 ms, and the available root commit about 1-2 ms. The apparent
+serial root bottleneck was almost entirely the replay utility joining 108
+separate lite-server account proofs one at a time. Live Collator does not do
+this operation.
 
-The first batch measured serial account samples of 165.072, 162.141, 174.648,
-152.299, and 186.052 ms and parallel samples of 46.663, 53.607, 56.450, 49.977,
-and 40.501 ms. The ratio of their separate medians was 3.30x. Full serial
-samples were 3.467, 3.419, 3.634, 3.391, and 3.251 s. Parallel-account plus
-serial-commit samples were 3.870, 3.293, 3.101, 3.428, and 3.380 s. Their paired
-speedup median was 0.989x.
+The proof path now uses TON's `MerkleProof::combine_fast()`, which is already
+used by lite-client. A dedicated checked-in test generates disjoint proofs,
+compares the fast and slow virtual roots, reads every merged path, checks repeat
+determinism, and rejects empty, null, and different-root inputs. Three exact
+corpus replays reduced predecessor-proof assembly to 8.976, 8.637, and 8.710 ms.
+Complete serial replay fell to 199.688, 178.460, and 181.844 ms while preserving
+all transaction, account-state, artifact, and available root checks. The roughly
+330x proof-merge reduction corrects the benchmark; it is not a mainnet
+optimization.
 
-After lane planning and deterministic merge were included in the total, the
-second batch measured separate median account times of 157.330 ms serial and
-55.165 ms parallel, a 2.85x ratio. Median planning and merge costs were 0.362
-and 0.333 ms; the equivalence-only check took 0.163 ms and was excluded. Full
-serial samples ranged from 3.113 to 3.608 s and the prepared path from 2.900 to
-3.332 s. Its paired speedup median was 1.083x. The serial augmented-root stage
-had a 3.082 s median, compared with 3.246 s for the complete serial replay.
+Five subsequent four-worker runs produced serial full-replay samples of
+196.491, 214.769, 203.214, 194.558, and 180.947 ms. Parallel-account plus
+serial-commit samples were 89.051, 78.121, 83.061, 101.674, and 84.467 ms.
+Every exact paired run improved, by 1.91x to 2.75x, with a 2.21x median. Median
+serial and prepared walls were 196.491 and 84.467 ms; for 138 raw transactions
+they correspond to diagnostic replay rates of 702 and 1,634 raw tx/s. The
+serial reference still precedes the prepared path in one process, so these are
+not substituted for an alternating live-Collator benchmark. The copied-mainnet
+corpus and raw process outputs remain local and are not included in this
+repository.
 
-Neither whole-path median establishes a speedup. The serial reference must run
-before the prepared path in every process, so the second root commit observes a
-different shared cache state. The JSON declares this order bias. Root-stage
-variation is larger than the saved account time, and the two batches straddle
-1.0. A stable whole-path benchmark requires alternating isolated commit samples
-or a live copied-state Collator harness.
+One additional worker sweep kept the corpus and exact gates fixed. Prepared
+walls for 1, 2, 4, and 8 workers were 225.504, 120.658, 81.566, and 74.215 ms,
+or 612, 1,144, 1,692, and 1,859 diagnostic raw tx/s. The 4-to-8-worker step
+saved only 7.351 ms because the serial commit remained about 39 ms. Each point
+is one serial-first sample, so the curve locates the current serial floor but
+does not establish sustainable shard capacity. The raw sweep outputs are not
+published in this repository.
 
-The reusable pool, canonical payload, coordinator, scheduler, and atomic root
-helpers have checked-in unit tests, but the new orchestration path currently
-depends on the external copied-mainnet corpus for its positive integration
-test. A compact checked-in BOC/proof fixture or extraction of artifact ordering
-into a separately testable module remains a regression-coverage gate before
-live Collator integration.
+The reusable pool, proof merger, canonical payload, coordinator, scheduler, and
+atomic root helpers have checked-in unit tests, but the complete orchestration
+path currently depends on the external copied-mainnet corpus for its positive
+integration test. A compact checked-in BOC/proof fixture remains a
+regression-coverage gate before live Collator integration.
 
 The corpus lacks the target candidate's collated-data predecessor witness, so
 the gate validates `InMsgDescr` and `OutMsgDescr`, not the complete
@@ -547,13 +557,12 @@ old Merkle-update view as that witness fails on pruned augmentation branches;
 the utility retains the fail-closed collated-data requirement instead of
 claiming four roots from hash-only data.
 
-This measurement changes the implementation order. Parallel TVM execution is a
-real but currently hidden gain. The next gate is prefix-safe parallel
-construction of disjoint `ShardAccounts` subtrees and deterministic root merge,
-with queue/descriptor mutations still ordered by the causal coordinator. Only
-after exact four-root and `ValidateQuery` equivalence can the project measure a
-sustainable single-shard throughput change. Trace compilation remains a later
-multiplicative optimization rather than the current critical path.
+The corrected measurement shows a real 2.21x offline whole-path gain, not only
+an account-lane ceiling. It still does not mutate a live Collator, create the
+candidate BOC, validate all four dictionary roots, or run `ValidateQuery`. Those
+are now the direct next gate on copied validator state. Only that gate can turn
+the diagnostic 1,634 raw tx/s rate into evidence about sustainable single-shard
+capacity.
 
 ## Dead ends and cautions
 
