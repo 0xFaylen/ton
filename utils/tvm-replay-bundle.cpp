@@ -24,11 +24,13 @@
     from all source files in the program, then also delete it here.
 */
 
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <map>
 #include <memory>
+#include <optional>
 #include <set>
 #include <string>
 #include <vector>
@@ -48,6 +50,7 @@
 #include "ton/lite-tl.hpp"
 #include "validator/db/fileref.hpp"
 #include "validator/db/package.hpp"
+#include "validator/impl/parallel-coordinator-shadow.h"
 #include "validator/impl/parallel-inbound-scheduler.h"
 #include "validator/impl/parallel-transaction-payload.h"
 #include "validator/interfaces/tvm-hotpath-stats.h"
@@ -65,7 +68,12 @@ using ton::BlockIdExt;
 using ton::StdSmcAddress;
 using ton::validator::TvmHotpathStats;
 using ton::validator::parallel_inbound::CanonicalTransactionPayload;
+using ton::validator::parallel_inbound::CanonicalTransactionEffects;
+using ton::validator::parallel_inbound::CoordinatorCommitContext;
 using ton::validator::parallel_inbound::Hash256;
+using ton::validator::parallel_inbound::InboundDescriptorContext;
+using ton::validator::parallel_inbound::OutboundQueueKey;
+using ton::validator::parallel_inbound::WorkItem;
 using ton::validator::parallel_inbound::inspect_transaction_payload;
 
 Hash256 as_hash256(const td::Bits256& value) {
@@ -122,6 +130,13 @@ struct LoadedLibraryBodies {
   std::set<td::Bits256> hashes;
 };
 
+struct ShadowCoordinatorCandidate {
+  WorkItem work;
+  CanonicalTransactionEffects effects;
+  CoordinatorCommitContext context;
+  Ref<vm::Cell> pre_account_state;
+};
+
 struct ReplayResult {
   struct AccountWork {
     std::size_t transactions = 0;
@@ -144,6 +159,12 @@ struct ReplayResult {
   std::size_t basechain_limit_accounts = 0;
   td::uint64 basechain_limit_gas = 0;
   ton::LogicalTime basechain_limit_max_end_lt = 0;
+  std::size_t shadow_coordinator_commits = 0;
+  std::size_t shadow_coordinator_accounts = 0;
+  std::size_t shadow_coordinator_in_descriptors = 0;
+  std::size_t shadow_coordinator_out_descriptors = 0;
+  std::size_t shadow_coordinator_queue_deletions = 0;
+  std::size_t shadow_coordinator_new_messages = 0;
   TvmHotpathStats hotpaths;
   std::map<StdSmcAddress, AccountWork> account_work;
 
@@ -671,8 +692,9 @@ td::Result<ReplayResult> replay_transactions(const BlockContext& target, const L
                                          block::tlb::aug_ShardAccountBlocks};
 
   ReplayResult result;
-  std::vector<ton::validator::parallel_inbound::CanonicalTransactionEffects> canonical_limit_effects;
+  std::vector<CanonicalTransactionEffects> canonical_limit_effects;
   std::vector<ton::validator::parallel_inbound::BasechainLimitContext> canonical_limit_contexts;
+  std::vector<ShadowCoordinatorCandidate> shadow_coordinator_candidates;
   td::Status replay_status = td::Status::OK();
   std::set<td::Bits256> missing_libraries;
   bool accounts_ok = account_blocks.check_for_each_extra([&](Ref<vm::CellSlice> account_block_slice, Ref<vm::CellSlice>,
@@ -781,7 +803,8 @@ td::Result<ReplayResult> replay_transactions(const BlockContext& target, const L
               return false;
             }
           }
-          const auto pre_account_state_hash = account.total_state->get_hash().as_bits256();
+          const auto pre_account_state = account.total_state;
+          const auto pre_account_state_hash = pre_account_state->get_hash().as_bits256();
           auto emulation = emulator.emulate_transaction(std::move(account), transaction);
           if (emulation.is_error()) {
             replay_status = emulation.move_as_error_prefix(PSTRING() << "transaction " << tx_key.get_uint(64) << " of "
@@ -814,6 +837,9 @@ td::Result<ReplayResult> replay_transactions(const BlockContext& target, const L
           }
 
           td::optional<block::MsgMetadata> inbound_metadata;
+          std::optional<ton::validator::parallel_inbound::MessageKey> coordinator_message_key;
+          std::optional<InboundDescriptorContext> coordinator_inbound_descriptor;
+          std::optional<OutboundQueueKey> coordinator_queue_deletion;
           if (payload_effects.inbound_message.not_null()) {
             auto message_key = payload_effects.inbound_message->get_hash().bits();
             auto declared_in_slice = in_msg_descr.lookup(message_key, 256);
@@ -869,14 +895,41 @@ td::Result<ReplayResult> replay_transactions(const BlockContext& target, const L
                                                             << address.to_hex() << " at " << tx_key.get_uint(64));
                 return false;
               }
+
+              block::tlb::MsgEnvelope::Record_std inbound_envelope;
+              block::gen::CommonMsgInfo::Record_int_msg_info inbound_info;
+              if (!block::tlb::unpack_cell(declared_in.in_msg, inbound_envelope) ||
+                  !block::tlb::unpack_cell_inexact(inbound_envelope.msg, inbound_info)) {
+                replay_status = td::Status::Error(PSTRING() << "cannot derive canonical inbound queue order for "
+                                                            << address.to_hex() << " at " << tx_key.get_uint(64));
+                return false;
+              }
+              coordinator_message_key = ton::validator::parallel_inbound::MessageKey{
+                  inbound_envelope.emitted_lt ? inbound_envelope.emitted_lt.value() : inbound_info.created_lt,
+                  payload_effects.inbound_message_hash.value()};
+              coordinator_inbound_descriptor = InboundDescriptorContext{
+                  .message_envelope = declared_in.in_msg, .dequeued_from_current_shard = dequeued_from_current_shard};
+              if (dequeued_from_current_shard) {
+                OutboundQueueKey queue_key;
+                if (!block::compute_out_msg_queue_key(declared_in.in_msg, queue_key)) {
+                  replay_status = td::Status::Error(PSTRING() << "cannot derive outbound queue key for "
+                                                              << address.to_hex() << " at " << tx_key.get_uint(64));
+                  return false;
+                }
+                coordinator_queue_deletion = queue_key;
+              }
               ++result.canonical_inbound_fin_descriptors;
               result.canonical_outbound_deq_imm_descriptors += dequeued_from_current_shard;
             }
           }
 
+          auto outbound_metadata = inbound_metadata;
+          if (outbound_metadata) {
+            ++outbound_metadata.value().depth;
+          }
           auto registrations = ton::validator::parallel_inbound::materialize_outbound_registrations(
               payload_effects,
-              {.metadata_enabled = config->has_capability(ton::capMsgMetadata), .metadata = inbound_metadata});
+              {.metadata_enabled = config->has_capability(ton::capMsgMetadata), .metadata = outbound_metadata});
           if (!registrations || registrations.batch->messages.size() != payload_effects.outbound_messages.size()) {
             replay_status = td::Status::Error(PSTRING() << "canonical outbound registration failed for transaction "
                                                         << tx_key.get_uint(64) << " of " << address.to_hex());
@@ -893,6 +946,20 @@ td::Result<ReplayResult> replay_transactions(const BlockContext& target, const L
           }
           canonical_limit_effects.push_back(payload_effects);
           canonical_limit_contexts.push_back({.account_is_first = first_account_transaction, .charge_gas = true});
+          if (coordinator_message_key) {
+            CHECK(coordinator_inbound_descriptor);
+            shadow_coordinator_candidates.push_back(
+                {.work = {.key = coordinator_message_key.value(),
+                          .account = std::optional<Hash256>{payload_effects.account}},
+                 .effects = payload_effects,
+                 .context = {.limit = {.account_is_first = first_account_transaction, .charge_gas = true},
+                             .outbound_registration = {.metadata_enabled =
+                                                           config->has_capability(ton::capMsgMetadata),
+                                                       .metadata = outbound_metadata},
+                             .inbound_descriptor = coordinator_inbound_descriptor,
+                             .outbound_queue_deletion = coordinator_queue_deletion},
+                 .pre_account_state = pre_account_state});
+          }
           first_account_transaction = false;
           ++result.transactions;
           auto& account_work = result.account_work[address];
@@ -950,6 +1017,87 @@ td::Result<ReplayResult> replay_transactions(const BlockContext& target, const L
   result.basechain_limit_accounts = shadow_limit_status.accounts;
   result.basechain_limit_gas = shadow_limit_status.gas_used;
   result.basechain_limit_max_end_lt = shadow_limit_status.cur_lt;
+
+  std::sort(shadow_coordinator_candidates.begin(), shadow_coordinator_candidates.end(),
+            [](const auto& left, const auto& right) { return left.work.key < right.work.key; });
+  block::BlockLimits coordinator_limits;
+  auto coordinator_usage_tree = std::make_shared<vm::CellUsageTree>();
+  coordinator_limits.usage_tree = coordinator_usage_tree.get();
+  ton::validator::parallel_inbound::ShadowCoordinatorState coordinator_state{coordinator_limits};
+  std::map<Hash256, Hash256> expected_final_states;
+  std::size_t expected_accounts = 0;
+  std::size_t expected_queue_deletions = 0;
+  std::size_t expected_new_messages = 0;
+  std::vector<WorkItem> coordinator_items;
+  std::vector<ton::validator::parallel_inbound::CompletionStatus> coordinator_completions;
+  std::vector<std::optional<CanonicalTransactionEffects>> coordinator_effects;
+  std::vector<CoordinatorCommitContext> coordinator_contexts;
+  for (const auto& candidate : shadow_coordinator_candidates) {
+    auto [account, inserted] = coordinator_state.accounts.emplace(
+        candidate.effects.account,
+        ton::validator::parallel_inbound::ShadowAccountState{
+            .state_hash = as_hash256(candidate.pre_account_state->get_hash().as_bits256()),
+            .state = candidate.pre_account_state});
+    if (!inserted && account->second.state_hash != candidate.effects.pre_account_state_hash &&
+        expected_final_states.at(candidate.effects.account) != candidate.effects.pre_account_state_hash) {
+      return td::Status::Error("canonical coordinator candidate account chain is discontinuous");
+    }
+    expected_final_states[candidate.effects.account] = candidate.effects.post_account_state_hash;
+    expected_accounts += candidate.context.limit.account_is_first;
+    expected_new_messages += candidate.effects.outbound_messages.size();
+    if (candidate.context.outbound_queue_deletion) {
+      if (!coordinator_state.outbound_queue_entries.insert(candidate.context.outbound_queue_deletion.value()).second) {
+        return td::Status::Error("canonical coordinator candidate contains a duplicate outbound queue deletion");
+      }
+      ++expected_queue_deletions;
+    }
+    coordinator_items.push_back(candidate.work);
+    coordinator_completions.push_back(ton::validator::parallel_inbound::CompletionStatus::succeeded);
+    coordinator_effects.push_back(candidate.effects);
+    coordinator_contexts.push_back(candidate.context);
+  }
+  auto coordinator_result = ton::validator::parallel_inbound::apply_ready_coordinator_prefix_atomic(
+      coordinator_state, coordinator_items, coordinator_completions, coordinator_effects, coordinator_contexts);
+  if (!coordinator_result) {
+    return td::Status::Error(PSTRING()
+                             << "canonical atomic shadow coordinator failed at item "
+                             << (coordinator_result.item_index ? td::to_string(coordinator_result.item_index.value())
+                                                               : std::string("none"))
+                             << ": "
+                             << ton::validator::parallel_inbound::to_string(coordinator_result.error)
+                             << ", outbound="
+                             << ton::validator::parallel_inbound::to_string(coordinator_result.outbound_error)
+                             << ", descriptor="
+                             << ton::validator::parallel_inbound::to_string(coordinator_result.descriptor_error)
+                             << ", limits="
+                             << ton::validator::parallel_inbound::to_string(coordinator_result.limit_error));
+  }
+  if (coordinator_result.decision.committed_count != shadow_coordinator_candidates.size() ||
+      coordinator_state.block_limits.transactions != shadow_coordinator_candidates.size() ||
+      coordinator_state.block_limits.accounts != expected_accounts ||
+      coordinator_state.in_msg_descriptors.size() != shadow_coordinator_candidates.size() ||
+      coordinator_state.out_msg_descriptors.size() != expected_queue_deletions ||
+      !coordinator_state.outbound_queue_entries.empty() ||
+      coordinator_state.new_messages.size() != expected_new_messages) {
+    return td::Status::Error("canonical atomic shadow coordinator counters disagree with replay scope");
+  }
+  if (!coordinator_items.empty() &&
+      coordinator_state.processed_upto.last_processed !=
+          std::optional<ton::validator::parallel_inbound::MessageKey>{coordinator_items.back().key}) {
+    return td::Status::Error("canonical atomic shadow coordinator frontier disagrees with replay scope");
+  }
+  for (const auto& [address, expected_state] : expected_final_states) {
+    auto actual = coordinator_state.accounts.find(address);
+    if (actual == coordinator_state.accounts.end() || actual->second.state_hash != expected_state) {
+      return td::Status::Error("canonical atomic shadow coordinator account state disagrees with replay scope");
+    }
+  }
+  result.shadow_coordinator_commits = coordinator_result.decision.committed_count;
+  result.shadow_coordinator_accounts = coordinator_state.block_limits.accounts;
+  result.shadow_coordinator_in_descriptors = coordinator_state.in_msg_descriptors.size();
+  result.shadow_coordinator_out_descriptors = coordinator_state.out_msg_descriptors.size();
+  result.shadow_coordinator_queue_deletions = expected_queue_deletions;
+  result.shadow_coordinator_new_messages = coordinator_state.new_messages.size();
   return result;
 }
 
@@ -1085,10 +1233,17 @@ std::string replay_json(const BlockContext& target, const LoadedState* account_s
       << ",\"basechain_limit_gas\":" << replay.basechain_limit_gas
       << ",\"basechain_limit_gas_status\":\"billed_gas_sum_special_context_not_reconstructed\""
       << ",\"basechain_limit_max_end_lt\":" << replay.basechain_limit_max_end_lt
+      << ",\"shadow_coordinator_commits\":" << replay.shadow_coordinator_commits
+      << ",\"shadow_coordinator_accounts\":" << replay.shadow_coordinator_accounts
+      << ",\"shadow_coordinator_in_descriptors\":" << replay.shadow_coordinator_in_descriptors
+      << ",\"shadow_coordinator_out_descriptors\":" << replay.shadow_coordinator_out_descriptors
+      << ",\"shadow_coordinator_queue_deletions\":" << replay.shadow_coordinator_queue_deletions
+      << ",\"shadow_coordinator_new_messages\":" << replay.shadow_coordinator_new_messages
+      << ",\"shadow_coordinator_queue_scope\":\"descriptor_derived_deletion_subset\""
       << ",\"block_size_status\":\"not_claimed_without_collator_usage_tree\""
       << ",\"proof_journals\":\"empty_in_transaction_replay\""
-      << ",\"processed_upto\":\"pure_prefix_gate_only\""
-      << ",\"global_effects\":\"materialized_not_applied\"}"
+      << ",\"processed_upto\":\"atomic_shadow_prefix_applied_for_inbound_fin_subset\""
+      << ",\"global_effects\":\"atomic_shadow_applied_not_live_collator_dictionaries\"}"
       << ",\"hotpaths_wall\":" << replay.hotpaths.to_json(false, 0, replay.hotpaths.size());
 #if TD_WINDOWS
   out << ",\"hotpaths_cpu\":null,\"cpu_metric_status\":\"unsupported_windows_timer_resolution\"";

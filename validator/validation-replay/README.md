@@ -124,12 +124,17 @@ block-size claim. It also does not reconstruct the special mint/recover routing
 context, so reported limit gas is the billed-gas sum rather than a claim about
 the historical block-limit counter. Descriptor dictionaries, queues,
 `ProcessedUpto`, account dictionary proofs, storage-dictionary updates, and
-state merge are not applied. `NewOutMsg` registrations are nevertheless
-materialized with coordinator-derived metadata, and every ordinary
-`msg_import_fin` in the replay scope is rebuilt byte-for-byte together with its
-optional `msg_export_deq_imm` pair. The pure scheduler gate separately proves
-that `ProcessedUpto` can advance only to the last successfully committed item
-of a continuous canonical prefix; it is not wired into live collation.
+state merge are not applied to live collator dictionaries. `NewOutMsg`
+registrations are materialized with coordinator-derived metadata, and every
+ordinary `msg_import_fin` in the replay scope is rebuilt byte-for-byte together
+with its optional `msg_export_deq_imm` pair. An atomic coordinator shadow now
+applies the validated continuous prefix to exact account cells, descriptor-cell
+maps, descriptor-derived 352-bit queue keys, the new-message heap, block-limit
+counters, and a `ProcessedUpto` frontier. A normal pending/failed/limited stop
+publishes only the ready prefix; any malformed delta discards the entire
+candidate publish. These maps do not reproduce augmented dictionary roots, so
+the result remains an offline consistency gate and is not wired into live
+collation.
 
 The replay JSON also contains `account_lane_ceiling`. It groups measured
 transaction and TVM wall time by account and reports greedy ideal makespans for

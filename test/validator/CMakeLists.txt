@@ -34,6 +34,7 @@ ton_test(test-parallel-cell-usage-journal)
 
 add_executable(test-parallel-transaction-payload
     test-parallel-transaction-payload.cpp
+    ${CMAKE_SOURCE_DIR}/validator/impl/parallel-coordinator-shadow.cpp
     ${CMAKE_SOURCE_DIR}/validator/impl/parallel-inbound-scheduler.cpp
     ${CMAKE_SOURCE_DIR}/validator/impl/parallel-cell-usage-journal.cpp
     ${CMAKE_SOURCE_DIR}/validator/impl/parallel-transaction-payload.cpp

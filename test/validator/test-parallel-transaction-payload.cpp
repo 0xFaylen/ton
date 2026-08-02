@@ -5,6 +5,7 @@
 
 #include "block/block-auto.h"
 #include "block/block-parse.h"
+#include "impl/parallel-coordinator-shadow.h"
 #include "block/block.h"
 #include "impl/parallel-transaction-payload.h"
 #include "td/utils/tests.h"
@@ -125,12 +126,12 @@ td::Ref<vm::Cell> skipped_ordinary_description() {
   return result;
 }
 
-td::Ref<vm::Cell> make_transaction(std::uint64_t account, std::uint64_t pre_state,
-                                   const td::Bits256& declared_post_state, std::uint64_t lt,
-                                   std::uint64_t total_fees = 0, td::Ref<vm::Cell> in_message = {},
-                                   std::vector<td::Ref<vm::Cell>> out_messages = {}) {
+td::Ref<vm::Cell> make_transaction_with_pre_hash(std::uint64_t account, const td::Bits256& declared_pre_state,
+                                                 const td::Bits256& declared_post_state, std::uint64_t lt,
+                                                 std::uint64_t total_fees = 0, td::Ref<vm::Cell> in_message = {},
+                                                 std::vector<td::Ref<vm::Cell>> out_messages = {}) {
   block::gen::HASH_UPDATE::Record update_record;
-  update_record.old_hash = bits(pre_state);
+  update_record.old_hash = declared_pre_state;
   update_record.new_hash = declared_post_state;
   td::Ref<vm::Cell> state_update;
   ASSERT_TRUE(block::gen::t_HASH_UPDATE_Account.cell_pack(state_update, update_record));
@@ -183,12 +184,30 @@ td::Ref<vm::Cell> make_transaction(std::uint64_t account, std::uint64_t pre_stat
   return root;
 }
 
+td::Ref<vm::Cell> make_transaction(std::uint64_t account, std::uint64_t pre_state,
+                                   const td::Bits256& declared_post_state, std::uint64_t lt,
+                                   std::uint64_t total_fees = 0, td::Ref<vm::Cell> in_message = {},
+                                   std::vector<td::Ref<vm::Cell>> out_messages = {}) {
+  return make_transaction_with_pre_hash(account, bits(pre_state), declared_post_state, lt, total_fees,
+                                        std::move(in_message), std::move(out_messages));
+}
+
 CanonicalTransactionPayload payload(std::uint64_t account, std::uint64_t pre_state, std::uint64_t lt,
                                     std::uint64_t total_fees = 0, td::Ref<vm::Cell> in_message = {},
                                     std::vector<td::Ref<vm::Cell>> out_messages = {}) {
   auto post = account_none();
   auto transaction = make_transaction(account, pre_state, post->get_hash().as_bits256(), lt, total_fees,
                                       std::move(in_message), std::move(out_messages));
+  return {.transaction_root = std::move(transaction), .post_account_state = std::move(post), .proof_journals = {}};
+}
+
+CanonicalTransactionPayload payload_from_state(std::uint64_t account, const td::Ref<vm::Cell>& pre_state,
+                                               std::uint64_t lt, td::Ref<vm::Cell> in_message = {},
+                                               std::vector<td::Ref<vm::Cell>> out_messages = {}) {
+  auto post = account_none();
+  auto transaction = make_transaction_with_pre_hash(account, pre_state->get_hash().as_bits256(),
+                                                     post->get_hash().as_bits256(), lt, 0, std::move(in_message),
+                                                     std::move(out_messages));
   return {.transaction_root = std::move(transaction), .post_account_state = std::move(post), .proof_journals = {}};
 }
 
@@ -312,6 +331,205 @@ TEST(ParallelTransactionPayload, MaterializesExactInboundInternalDescriptorPair)
                                                      {.message_envelope = envelope})
                 .error,
             InboundDescriptorError::missing_inbound_message);
+}
+
+TEST(ParallelCoordinatorShadow, AtomicallyPublishesAccountMessagesDescriptorsQueueAndFrontier) {
+  auto pre_state = vm::CellBuilder().store_ones(1).finalize_novm();
+  auto inbound = internal_message(20, 10, 100);
+  auto outbound = internal_message(10, 30, 101);
+  auto canonical = payload_from_state(10, pre_state, 11, inbound, {outbound});
+  auto inspected = inspect_transaction_payload(canonical);
+  ASSERT_TRUE(inspected);
+  auto envelope = message_envelope(inbound, 777);
+
+  block::BlockLimits limits;
+  auto usage_tree = std::make_shared<vm::CellUsageTree>();
+  limits.usage_tree = usage_tree.get();
+  ShadowCoordinatorState state{limits};
+  state.accounts.emplace(hash(10), ShadowAccountState{.state_hash = cell_hash(pre_state), .state = pre_state});
+  OutboundQueueKey queue_key;
+  ASSERT_TRUE(block::compute_out_msg_queue_key(envelope, queue_key));
+  state.outbound_queue_entries.insert(queue_key);
+
+  const WorkItem work{{100, cell_hash(inbound)}, hash(10)};
+  CoordinatorCommitContext context{
+      .limit = {.account_is_first = true, .charge_gas = true},
+      .outbound_registration = {},
+      .inbound_descriptor = InboundDescriptorContext{.message_envelope = envelope,
+                                                     .dequeued_from_current_shard = true},
+      .outbound_queue_deletion = queue_key};
+  auto result = apply_ready_coordinator_prefix_atomic(
+      state, {work}, {CompletionStatus::succeeded}, {*inspected.effects}, {context});
+
+  ASSERT_TRUE(result);
+  ASSERT_EQ(result.decision.committed_count, 1u);
+  ASSERT_EQ(result.decision.stop_reason, PrefixStopReason::end_of_input);
+  ASSERT_EQ(state.accounts.at(hash(10)).state_hash, inspected.effects->post_account_state_hash);
+  ASSERT_EQ(state.accounts.at(hash(10)).last_transaction_hash, inspected.effects->transaction_hash);
+  ASSERT_EQ(state.accounts.at(hash(10)).last_transaction_end_lt, inspected.effects->transaction_end_lt);
+  ASSERT_EQ(state.in_msg_descriptors.size(), 1u);
+  ASSERT_EQ(state.out_msg_descriptors.size(), 1u);
+  ASSERT_TRUE(state.outbound_queue_entries.empty());
+  ASSERT_EQ(state.new_messages.size(), 1u);
+  ASSERT_EQ(state.new_messages.top().msg->get_hash(), outbound->get_hash());
+  ASSERT_EQ(state.min_new_message_lt, std::optional<ton::LogicalTime>{12});
+  ASSERT_EQ(state.block_limits.transactions, 1u);
+  ASSERT_EQ(state.block_limits.accounts, 1u);
+  ASSERT_EQ(state.block_limits.extra_out_msgs, 1u);
+  ASSERT_EQ(state.processed_upto.last_processed, std::optional<MessageKey>{work.key});
+}
+
+TEST(ParallelCoordinatorShadow, NormalStopPublishesOnlyTheReadyPrefixAndCanResume) {
+  auto first_pre = vm::CellBuilder().store_long(1, 2).finalize_novm();
+  auto second_pre = vm::CellBuilder().store_long(2, 2).finalize_novm();
+  auto first_inbound = internal_message(20, 10, 100);
+  auto second_inbound = internal_message(30, 11, 101);
+  auto first_payload = payload_from_state(10, first_pre, 11, first_inbound);
+  auto second_payload = payload_from_state(11, second_pre, 21, second_inbound);
+  auto first = inspect_transaction_payload(first_payload);
+  auto second = inspect_transaction_payload(second_payload);
+  ASSERT_TRUE(first);
+  ASSERT_TRUE(second);
+
+  block::BlockLimits limits;
+  auto usage_tree = std::make_shared<vm::CellUsageTree>();
+  limits.usage_tree = usage_tree.get();
+  ShadowCoordinatorState state{limits};
+  state.accounts.emplace(hash(10), ShadowAccountState{.state_hash = cell_hash(first_pre), .state = first_pre});
+  state.accounts.emplace(hash(11), ShadowAccountState{.state_hash = cell_hash(second_pre), .state = second_pre});
+  const std::vector<WorkItem> items{{{100, cell_hash(first_inbound)}, hash(10)},
+                                    {{101, cell_hash(second_inbound)}, hash(11)}};
+  const std::vector<CoordinatorCommitContext> contexts{
+      {.limit = {.account_is_first = true},
+       .outbound_registration = {},
+       .inbound_descriptor = InboundDescriptorContext{.message_envelope = message_envelope(first_inbound, 10)},
+       .outbound_queue_deletion = std::nullopt},
+      {.limit = {.account_is_first = true},
+       .outbound_registration = {},
+       .inbound_descriptor = InboundDescriptorContext{.message_envelope = message_envelope(second_inbound, 20)},
+       .outbound_queue_deletion = std::nullopt}};
+
+  auto partial = apply_ready_coordinator_prefix_atomic(
+      state, items, {CompletionStatus::succeeded, CompletionStatus::pending},
+      {*first.effects, std::nullopt}, contexts);
+  ASSERT_TRUE(partial);
+  ASSERT_EQ(partial.decision.committed_count, 1u);
+  ASSERT_EQ(partial.decision.stop_reason, PrefixStopReason::pending);
+  ASSERT_EQ(state.accounts.at(hash(10)).state_hash, first.effects->post_account_state_hash);
+  ASSERT_EQ(state.accounts.at(hash(11)).state_hash, cell_hash(second_pre));
+  ASSERT_EQ(state.in_msg_descriptors.size(), 1u);
+  ASSERT_EQ(state.processed_upto.last_processed, std::optional<MessageKey>{items[0].key});
+
+  auto resumed = apply_ready_coordinator_prefix_atomic(
+      state, {items[1]}, {CompletionStatus::succeeded}, {*second.effects}, {contexts[1]});
+  ASSERT_TRUE(resumed);
+  ASSERT_EQ(state.accounts.at(hash(11)).state_hash, second.effects->post_account_state_hash);
+  ASSERT_EQ(state.in_msg_descriptors.size(), 2u);
+  ASSERT_EQ(state.processed_upto.last_processed, std::optional<MessageKey>{items[1].key});
+}
+
+TEST(ParallelCoordinatorShadow, CommitErrorDiscardsTheEntireCandidatePrefix) {
+  auto first_pre = vm::CellBuilder().store_long(1, 2).finalize_novm();
+  auto second_pre = vm::CellBuilder().store_long(2, 2).finalize_novm();
+  auto first_inbound = internal_message(20, 10, 100);
+  auto second_inbound = internal_message(30, 11, 101);
+  auto first = inspect_transaction_payload(payload_from_state(10, first_pre, 11, first_inbound));
+  auto second = inspect_transaction_payload(payload_from_state(11, second_pre, 21, second_inbound));
+  ASSERT_TRUE(first);
+  ASSERT_TRUE(second);
+
+  block::BlockLimits limits;
+  auto usage_tree = std::make_shared<vm::CellUsageTree>();
+  limits.usage_tree = usage_tree.get();
+  ShadowCoordinatorState state{limits};
+  state.accounts.emplace(hash(10), ShadowAccountState{.state_hash = cell_hash(first_pre), .state = first_pre});
+  state.accounts.emplace(hash(11), ShadowAccountState{.state_hash = cell_hash(second_pre), .state = second_pre});
+  state.in_msg_descriptors.emplace(cell_hash(second_inbound), account_none());
+  const std::vector<WorkItem> items{{{100, cell_hash(first_inbound)}, hash(10)},
+                                    {{101, cell_hash(second_inbound)}, hash(11)}};
+  const std::vector<CoordinatorCommitContext> contexts{
+      {.limit = {.account_is_first = true},
+       .outbound_registration = {},
+       .inbound_descriptor = InboundDescriptorContext{.message_envelope = message_envelope(first_inbound, 10)},
+       .outbound_queue_deletion = std::nullopt},
+      {.limit = {.account_is_first = true},
+       .outbound_registration = {},
+       .inbound_descriptor = InboundDescriptorContext{.message_envelope = message_envelope(second_inbound, 20)},
+       .outbound_queue_deletion = std::nullopt}};
+
+  auto rejected = apply_ready_coordinator_prefix_atomic(
+      state, items, {CompletionStatus::succeeded, CompletionStatus::succeeded}, {*first.effects, *second.effects},
+      contexts);
+  ASSERT_EQ(rejected.error, CoordinatorCommitError::duplicate_in_descriptor);
+  ASSERT_EQ(rejected.item_index, std::optional<std::size_t>{1});
+  ASSERT_EQ(rejected.decision.stop_reason, PrefixStopReason::commit_failure);
+  ASSERT_EQ(state.accounts.at(hash(10)).state_hash, cell_hash(first_pre));
+  ASSERT_EQ(state.accounts.at(hash(11)).state_hash, cell_hash(second_pre));
+  ASSERT_EQ(state.in_msg_descriptors.size(), 1u);
+  ASSERT_EQ(state.block_limits.transactions, 0u);
+  ASSERT_TRUE(state.new_messages.empty());
+  ASSERT_TRUE(!state.processed_upto.last_processed);
+}
+
+TEST(ParallelCoordinatorShadow, RejectsMissingQueueEntryWithoutPublishing) {
+  auto pre_state = vm::CellBuilder().store_ones(1).finalize_novm();
+  auto inbound = internal_message(20, 10, 100);
+  auto inspected = inspect_transaction_payload(payload_from_state(10, pre_state, 11, inbound));
+  ASSERT_TRUE(inspected);
+  auto envelope = message_envelope(inbound, 777);
+  OutboundQueueKey queue_key;
+  ASSERT_TRUE(block::compute_out_msg_queue_key(envelope, queue_key));
+
+  block::BlockLimits limits;
+  auto usage_tree = std::make_shared<vm::CellUsageTree>();
+  limits.usage_tree = usage_tree.get();
+  ShadowCoordinatorState state{limits};
+  state.accounts.emplace(hash(10), ShadowAccountState{.state_hash = cell_hash(pre_state), .state = pre_state});
+  const WorkItem work{{100, cell_hash(inbound)}, hash(10)};
+  CoordinatorCommitContext context{
+      .limit = {.account_is_first = true},
+      .outbound_registration = {},
+      .inbound_descriptor = InboundDescriptorContext{.message_envelope = envelope,
+                                                     .dequeued_from_current_shard = true},
+      .outbound_queue_deletion = queue_key};
+
+  auto rejected = apply_ready_coordinator_prefix_atomic(
+      state, {work}, {CompletionStatus::succeeded}, {*inspected.effects}, {context});
+  ASSERT_EQ(rejected.error, CoordinatorCommitError::queue_entry_not_found);
+  ASSERT_EQ(state.accounts.at(hash(10)).state_hash, cell_hash(pre_state));
+  ASSERT_TRUE(state.in_msg_descriptors.empty());
+  ASSERT_TRUE(state.out_msg_descriptors.empty());
+  ASSERT_EQ(state.block_limits.transactions, 0u);
+  ASSERT_TRUE(!state.processed_upto.last_processed);
+}
+
+TEST(ParallelCoordinatorShadow, RejectsTamperedCanonicalCellWithoutPublishing) {
+  auto pre_state = vm::CellBuilder().store_ones(1).finalize_novm();
+  auto inbound = internal_message(20, 10, 100);
+  auto inspected = inspect_transaction_payload(payload_from_state(10, pre_state, 11, inbound));
+  ASSERT_TRUE(inspected);
+
+  block::BlockLimits limits;
+  auto usage_tree = std::make_shared<vm::CellUsageTree>();
+  limits.usage_tree = usage_tree.get();
+  ShadowCoordinatorState state{limits};
+  state.accounts.emplace(hash(10), ShadowAccountState{.state_hash = cell_hash(pre_state), .state = pre_state});
+  auto tampered = *inspected.effects;
+  tampered.post_account_state = pre_state;
+  const WorkItem work{{100, cell_hash(inbound)}, hash(10)};
+  CoordinatorCommitContext context{
+      .limit = {.account_is_first = true},
+      .outbound_registration = {},
+      .inbound_descriptor = InboundDescriptorContext{.message_envelope = message_envelope(inbound, 777)},
+      .outbound_queue_deletion = std::nullopt};
+
+  auto rejected = apply_ready_coordinator_prefix_atomic(
+      state, {work}, {CompletionStatus::succeeded}, {tampered}, {context});
+  ASSERT_EQ(rejected.error, CoordinatorCommitError::post_state_cell_hash_mismatch);
+  ASSERT_EQ(state.accounts.at(hash(10)).state_hash, cell_hash(pre_state));
+  ASSERT_EQ(state.block_limits.transactions, 0u);
+  ASSERT_TRUE(state.in_msg_descriptors.empty());
+  ASSERT_TRUE(!state.processed_upto.last_processed);
 }
 
 TEST(ParallelTransactionPayload, AppliesBasechainBlockLimitEffectsAtomically) {

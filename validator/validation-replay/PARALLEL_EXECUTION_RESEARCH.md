@@ -151,8 +151,20 @@ canonical queue slice before callbacks and publishes `ProcessedUpto` only to
 the last successfully committed item; pending, failed, limited and
 commit-failed items cannot expose a completed suffix.
 
+The message, account and limit subsets now have a single atomic shadow publish.
+It first applies a canonical ready prefix to a private coordinator state and
+publishes account cells, descriptor cells, descriptor-derived queue deletions,
+new-message registrations, limit counters and `ProcessedUpto` together. Any
+malformed effect leaves the original shadow state unchanged. A copied
+full-block replay committed all 10 `msg_import_fin` entries in canonical
+`(lt, hash)` order, covering five first-account counters, 10 exact InMsg cells,
+10 paired OutMsg/dequeue cells and 22 newly registered messages. All 51
+historical transaction and account-state hashes remained exact. This verifies
+the coordinator contract for that bounded input; it does not construct
+augmented dictionary roots or measure parallel speedup.
+
 Masterchain public-library deltas, collator usage-tree proof size,
-account-dictionary proof merge, descriptor-dictionary insertion, queue mutation,
+account-dictionary proof merge, augmented descriptor/queue roots,
 storage-dictionary updates, live `ProcessedUpto` wiring, value flow and state
 merge remain outside this gate.
 
