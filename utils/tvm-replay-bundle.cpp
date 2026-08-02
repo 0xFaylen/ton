@@ -28,8 +28,10 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <iterator>
 #include <map>
 #include <memory>
+#include <numeric>
 #include <optional>
 #include <set>
 #include <string>
@@ -159,6 +161,13 @@ struct ShadowCoordinatorCandidate {
   Ref<vm::Cell> pre_account_state;
 };
 
+struct ReplayAccountArtifacts {
+  std::vector<CanonicalTransactionEffects> limit_effects;
+  std::vector<ton::validator::parallel_inbound::BasechainLimitContext> limit_contexts;
+  std::vector<ShadowCoordinatorCandidate> coordinator_candidates;
+  std::vector<ton::validator::parallel_inbound::AccountDictionaryDelta> account_dictionary_deltas;
+};
+
 struct TransactionKindCounts {
   std::size_t ordinary{0};
   std::size_t tick{0};
@@ -224,6 +233,7 @@ struct ReplayResult {
   std::size_t shadow_coordinator_new_messages = 0;
   std::size_t shard_account_proof_values_bound = 0;
   bool collated_predecessor_witness_loaded = false;
+  std::string predecessor_state_witness_source = "none";
   bool shard_accounts_predecessor_root_bound = false;
   bool shard_accounts_transition_validated = false;
   std::string shard_accounts_transition_status = "not_run";
@@ -245,6 +255,7 @@ struct ReplayResult {
   LimitTriplet block_limit_collated_bytes;
   double phase_setup_seconds = 0.0;
   double phase_account_replay_seconds = 0.0;
+  double phase_artifact_export_seconds = 0.0;
   double phase_block_limits_seconds = 0.0;
   double phase_coordinator_seconds = 0.0;
   double phase_augmented_roots_seconds = 0.0;
@@ -255,6 +266,17 @@ struct ReplayResult {
   ReplayResult() {
     hotpaths.enable_exact();
   }
+};
+
+struct PreparedAccountReplay {
+  ReplayResult summary;
+  ReplayAccountArtifacts artifacts;
+};
+
+enum class ReplayExecutionMode {
+  full,
+  account_effects_only,
+  prepared_effects,
 };
 
 struct ParallelAccountReplayProbe {
@@ -280,6 +302,28 @@ struct ParallelAccountReplayProbe {
     auto values = wall_speedup_samples;
     std::sort(values.begin(), values.end());
     return values[values.size() / 2];
+  }
+};
+
+struct OfflineCollatorReplayProbe {
+  std::size_t requested_workers{0};
+  std::size_t workers{0};
+  std::size_t transactions{0};
+  std::size_t accounts{0};
+  double lane_planning_seconds{0.0};
+  double worker_pool_startup_seconds{0.0};
+  double account_execution_seconds{0.0};
+  double artifact_merge_seconds{0.0};
+  double equivalence_check_seconds{0.0};
+  double serial_commit_seconds{0.0};
+  double total_seconds{0.0};
+  double serial_reference_seconds{0.0};
+  std::size_t augmented_dictionary_roots_validated{0};
+  bool exact_artifact_set{false};
+  bool exact_replay_result{false};
+
+  double speedup() const {
+    return total_seconds > 0.0 ? serial_reference_seconds / total_seconds : 0.0;
   }
 };
 
@@ -1365,9 +1409,14 @@ td::Result<ReplayResult> replay_transactions(
     const std::string& archive, const HistoryBlocks& history, const BlockContext& target,
     const Ref<vm::Cell>& collated_predecessor_witness, const LoadedState* prev_state, const LoadedState& mc_state,
     const std::vector<LoadedAccountPart>& account_parts, const std::vector<LoadedAccountProof>& account_proofs,
-    const LoadedLibraryBodies* library_bodies, bool profile_ed25519, bool validate_augmented_roots) {
+    const LoadedLibraryBodies* library_bodies, bool profile_ed25519, bool validate_augmented_roots,
+    ReplayExecutionMode execution_mode = ReplayExecutionMode::full,
+    ReplayAccountArtifacts* collected_artifacts = nullptr, const PreparedAccountReplay* prepared = nullptr) {
   td::Timer replay_timer;
   ReplayResult result;
+  if ((execution_mode == ReplayExecutionMode::prepared_effects) != (prepared != nullptr)) {
+    return td::Status::Error("prepared replay mode requires exactly one prepared account replay");
+  }
   TRY_STATUS(verify_replay_scope(target));
   if ((prev_state != nullptr && prev_state->record.global_id != target.global_id) ||
       mc_state.record.global_id != target.global_id) {
@@ -1443,14 +1492,33 @@ td::Result<ReplayResult> replay_transactions(
 
   result.phase_setup_seconds = replay_timer.elapsed();
   double phase_checkpoint = result.phase_setup_seconds;
-  std::vector<CanonicalTransactionEffects> canonical_limit_effects;
-  std::vector<ton::validator::parallel_inbound::BasechainLimitContext> canonical_limit_contexts;
-  std::vector<ShadowCoordinatorCandidate> shadow_coordinator_candidates;
-  std::vector<ton::validator::parallel_inbound::AccountDictionaryDelta> account_dictionary_deltas;
+  ReplayAccountArtifacts artifacts;
+  if (prepared != nullptr) {
+    const auto setup = result;
+    result = prepared->summary;
+    result.consensus_max_block_bytes = setup.consensus_max_block_bytes;
+    result.consensus_max_collated_bytes = setup.consensus_max_collated_bytes;
+    result.consensus_protocol_version = setup.consensus_protocol_version;
+    result.consensus_slots_per_leader_window = setup.consensus_slots_per_leader_window;
+    result.consensus_target_rate_ms = setup.consensus_target_rate_ms;
+    result.consensus_min_block_interval_ms = setup.consensus_min_block_interval_ms;
+    result.block_limit_bytes = setup.block_limit_bytes;
+    result.block_limit_gas = setup.block_limit_gas;
+    result.block_limit_lt_delta = setup.block_limit_lt_delta;
+    result.block_limit_collated_bytes = setup.block_limit_collated_bytes;
+    result.phase_setup_seconds = phase_checkpoint;
+    artifacts = prepared->artifacts;
+  }
+  auto& canonical_limit_effects = artifacts.limit_effects;
+  auto& canonical_limit_contexts = artifacts.limit_contexts;
+  auto& shadow_coordinator_candidates = artifacts.coordinator_candidates;
+  auto& account_dictionary_deltas = artifacts.account_dictionary_deltas;
   td::Status replay_status = td::Status::OK();
   std::set<td::Bits256> missing_libraries;
-  bool accounts_ok = account_blocks.check_for_each_extra([&](Ref<vm::CellSlice> account_block_slice, Ref<vm::CellSlice>,
-                                                             td::ConstBitPtr key, int key_len) {
+  bool accounts_ok = prepared != nullptr || account_blocks.check_for_each_extra([&](Ref<vm::CellSlice>
+                                                                                        account_block_slice,
+                                                                                    Ref<vm::CellSlice>,
+                                                                                    td::ConstBitPtr key, int key_len) {
     if (key_len != 256) {
       replay_status = td::Status::Error("invalid account block key length");
       return false;
@@ -1771,8 +1839,22 @@ td::Result<ReplayResult> replay_transactions(
     return td::Status::Error("transaction kind counts do not cover the complete replay scope");
   }
   auto phase_elapsed = replay_timer.elapsed();
-  result.phase_account_replay_seconds = phase_elapsed - phase_checkpoint;
+  if (prepared == nullptr) {
+    result.phase_account_replay_seconds = phase_elapsed - phase_checkpoint;
+  }
   phase_checkpoint = phase_elapsed;
+
+  if (collected_artifacts != nullptr) {
+    const auto artifact_export_started = replay_timer.elapsed();
+    *collected_artifacts = artifacts;
+    const auto artifact_export_finished = replay_timer.elapsed();
+    result.phase_artifact_export_seconds = artifact_export_finished - artifact_export_started;
+    phase_checkpoint = artifact_export_finished;
+  }
+  if (execution_mode == ReplayExecutionMode::account_effects_only) {
+    result.replay_total_seconds = result.phase_setup_seconds + result.phase_account_replay_seconds;
+    return result;
+  }
   block::BlockLimits shadow_limits = *configured_block_limits;
   auto synthetic_usage_tree = std::make_shared<vm::CellUsageTree>();
   shadow_limits.usage_tree = synthetic_usage_tree.get();
@@ -1880,6 +1962,8 @@ td::Result<ReplayResult> replay_transactions(
       result.collated_predecessor_witness_loaded = collated_predecessor_witness.not_null();
       PartialStateDictionaries old_state_dictionaries;
       PartialStateDictionaries new_state_dictionaries;
+      result.predecessor_state_witness_source =
+          collated_predecessor_witness.not_null() ? "collated_data" : "not_available";
       if (collated_predecessor_witness.not_null()) {
         root_stage = "extract_state_dictionaries";
         TRY_RESULT_ASSIGN(old_state_dictionaries, extract_partial_state_dictionaries(collated_predecessor_witness));
@@ -1957,7 +2041,7 @@ td::Result<ReplayResult> replay_transactions(
             account_transition_seed, account_dictionary_deltas, {}, {}, {});
         if (!account_transition) {
           return td::Status::Error(
-              PSTRING() << "collated predecessor witness cannot apply the canonical ShardAccounts transition at item "
+              PSTRING() << "predecessor witness cannot apply the canonical ShardAccounts transition at item "
                         << (account_transition.item_index ? td::to_string(account_transition.item_index.value())
                                                           : std::string("none"))
                         << ": " << ton::validator::parallel_inbound::to_string(account_transition.error)
@@ -2042,7 +2126,7 @@ td::Result<ReplayResult> replay_transactions(
             throw;
           }
           queue_diff_status =
-              td::Status::Error("collated predecessor witness is incomplete for the canonical OutMsgQueue transition");
+              td::Status::Error("predecessor witness is incomplete for the canonical OutMsgQueue transition");
         }
         if (!queue_diff_ok) {
           if (queue_diff_status.is_error()) {
@@ -2129,7 +2213,9 @@ td::Result<ReplayResult> replay_transactions(
   }
   phase_elapsed = replay_timer.elapsed();
   result.phase_augmented_roots_seconds = phase_elapsed - phase_checkpoint;
-  result.replay_total_seconds = phase_elapsed;
+  result.replay_total_seconds = result.phase_setup_seconds + result.phase_account_replay_seconds +
+                                result.phase_block_limits_seconds + result.phase_coordinator_seconds +
+                                result.phase_augmented_roots_seconds;
   return result;
 }
 
@@ -2139,6 +2225,11 @@ struct AccountReplayBatchMeasurement {
   std::vector<std::size_t> lane_accounts;
   std::vector<double> lane_planned_account_seconds;
   std::vector<double> lane_wall_seconds;
+};
+
+struct AccountLanePlan {
+  std::vector<std::vector<LoadedAccountProof>> proofs;
+  std::vector<double> planned_account_seconds;
 };
 
 double median(std::vector<double> values) {
@@ -2153,8 +2244,51 @@ double median(std::vector<double> values) {
   return (values[middle - 1] + values[middle]) / 2.0;
 }
 
+td::Result<AccountLanePlan> build_account_lane_plan(const std::vector<LoadedAccountProof>& account_proofs,
+                                                    const ReplayResult& reference, std::size_t requested_workers) {
+  if (requested_workers == 0 || requested_workers > 64) {
+    return td::Status::Error("parallel account replay worker count must be between 1 and 64");
+  }
+  if (account_proofs.empty() || reference.skipped_accounts != 0 || reference.accounts != account_proofs.size() ||
+      reference.account_work.size() != account_proofs.size()) {
+    return td::Status::Error("parallel account replay requires a complete account-proof block replay");
+  }
+
+  const std::size_t workers = std::min(requested_workers, account_proofs.size());
+  std::vector<const LoadedAccountProof*> ordered;
+  ordered.reserve(account_proofs.size());
+  for (const auto& proof : account_proofs) {
+    if (reference.account_work.find(proof.address) == reference.account_work.end()) {
+      return td::Status::Error(PSTRING() << "parallel account replay has no measured work for "
+                                         << proof.address.to_hex());
+    }
+    ordered.push_back(&proof);
+  }
+  std::sort(ordered.begin(), ordered.end(), [&](const auto* left, const auto* right) {
+    const double left_work = reference.account_work.at(left->address).transaction_seconds;
+    const double right_work = reference.account_work.at(right->address).transaction_seconds;
+    if (left_work != right_work) {
+      return left_work > right_work;
+    }
+    return left->address < right->address;
+  });
+
+  AccountLanePlan plan;
+  plan.proofs.resize(workers);
+  plan.planned_account_seconds.resize(workers, 0.0);
+  for (const auto* proof : ordered) {
+    const auto lane = static_cast<std::size_t>(
+        std::min_element(plan.planned_account_seconds.begin(), plan.planned_account_seconds.end()) -
+        plan.planned_account_seconds.begin());
+    plan.proofs[lane].push_back(*proof);
+    plan.planned_account_seconds[lane] += reference.account_work.at(proof->address).transaction_seconds;
+  }
+  return plan;
+}
+
 td::Status validate_account_replay_batch(const ReplayResult& reference,
-                                         const std::vector<std::unique_ptr<td::Result<ReplayResult>>>& lanes) {
+                                         const std::vector<std::unique_ptr<td::Result<ReplayResult>>>& lanes,
+                                         bool expect_global_effects = true) {
   auto check_sum = [&](auto member, td::Slice name) -> td::Status {
     using Value = std::decay_t<decltype(reference.*member)>;
     Value total{};
@@ -2178,15 +2312,32 @@ td::Status validate_account_replay_batch(const ReplayResult& reference,
                        "canonical_outbound_deq_imm_descriptors"));
   TRY_STATUS(check_sum(&ReplayResult::canonical_fee_augmentations_validated,
                        "canonical_fee_augmentations_validated"));
-  TRY_STATUS(check_sum(&ReplayResult::basechain_limit_effects_applied, "basechain_limit_effects_applied"));
-  TRY_STATUS(check_sum(&ReplayResult::basechain_limit_accounts, "basechain_limit_accounts"));
-  TRY_STATUS(check_sum(&ReplayResult::basechain_limit_gas, "basechain_limit_gas"));
-  TRY_STATUS(check_sum(&ReplayResult::shadow_coordinator_commits, "shadow_coordinator_commits"));
-  TRY_STATUS(check_sum(&ReplayResult::shadow_coordinator_accounts, "shadow_coordinator_accounts"));
-  TRY_STATUS(check_sum(&ReplayResult::shadow_coordinator_in_descriptors, "shadow_coordinator_in_descriptors"));
-  TRY_STATUS(check_sum(&ReplayResult::shadow_coordinator_out_descriptors, "shadow_coordinator_out_descriptors"));
-  TRY_STATUS(check_sum(&ReplayResult::shadow_coordinator_queue_deletions, "shadow_coordinator_queue_deletions"));
-  TRY_STATUS(check_sum(&ReplayResult::shadow_coordinator_new_messages, "shadow_coordinator_new_messages"));
+  if (expect_global_effects) {
+    TRY_STATUS(check_sum(&ReplayResult::basechain_limit_effects_applied, "basechain_limit_effects_applied"));
+    TRY_STATUS(check_sum(&ReplayResult::basechain_limit_accounts, "basechain_limit_accounts"));
+    TRY_STATUS(check_sum(&ReplayResult::basechain_limit_gas, "basechain_limit_gas"));
+    TRY_STATUS(check_sum(&ReplayResult::shadow_coordinator_commits, "shadow_coordinator_commits"));
+    TRY_STATUS(check_sum(&ReplayResult::shadow_coordinator_accounts, "shadow_coordinator_accounts"));
+    TRY_STATUS(check_sum(&ReplayResult::shadow_coordinator_in_descriptors, "shadow_coordinator_in_descriptors"));
+    TRY_STATUS(check_sum(&ReplayResult::shadow_coordinator_out_descriptors, "shadow_coordinator_out_descriptors"));
+    TRY_STATUS(check_sum(&ReplayResult::shadow_coordinator_queue_deletions, "shadow_coordinator_queue_deletions"));
+    TRY_STATUS(check_sum(&ReplayResult::shadow_coordinator_new_messages, "shadow_coordinator_new_messages"));
+  }
+
+  TransactionKindCounts transaction_kinds;
+  for (const auto& lane : lanes) {
+    transaction_kinds.add(lane->ok().transaction_kinds);
+  }
+  if (transaction_kinds.ordinary != reference.transaction_kinds.ordinary ||
+      transaction_kinds.tick != reference.transaction_kinds.tick ||
+      transaction_kinds.tock != reference.transaction_kinds.tock ||
+      transaction_kinds.storage != reference.transaction_kinds.storage ||
+      transaction_kinds.split_prepare != reference.transaction_kinds.split_prepare ||
+      transaction_kinds.split_install != reference.transaction_kinds.split_install ||
+      transaction_kinds.merge_prepare != reference.transaction_kinds.merge_prepare ||
+      transaction_kinds.merge_install != reference.transaction_kinds.merge_install) {
+    return td::Status::Error("parallel account replay transaction-kind mismatch");
+  }
 
   std::map<StdSmcAddress, std::size_t> account_transactions;
   for (const auto& lane : lanes) {
@@ -2220,46 +2371,179 @@ td::Status validate_account_replay_batch(const ReplayResult& reference,
   return td::Status::OK();
 }
 
+td::Status normalize_account_artifacts(ReplayAccountArtifacts& artifacts) {
+  if (artifacts.limit_effects.size() != artifacts.limit_contexts.size()) {
+    return td::Status::Error("account artifact limit effect/context size mismatch");
+  }
+
+  std::vector<std::size_t> order(artifacts.limit_effects.size());
+  std::iota(order.begin(), order.end(), 0);
+  std::sort(order.begin(), order.end(), [&](std::size_t left, std::size_t right) {
+    const auto& lhs = artifacts.limit_effects[left];
+    const auto& rhs = artifacts.limit_effects[right];
+    return lhs.transaction_start_lt < rhs.transaction_start_lt ||
+           (lhs.transaction_start_lt == rhs.transaction_start_lt && lhs.transaction_hash < rhs.transaction_hash);
+  });
+  std::vector<CanonicalTransactionEffects> effects;
+  std::vector<ton::validator::parallel_inbound::BasechainLimitContext> contexts;
+  effects.reserve(order.size());
+  contexts.reserve(order.size());
+  std::set<Hash256> transaction_hashes;
+  for (auto index : order) {
+    if (!transaction_hashes.insert(artifacts.limit_effects[index].transaction_hash).second) {
+      return td::Status::Error("account artifacts contain a duplicate transaction hash");
+    }
+    effects.push_back(std::move(artifacts.limit_effects[index]));
+    contexts.push_back(artifacts.limit_contexts[index]);
+  }
+  artifacts.limit_effects = std::move(effects);
+  artifacts.limit_contexts = std::move(contexts);
+
+  std::sort(artifacts.coordinator_candidates.begin(), artifacts.coordinator_candidates.end(),
+            [](const auto& left, const auto& right) { return left.work.key < right.work.key; });
+  for (std::size_t i = 1; i < artifacts.coordinator_candidates.size(); ++i) {
+    if (!(artifacts.coordinator_candidates[i - 1].work.key < artifacts.coordinator_candidates[i].work.key)) {
+      return td::Status::Error("account artifacts contain a duplicate coordinator key");
+    }
+  }
+
+  std::sort(artifacts.account_dictionary_deltas.begin(), artifacts.account_dictionary_deltas.end(),
+            [](const auto& left, const auto& right) { return left.account < right.account; });
+  for (std::size_t i = 1; i < artifacts.account_dictionary_deltas.size(); ++i) {
+    if (!(artifacts.account_dictionary_deltas[i - 1].account < artifacts.account_dictionary_deltas[i].account)) {
+      return td::Status::Error("account artifacts contain a duplicate account delta");
+    }
+  }
+  return td::Status::OK();
+}
+
+bool equal_optional_metadata(const td::optional<block::MsgMetadata>& left,
+                             const td::optional<block::MsgMetadata>& right) {
+  return static_cast<bool>(left) == static_cast<bool>(right) && (!left || left.value() == right.value());
+}
+
+bool equal_coordinator_context(const CoordinatorCommitContext& left, const CoordinatorCommitContext& right) {
+  if (left.limit.account_is_first != right.limit.account_is_first || left.limit.charge_gas != right.limit.charge_gas ||
+      left.outbound_registration.metadata_enabled != right.outbound_registration.metadata_enabled ||
+      !equal_optional_metadata(left.outbound_registration.metadata, right.outbound_registration.metadata) ||
+      left.inbound_descriptor.has_value() != right.inbound_descriptor.has_value() ||
+      left.outbound_queue_deletion.has_value() != right.outbound_queue_deletion.has_value()) {
+    return false;
+  }
+  if (left.inbound_descriptor &&
+      (left.inbound_descriptor->dequeued_from_current_shard != right.inbound_descriptor->dequeued_from_current_shard ||
+       left.inbound_descriptor->message_envelope.is_null() || right.inbound_descriptor->message_envelope.is_null() ||
+       left.inbound_descriptor->message_envelope->get_hash() !=
+           right.inbound_descriptor->message_envelope->get_hash())) {
+    return false;
+  }
+  return !left.outbound_queue_deletion || left.outbound_queue_deletion.value() == right.outbound_queue_deletion.value();
+}
+
+td::Status validate_account_artifact_equivalence(const ReplayAccountArtifacts& reference,
+                                                 const ReplayAccountArtifacts& actual) {
+  if (reference.limit_effects.size() != actual.limit_effects.size() ||
+      reference.limit_contexts.size() != actual.limit_contexts.size() ||
+      reference.coordinator_candidates.size() != actual.coordinator_candidates.size() ||
+      reference.account_dictionary_deltas.size() != actual.account_dictionary_deltas.size()) {
+    return td::Status::Error("offline collator artifact cardinality mismatch");
+  }
+  for (std::size_t i = 0; i < reference.limit_effects.size(); ++i) {
+    const auto& expected = reference.limit_effects[i];
+    const auto& observed = actual.limit_effects[i];
+    if (expected.account != observed.account || expected.transaction_hash != observed.transaction_hash ||
+        expected.pre_account_state_hash != observed.pre_account_state_hash ||
+        expected.post_account_state_hash != observed.post_account_state_hash ||
+        expected.effects_hash != observed.effects_hash || expected.proof_journal_hash != observed.proof_journal_hash ||
+        expected.transaction_start_lt != observed.transaction_start_lt ||
+        expected.transaction_end_lt != observed.transaction_end_lt || expected.transaction_root.is_null() ||
+        observed.transaction_root.is_null() ||
+        expected.transaction_root->get_hash() != observed.transaction_root->get_hash() ||
+        expected.post_account_state.is_null() || observed.post_account_state.is_null() ||
+        expected.post_account_state->get_hash() != observed.post_account_state->get_hash() ||
+        expected.total_fees_hash != observed.total_fees_hash ||
+        reference.limit_contexts[i].account_is_first != actual.limit_contexts[i].account_is_first ||
+        reference.limit_contexts[i].charge_gas != actual.limit_contexts[i].charge_gas) {
+      return td::Status::Error(PSTRING() << "offline collator transaction artifact mismatch at item " << i);
+    }
+  }
+  for (std::size_t i = 0; i < reference.coordinator_candidates.size(); ++i) {
+    const auto& expected = reference.coordinator_candidates[i];
+    const auto& observed = actual.coordinator_candidates[i];
+    if (!(expected.work.key == observed.work.key) || expected.work.account != observed.work.account ||
+        expected.effects.effects_hash != observed.effects.effects_hash || expected.pre_account_state.is_null() ||
+        observed.pre_account_state.is_null() ||
+        expected.pre_account_state->get_hash() != observed.pre_account_state->get_hash() ||
+        !equal_coordinator_context(expected.context, observed.context)) {
+      return td::Status::Error(PSTRING() << "offline collator coordinator artifact mismatch at item " << i);
+    }
+  }
+  for (std::size_t i = 0; i < reference.account_dictionary_deltas.size(); ++i) {
+    const auto& expected = reference.account_dictionary_deltas[i];
+    const auto& observed = actual.account_dictionary_deltas[i];
+    if (expected.account != observed.account || expected.last_transaction_hash != observed.last_transaction_hash ||
+        expected.last_transaction_lt != observed.last_transaction_lt ||
+        expected.existed_before != observed.existed_before || expected.exists_after != observed.exists_after ||
+        expected.post_account_state.is_null() != observed.post_account_state.is_null() ||
+        (expected.post_account_state.not_null() &&
+         expected.post_account_state->get_hash() != observed.post_account_state->get_hash())) {
+      return td::Status::Error(PSTRING() << "offline collator account delta mismatch at item " << i);
+    }
+  }
+  return td::Status::OK();
+}
+
+td::Status validate_offline_replay_result(const ReplayResult& reference, const ReplayResult& actual) {
+  if (actual.target_accounts != reference.target_accounts || actual.accounts != reference.accounts ||
+      actual.skipped_accounts != reference.skipped_accounts || actual.transactions != reference.transactions ||
+      actual.tvm_transactions != reference.tvm_transactions ||
+      actual.transaction_kinds.ordinary != reference.transaction_kinds.ordinary ||
+      actual.transaction_kinds.tick != reference.transaction_kinds.tick ||
+      actual.transaction_kinds.tock != reference.transaction_kinds.tock ||
+      actual.transaction_kinds.storage != reference.transaction_kinds.storage ||
+      actual.transaction_kinds.split_prepare != reference.transaction_kinds.split_prepare ||
+      actual.transaction_kinds.split_install != reference.transaction_kinds.split_install ||
+      actual.transaction_kinds.merge_prepare != reference.transaction_kinds.merge_prepare ||
+      actual.transaction_kinds.merge_install != reference.transaction_kinds.merge_install ||
+      actual.canonical_payloads_validated != reference.canonical_payloads_validated ||
+      actual.canonical_payload_out_messages != reference.canonical_payload_out_messages ||
+      actual.canonical_outbound_registrations != reference.canonical_outbound_registrations ||
+      actual.canonical_inbound_fin_descriptors != reference.canonical_inbound_fin_descriptors ||
+      actual.canonical_outbound_deq_imm_descriptors != reference.canonical_outbound_deq_imm_descriptors ||
+      actual.canonical_fee_augmentations_validated != reference.canonical_fee_augmentations_validated ||
+      actual.basechain_limit_effects_applied != reference.basechain_limit_effects_applied ||
+      actual.basechain_limit_accounts != reference.basechain_limit_accounts ||
+      actual.basechain_limit_gas != reference.basechain_limit_gas ||
+      actual.basechain_limit_max_end_lt != reference.basechain_limit_max_end_lt ||
+      actual.shadow_coordinator_commits != reference.shadow_coordinator_commits ||
+      actual.shadow_coordinator_accounts != reference.shadow_coordinator_accounts ||
+      actual.shadow_coordinator_in_descriptors != reference.shadow_coordinator_in_descriptors ||
+      actual.shadow_coordinator_out_descriptors != reference.shadow_coordinator_out_descriptors ||
+      actual.shadow_coordinator_queue_deletions != reference.shadow_coordinator_queue_deletions ||
+      actual.shadow_coordinator_new_messages != reference.shadow_coordinator_new_messages ||
+      actual.shard_account_proof_values_bound != reference.shard_account_proof_values_bound ||
+      actual.predecessor_state_witness_source != reference.predecessor_state_witness_source ||
+      actual.shard_accounts_predecessor_root_bound != reference.shard_accounts_predecessor_root_bound ||
+      actual.shard_accounts_transition_validated != reference.shard_accounts_transition_validated ||
+      actual.shard_accounts_transition_status != reference.shard_accounts_transition_status ||
+      actual.out_msg_queue_diff_additions != reference.out_msg_queue_diff_additions ||
+      actual.out_msg_queue_diff_deletions != reference.out_msg_queue_diff_deletions ||
+      actual.out_msg_queue_diff_replacements != reference.out_msg_queue_diff_replacements ||
+      actual.out_msg_queue_deletions_bound != reference.out_msg_queue_deletions_bound ||
+      actual.out_msg_queue_transition_status != reference.out_msg_queue_transition_status ||
+      actual.augmented_dictionary_roots_validated != reference.augmented_dictionary_roots_validated) {
+    return td::Status::Error("offline collator replay result disagrees with serial reference");
+  }
+  return td::Status::OK();
+}
+
 td::Result<AccountReplayBatchMeasurement> run_account_replay_batch(
     const std::string& archive, const HistoryBlocks& history, const BlockContext& target, const LoadedState& mc_state,
     const std::vector<LoadedAccountProof>& account_proofs, const LoadedLibraryBodies* library_bodies,
     bool profile_ed25519, const ReplayResult& reference,
     ton::validator::parallel_inbound::ReusableWorkerPool& worker_pool, std::size_t requested_workers) {
-  if (requested_workers == 0 || requested_workers > 64) {
-    return td::Status::Error("parallel account replay worker count must be between 1 and 64");
-  }
-  if (account_proofs.empty() || reference.skipped_accounts != 0 || reference.accounts != account_proofs.size() ||
-      reference.account_work.size() != account_proofs.size()) {
-    return td::Status::Error("parallel account replay requires a complete account-proof block replay");
-  }
-
-  const std::size_t workers = std::min(requested_workers, account_proofs.size());
-  std::vector<const LoadedAccountProof*> ordered;
-  ordered.reserve(account_proofs.size());
-  for (const auto& proof : account_proofs) {
-    if (reference.account_work.find(proof.address) == reference.account_work.end()) {
-      return td::Status::Error(PSTRING() << "parallel account replay has no measured work for "
-                                         << proof.address.to_hex());
-    }
-    ordered.push_back(&proof);
-  }
-  std::sort(ordered.begin(), ordered.end(), [&](const auto* left, const auto* right) {
-    const double left_work = reference.account_work.at(left->address).transaction_seconds;
-    const double right_work = reference.account_work.at(right->address).transaction_seconds;
-    if (left_work != right_work) {
-      return left_work > right_work;
-    }
-    return left->address < right->address;
-  });
-
-  std::vector<std::vector<LoadedAccountProof>> lane_proofs(workers);
-  std::vector<double> lane_planned(workers, 0.0);
-  for (const auto* proof : ordered) {
-    const auto lane = static_cast<std::size_t>(
-        std::min_element(lane_planned.begin(), lane_planned.end()) - lane_planned.begin());
-    lane_proofs[lane].push_back(*proof);
-    lane_planned[lane] += reference.account_work.at(proof->address).transaction_seconds;
-  }
+  TRY_RESULT(plan, build_account_lane_plan(account_proofs, reference, requested_workers));
+  const auto workers = plan.proofs.size();
 
   std::vector<std::unique_ptr<td::Result<ReplayResult>>> lane_results(workers);
   std::vector<double> lane_wall(workers, 0.0);
@@ -2271,7 +2555,7 @@ td::Result<AccountReplayBatchMeasurement> run_account_replay_batch(
       td::Timer lane_timer;
       try {
         lane_results[lane] = std::make_unique<td::Result<ReplayResult>>(
-            replay_transactions(archive, history, target, {}, nullptr, mc_state, {}, lane_proofs[lane], library_bodies,
+            replay_transactions(archive, history, target, {}, nullptr, mc_state, {}, plan.proofs[lane], library_bodies,
                                 profile_ed25519, false));
       } catch (const vm::VmVirtError& error) {
         lane_results[lane] = std::make_unique<td::Result<ReplayResult>>(
@@ -2303,13 +2587,166 @@ td::Result<AccountReplayBatchMeasurement> run_account_replay_batch(
   AccountReplayBatchMeasurement measurement;
   measurement.workers = workers;
   measurement.wall_seconds = wall_seconds;
-  measurement.lane_planned_account_seconds = std::move(lane_planned);
+  measurement.lane_planned_account_seconds = std::move(plan.planned_account_seconds);
   measurement.lane_wall_seconds = std::move(lane_wall);
   measurement.lane_accounts.reserve(workers);
-  for (const auto& proofs : lane_proofs) {
+  for (const auto& proofs : plan.proofs) {
     measurement.lane_accounts.push_back(proofs.size());
   }
   return measurement;
+}
+
+td::Result<PreparedAccountReplay> merge_account_replay_lanes(
+    const ReplayResult& reference, const std::vector<std::unique_ptr<td::Result<ReplayResult>>>& lane_results,
+    std::vector<ReplayAccountArtifacts> lane_artifacts, double account_wall_seconds) {
+  PreparedAccountReplay merged;
+  auto& summary = merged.summary;
+  summary.target_accounts = reference.target_accounts;
+  summary.consensus_max_block_bytes = reference.consensus_max_block_bytes;
+  summary.consensus_max_collated_bytes = reference.consensus_max_collated_bytes;
+  summary.consensus_protocol_version = reference.consensus_protocol_version;
+  summary.consensus_slots_per_leader_window = reference.consensus_slots_per_leader_window;
+  summary.consensus_target_rate_ms = reference.consensus_target_rate_ms;
+  summary.consensus_min_block_interval_ms = reference.consensus_min_block_interval_ms;
+  summary.block_limit_bytes = reference.block_limit_bytes;
+  summary.block_limit_gas = reference.block_limit_gas;
+  summary.block_limit_lt_delta = reference.block_limit_lt_delta;
+  summary.block_limit_collated_bytes = reference.block_limit_collated_bytes;
+  summary.phase_account_replay_seconds = account_wall_seconds;
+  summary.replay_total_seconds = account_wall_seconds;
+
+  if (lane_results.size() != lane_artifacts.size()) {
+    return td::Status::Error("offline collator lane result/artifact size mismatch");
+  }
+  for (std::size_t lane = 0; lane < lane_results.size(); ++lane) {
+    const auto& replay = lane_results[lane]->ok();
+    summary.accounts += replay.accounts;
+    summary.transactions += replay.transactions;
+    summary.tvm_transactions += replay.tvm_transactions;
+    summary.transaction_kinds.add(replay.transaction_kinds);
+    summary.canonical_payloads_validated += replay.canonical_payloads_validated;
+    summary.canonical_payload_out_messages += replay.canonical_payload_out_messages;
+    summary.canonical_outbound_registrations += replay.canonical_outbound_registrations;
+    summary.canonical_inbound_fin_descriptors += replay.canonical_inbound_fin_descriptors;
+    summary.canonical_outbound_deq_imm_descriptors += replay.canonical_outbound_deq_imm_descriptors;
+    summary.canonical_fee_augmentations_validated += replay.canonical_fee_augmentations_validated;
+    summary.hotpaths.merge(replay.hotpaths);
+    for (const auto& [address, work] : replay.account_work) {
+      if (!summary.account_work.emplace(address, work).second) {
+        return td::Status::Error(PSTRING() << "offline collator duplicated account summary " << address.to_hex());
+      }
+    }
+
+    auto& artifacts = lane_artifacts[lane];
+    merged.artifacts.limit_effects.insert(merged.artifacts.limit_effects.end(),
+                                          std::make_move_iterator(artifacts.limit_effects.begin()),
+                                          std::make_move_iterator(artifacts.limit_effects.end()));
+    merged.artifacts.limit_contexts.insert(merged.artifacts.limit_contexts.end(), artifacts.limit_contexts.begin(),
+                                           artifacts.limit_contexts.end());
+    merged.artifacts.coordinator_candidates.insert(merged.artifacts.coordinator_candidates.end(),
+                                                   std::make_move_iterator(artifacts.coordinator_candidates.begin()),
+                                                   std::make_move_iterator(artifacts.coordinator_candidates.end()));
+    merged.artifacts.account_dictionary_deltas.insert(
+        merged.artifacts.account_dictionary_deltas.end(),
+        std::make_move_iterator(artifacts.account_dictionary_deltas.begin()),
+        std::make_move_iterator(artifacts.account_dictionary_deltas.end()));
+  }
+  summary.skipped_accounts = summary.target_accounts - summary.accounts;
+  TRY_STATUS(normalize_account_artifacts(merged.artifacts));
+  return merged;
+}
+
+td::Result<OfflineCollatorReplayProbe> run_offline_collator_replay(
+    const std::string& archive, const HistoryBlocks& history, const BlockContext& target,
+    const Ref<vm::Cell>& collated_predecessor_witness, const LoadedState& mc_state,
+    const std::vector<LoadedAccountProof>& account_proofs, const LoadedLibraryBodies* library_bodies,
+    bool profile_ed25519, const ReplayResult& reference, ReplayAccountArtifacts reference_artifacts,
+    std::size_t requested_workers) {
+  if (reference.transaction_kinds.total() != reference.transaction_kinds.ordinary) {
+    return td::Status::Error(
+        "offline collator probe rejects blocks containing special transactions; serial separation is not implemented");
+  }
+  td::Timer planning_timer;
+  TRY_RESULT(plan, build_account_lane_plan(account_proofs, reference, requested_workers));
+  const double planning_seconds = planning_timer.elapsed();
+  const auto workers = plan.proofs.size();
+
+  td::Timer startup_timer;
+  TRY_RESULT(worker_pool, ton::validator::parallel_inbound::ReusableWorkerPool::create(workers));
+  const double startup_seconds = startup_timer.elapsed();
+
+  std::vector<std::unique_ptr<td::Result<ReplayResult>>> lane_results(workers);
+  std::vector<ReplayAccountArtifacts> lane_artifacts(workers);
+  std::vector<ton::validator::parallel_inbound::ReusableWorkerPool::Task> tasks;
+  tasks.reserve(workers);
+  td::Timer account_timer;
+  for (std::size_t lane = 0; lane < workers; ++lane) {
+    tasks.push_back([&, lane]() {
+      try {
+        lane_results[lane] = std::make_unique<td::Result<ReplayResult>>(replay_transactions(
+            archive, history, target, {}, nullptr, mc_state, {}, plan.proofs[lane], library_bodies, profile_ed25519,
+            false, ReplayExecutionMode::account_effects_only, &lane_artifacts[lane]));
+      } catch (const vm::VmVirtError& error) {
+        lane_results[lane] = std::make_unique<td::Result<ReplayResult>>(
+            td::Status::Error(PSTRING() << "offline collator virtualization error: " << error.get_msg()));
+      } catch (const vm::VmError& error) {
+        lane_results[lane] = std::make_unique<td::Result<ReplayResult>>(
+            td::Status::Error(PSTRING() << "offline collator VM error: " << error.get_msg()));
+      } catch (const std::exception& error) {
+        lane_results[lane] = std::make_unique<td::Result<ReplayResult>>(td::Status::Error(PSLICE() << error.what()));
+      } catch (...) {
+        lane_results[lane] =
+            std::make_unique<td::Result<ReplayResult>>(td::Status::Error("unknown offline collator worker error"));
+      }
+    });
+  }
+  TRY_STATUS(worker_pool->run_batch(std::move(tasks)));
+  const double account_seconds = account_timer.elapsed();
+  for (std::size_t lane = 0; lane < workers; ++lane) {
+    if (lane_results[lane] == nullptr) {
+      return td::Status::Error("offline collator worker returned no result");
+    }
+    if (lane_results[lane]->is_error()) {
+      return lane_results[lane]->move_as_error_prefix(PSTRING() << "offline collator lane " << lane << ": ");
+    }
+  }
+  td::Timer equivalence_timer;
+  TRY_STATUS(validate_account_replay_batch(reference, lane_results, false));
+  double equivalence_seconds = equivalence_timer.elapsed();
+  td::Timer merge_timer;
+  TRY_RESULT(prepared, merge_account_replay_lanes(reference, lane_results, std::move(lane_artifacts), account_seconds));
+  const double merge_seconds = merge_timer.elapsed();
+  td::Timer artifact_equivalence_timer;
+  TRY_STATUS(normalize_account_artifacts(reference_artifacts));
+  TRY_STATUS(validate_account_artifact_equivalence(reference_artifacts, prepared.artifacts));
+  equivalence_seconds += artifact_equivalence_timer.elapsed();
+
+  td::Timer commit_timer;
+  TRY_RESULT(committed, replay_transactions(archive, history, target, collated_predecessor_witness, nullptr, mc_state,
+                                            {}, account_proofs, library_bodies, profile_ed25519, true,
+                                            ReplayExecutionMode::prepared_effects, nullptr, &prepared));
+  const double commit_seconds = commit_timer.elapsed();
+  td::Timer result_equivalence_timer;
+  TRY_STATUS(validate_offline_replay_result(reference, committed));
+  equivalence_seconds += result_equivalence_timer.elapsed();
+
+  OfflineCollatorReplayProbe probe;
+  probe.requested_workers = requested_workers;
+  probe.workers = workers;
+  probe.transactions = committed.transactions;
+  probe.accounts = committed.accounts;
+  probe.lane_planning_seconds = planning_seconds;
+  probe.worker_pool_startup_seconds = startup_seconds;
+  probe.account_execution_seconds = account_seconds;
+  probe.artifact_merge_seconds = merge_seconds;
+  probe.equivalence_check_seconds = equivalence_seconds;
+  probe.serial_commit_seconds = commit_seconds;
+  probe.total_seconds = planning_seconds + account_seconds + merge_seconds + commit_seconds;
+  probe.serial_reference_seconds = reference.replay_total_seconds;
+  probe.augmented_dictionary_roots_validated = committed.augmented_dictionary_roots_validated;
+  probe.exact_artifact_set = true;
+  probe.exact_replay_result = true;
+  return probe;
 }
 
 td::Result<ParallelAccountReplayProbe> run_parallel_account_replay_probe(
@@ -2567,7 +3004,8 @@ std::string single_shard_capacity_json(const BlockContext& target, const ReplayR
 std::string replay_json(const BlockContext& target, const LoadedState* account_state,
                         const std::vector<LoadedAccountProof>& account_proofs, const LoadedState& mc_state,
                         const LoadedLibraryBodies* library_bodies, const ReplayResult& replay, bool profile_ed25519,
-                        const ParallelAccountReplayProbe* parallel_probe) {
+                        const ParallelAccountReplayProbe* parallel_probe,
+                        const OfflineCollatorReplayProbe* offline_collator_probe) {
   td::StringBuilder out;
   out << "{\"schema_version\":1,\"mode\":\"transaction_equivalence_replay\",\"block_id\":\"" << target.id.to_str()
       << "\",\"predecessor_id\":\"" << target.prev[0].to_str() << "\",\"account_source\":\""
@@ -2621,6 +3059,7 @@ std::string replay_json(const BlockContext& target, const LoadedState* account_s
       << ",\"shadow_coordinator_new_messages\":" << replay.shadow_coordinator_new_messages
       << ",\"shadow_coordinator_queue_scope\":\"descriptor_derived_deletion_subset\""
       << ",\"collated_predecessor_witness_loaded\":" << (replay.collated_predecessor_witness_loaded ? "true" : "false")
+      << ",\"predecessor_state_witness_source\":\"" << replay.predecessor_state_witness_source << "\""
       << ",\"shard_account_proof_values_bound\":" << replay.shard_account_proof_values_bound
       << ",\"shard_accounts_predecessor_root_bound\":"
       << (replay.shard_accounts_predecessor_root_bound ? "true" : "false")
@@ -2637,8 +3076,8 @@ std::string replay_json(const BlockContext& target, const LoadedState* account_s
                                                            : "InMsgDescr_OutMsgDescr")
       << "\""
       << ",\"augmented_dictionary_baseline_source\":\"target_minus_validated_deltas\""
-      << ",\"augmented_dictionary_historical_transition_proven\":false"
-      << ",\"shard_accounts_root_status\":\""
+      << ",\"augmented_dictionary_historical_transition_proven\":"
+      << (replay.collated_predecessor_witness_loaded ? "true" : "false") << ",\"shard_accounts_root_status\":\""
       << (replay.shard_accounts_transition_validated   ? "exact_transition_validated"
           : replay.collated_predecessor_witness_loaded ? "collated_witness_loaded_transition_incomplete"
                                                        : "requires_collated_data_predecessor_witness")
@@ -2656,6 +3095,7 @@ std::string replay_json(const BlockContext& target, const LoadedState* account_s
       << ",\"global_effects\":\"atomic_shadow_applied_not_live_collator_dictionaries\"}"
       << ",\"replay_phases_wall\":{\"setup_seconds\":" << replay.phase_setup_seconds
       << ",\"account_replay_seconds\":" << replay.phase_account_replay_seconds
+      << ",\"artifact_export_seconds_excluded_from_total\":" << replay.phase_artifact_export_seconds
       << ",\"block_limits_seconds\":" << replay.phase_block_limits_seconds
       << ",\"coordinator_seconds\":" << replay.phase_coordinator_seconds
       << ",\"augmented_roots_seconds\":" << replay.phase_augmented_roots_seconds
@@ -2733,6 +3173,37 @@ std::string replay_json(const BlockContext& target, const LoadedState* account_s
         << ",\"excludes\":[\"worker_pool_startup\",\"augmented_root_commit\",\"collator_integration\","
            "\"network\",\"consensus\"]}";
   }
+  out << ",\"offline_collator_replay\":";
+  if (offline_collator_probe == nullptr) {
+    out << "null";
+  } else {
+    out << "{\"scope\":\"offline_immutable_account_effects_plus_serial_shadow_commit\""
+        << ",\"requested_workers\":" << offline_collator_probe->requested_workers
+        << ",\"workers\":" << offline_collator_probe->workers
+        << ",\"transactions\":" << offline_collator_probe->transactions
+        << ",\"accounts\":" << offline_collator_probe->accounts
+        << ",\"lane_planning_seconds\":" << offline_collator_probe->lane_planning_seconds
+        << ",\"worker_pool_startup_seconds\":" << offline_collator_probe->worker_pool_startup_seconds
+        << ",\"account_execution_seconds\":" << offline_collator_probe->account_execution_seconds
+        << ",\"artifact_merge_seconds\":" << offline_collator_probe->artifact_merge_seconds
+        << ",\"equivalence_check_seconds_excluded_from_total\":" << offline_collator_probe->equivalence_check_seconds
+        << ",\"serial_commit_seconds\":" << offline_collator_probe->serial_commit_seconds
+        << ",\"total_seconds\":" << offline_collator_probe->total_seconds
+        << ",\"serial_reference_seconds\":" << offline_collator_probe->serial_reference_seconds
+        << ",\"wall_speedup\":" << offline_collator_probe->speedup()
+        << ",\"augmented_dictionary_roots_validated\":" << offline_collator_probe->augmented_dictionary_roots_validated
+        << ",\"exact_artifact_set\":" << (offline_collator_probe->exact_artifact_set ? "true" : "false")
+        << ",\"exact_replay_result\":" << (offline_collator_probe->exact_replay_result ? "true" : "false")
+        << ",\"special_transaction_policy\":\"probe_rejects_any_non_ordinary_transaction\""
+        << ",\"failure_policy\":\"discard_entire_offline_batch_before_global_publish\""
+        << ",\"sample_order\":\"serial_reference_then_parallel_path\""
+        << ",\"known_biases\":[\"single_sample\",\"shared_process_cache_state\","
+           "\"serial_reference_precedes_parallel_path\"]"
+        << ",\"includes\":[\"parallel_account_execution\",\"deterministic_artifact_merge\","
+           "\"serial_block_limits\",\"serial_shadow_coordinator\",\"available_augmented_root_gates\"]"
+        << ",\"excludes\":[\"worker_pool_startup\",\"live_collator_mutation\",\"block_candidate_serialization\","
+           "\"validate_query\",\"network\",\"consensus\"]}";
+  }
   out << ",\"single_shard_capacity\":" << single_shard_capacity_json(target, replay, parallel_probe) << "}";
   return out.as_cslice().str();
 }
@@ -2744,7 +3215,8 @@ td::Result<std::string> run(const std::string& archive, const std::string& block
                             const std::vector<std::string>& library_body_paths,
                             const std::vector<std::string>& account_part_specs,
                             const std::vector<std::string>& account_proof_specs, int split_depth, bool profile_ed25519,
-                            std::size_t account_workers, std::size_t account_samples) {
+                            std::size_t account_workers, std::size_t account_samples,
+                            std::size_t offline_collator_workers) {
   const bool block_boc_mode = !block_boc.empty();
   td::Result<LoadedBlock> loaded_block = td::Status::Error("block source was not selected");
   if (block_boc_mode) {
@@ -2757,8 +3229,8 @@ td::Result<std::string> run(const std::string& archive, const std::string& block
   TRY_RESULT(block_data, std::move(loaded_block));
   TRY_RESULT(target, unpack_block_context(std::move(block_data)));
   if (inspect) {
-    if (account_workers != 0) {
-      return td::Status::Error("--account-workers is only valid in replay mode");
+    if (account_workers != 0 || offline_collator_workers != 0) {
+      return td::Status::Error("worker probes are only valid in replay mode");
     }
     return inspect_json(target, split_depth);
   }
@@ -2834,9 +3306,10 @@ td::Result<std::string> run(const std::string& archive, const std::string& block
     TRY_RESULT(loaded, load_library_bodies(library_body_paths));
     library_bodies = std::make_unique<LoadedLibraryBodies>(std::move(loaded));
   }
-  TRY_RESULT(replay,
-             replay_transactions(archive, history, target, collated_predecessor_witness, prev_state.get(), *mc_state,
-                                 account_parts, account_proofs, library_bodies.get(), profile_ed25519, true));
+  ReplayAccountArtifacts serial_artifacts;
+  TRY_RESULT(replay, replay_transactions(archive, history, target, collated_predecessor_witness, prev_state.get(),
+                                         *mc_state, account_parts, account_proofs, library_bodies.get(),
+                                         profile_ed25519, true, ReplayExecutionMode::full, &serial_artifacts));
   std::optional<ParallelAccountReplayProbe> parallel_probe;
   if (account_workers != 0) {
     if (prev_state != nullptr || !account_parts.empty() || account_proofs.empty()) {
@@ -2847,8 +3320,19 @@ td::Result<std::string> run(const std::string& archive, const std::string& block
                                                         account_samples));
     parallel_probe = std::move(probe);
   }
-  return replay_json(target, prev_state.get(), account_proofs, *mc_state, library_bodies.get(), replay,
-                     profile_ed25519, parallel_probe ? &parallel_probe.value() : nullptr);
+  std::optional<OfflineCollatorReplayProbe> offline_collator_probe;
+  if (offline_collator_workers != 0) {
+    if (prev_state != nullptr || !account_parts.empty() || account_proofs.empty()) {
+      return td::Status::Error("--offline-collator-workers requires complete --account-proof replay mode");
+    }
+    TRY_RESULT(probe, run_offline_collator_replay(archive, history, target, collated_predecessor_witness, *mc_state,
+                                                  account_proofs, library_bodies.get(), profile_ed25519, replay,
+                                                  std::move(serial_artifacts), offline_collator_workers));
+    offline_collator_probe = std::move(probe);
+  }
+  return replay_json(target, prev_state.get(), account_proofs, *mc_state, library_bodies.get(), replay, profile_ed25519,
+                     parallel_probe ? &parallel_probe.value() : nullptr,
+                     offline_collator_probe ? &offline_collator_probe.value() : nullptr);
 }
 
 }  // namespace
@@ -2877,6 +3361,7 @@ int main(int argc, char** argv) {
   std::size_t account_workers = 0;
   std::size_t account_samples = 1;
   bool account_samples_explicit = false;
+  std::size_t offline_collator_workers = 0;
 
   td::OptionParser options;
   options.set_description(
@@ -2944,6 +3429,15 @@ int main(int argc, char** argv) {
                                }
                                return td::Status::OK();
                              });
+  options.add_checked_option(0, "offline-collator-workers",
+                             "run opt-in immutable account execution plus one serial shadow commit with 1..64 workers",
+                             [&](td::Slice value) {
+                               TRY_RESULT_ASSIGN(offline_collator_workers, td::to_integer_safe<std::size_t>(value));
+                               if (offline_collator_workers == 0 || offline_collator_workers > 64) {
+                                 return td::Status::Error("offline collator worker count must be between 1 and 64");
+                               }
+                               return td::Status::OK();
+                             });
   options.add_option('h', "help", "print help", [&]() {
     char buffer[16384];
     td::StringBuilder out(td::MutableSlice{buffer, sizeof(buffer)});
@@ -2960,7 +3454,7 @@ int main(int argc, char** argv) {
   const bool has_replay_inputs = !mc_archive.empty() || !prev_state.empty() || !mc_state.empty() || !mc_proof.empty() ||
                                  !collated_data.empty() || !library_bodies.empty() || !account_parts.empty() ||
                                  !account_proofs.empty() || !history_block_bocs.empty() || profile_ed25519 ||
-                                 account_workers != 0 || account_samples_explicit;
+                                 account_workers != 0 || account_samples_explicit || offline_collator_workers != 0;
   if (account_samples_explicit && account_workers == 0) {
     std::cerr << "Error: --account-samples requires --account-workers\n";
     return 1;
@@ -3038,7 +3532,7 @@ int main(int argc, char** argv) {
     } else {
       result = run(archive, block_boc, mc_archive, block_id, inspect, collated_data, prev_state, mc_state, mc_proof,
                    history_block_bocs, library_bodies, account_parts, account_proofs, split_depth, profile_ed25519,
-                   account_workers, account_samples);
+                   account_workers, account_samples, offline_collator_workers);
     }
     if (result.is_error()) {
       std::cerr << "Error: " << result.move_as_error().to_string() << '\n';

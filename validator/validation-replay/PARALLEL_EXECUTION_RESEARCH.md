@@ -488,6 +488,73 @@ therefore remains `null`. The next gate is a disabled offline Collator path that
 feeds immutable ordinary account chains to this pool, retains tick/tock on the
 coordinator, and requires serial candidate and ValidateQuery equivalence.
 
+## Offline immutable-account commit gate - 2026-08-02
+
+The replay utility now has an opt-in `--offline-collator-workers` path. It does
+not wire workers into the live Collator. Whole-account chains run concurrently
+against immutable predecessor proofs and return canonical transaction effects,
+coordinator inputs, and account dictionary deltas. A serial coordinator sorts
+by canonical transaction/message/account keys, rejects duplicates, requires
+exact equality with the serial artifact set, and then applies the existing
+block-limit, coordinator, and augmented-root gates once.
+
+The failure boundary is deliberately coarse. A worker exception, missing or
+duplicate artifact, limit failure, coordinator failure, or root mismatch
+discards the entire offline batch before publication. Ordinary basechain
+transactions are the only accepted worker input. A tick/tock, storage, split,
+or merge description makes the current probe fail closed; separating those
+descriptions into serial coordinator work remains an integration gate. The
+64-worker CLI bound is only a local resource guard.
+
+Two batches of five independent Release processes replayed copied basechain
+block `88028077` with four workers. Every run covered 138 ordinary transactions
+and 108 accounts, matched the serial transaction/account effects exactly, and
+reproduced the same two available descriptor roots.
+
+The first batch measured serial account samples of 165.072, 162.141, 174.648,
+152.299, and 186.052 ms and parallel samples of 46.663, 53.607, 56.450, 49.977,
+and 40.501 ms. The ratio of their separate medians was 3.30x. Full serial
+samples were 3.467, 3.419, 3.634, 3.391, and 3.251 s. Parallel-account plus
+serial-commit samples were 3.870, 3.293, 3.101, 3.428, and 3.380 s. Their paired
+speedup median was 0.989x.
+
+After lane planning and deterministic merge were included in the total, the
+second batch measured separate median account times of 157.330 ms serial and
+55.165 ms parallel, a 2.85x ratio. Median planning and merge costs were 0.362
+and 0.333 ms; the equivalence-only check took 0.163 ms and was excluded. Full
+serial samples ranged from 3.113 to 3.608 s and the prepared path from 2.900 to
+3.332 s. Its paired speedup median was 1.083x. The serial augmented-root stage
+had a 3.082 s median, compared with 3.246 s for the complete serial replay.
+
+Neither whole-path median establishes a speedup. The serial reference must run
+before the prepared path in every process, so the second root commit observes a
+different shared cache state. The JSON declares this order bias. Root-stage
+variation is larger than the saved account time, and the two batches straddle
+1.0. A stable whole-path benchmark requires alternating isolated commit samples
+or a live copied-state Collator harness.
+
+The reusable pool, canonical payload, coordinator, scheduler, and atomic root
+helpers have checked-in unit tests, but the new orchestration path currently
+depends on the external copied-mainnet corpus for its positive integration
+test. A compact checked-in BOC/proof fixture or extraction of artifact ordering
+into a separately testable module remains a regression-coverage gate before
+live Collator integration.
+
+The corpus lacks the target candidate's collated-data predecessor witness, so
+the gate validates `InMsgDescr` and `OutMsgDescr`, not the complete
+`ShardAccounts` and `OutMsgQueue` transition. Trying to use the target block's
+old Merkle-update view as that witness fails on pruned augmentation branches;
+the utility retains the fail-closed collated-data requirement instead of
+claiming four roots from hash-only data.
+
+This measurement changes the implementation order. Parallel TVM execution is a
+real but currently hidden gain. The next gate is prefix-safe parallel
+construction of disjoint `ShardAccounts` subtrees and deterministic root merge,
+with queue/descriptor mutations still ordered by the causal coordinator. Only
+after exact four-root and `ValidateQuery` equivalence can the project measure a
+sustainable single-shard throughput change. Trace compilation remains a later
+multiplicative optimization rather than the current critical path.
+
 ## Dead ends and cautions
 
 - Search results did not expose a public TON trace JIT or public intra-block

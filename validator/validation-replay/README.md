@@ -240,6 +240,49 @@ samples were 49.9-62.2 ms, and the median paired speedup was 3.24x. The median
 isolated rates were 760 raw tx/s serial and 2,440 raw tx/s parallel. Pool startup
 was 0.391 ms and is not included in either rate.
 
+`--offline-collator-workers N` extends that probe through the currently
+available serial commit boundary. Workers replay immutable whole-account
+chains and return canonical transaction effects, coordinator inputs, and
+account dictionary deltas. The caller normalizes them by canonical keys,
+rejects duplicate transaction, message, or account keys, requires the merged
+artifact set to equal a serial replay, and only then applies block limits, the
+shadow coordinator, and the available augmented-dictionary root gates. Any
+worker, merge, limit, coordinator, or root failure discards the entire offline
+batch before global publication. A block containing any special transaction
+kind makes the current probe fail closed; separating tick/tock or other special
+work into a serial coordinator lane is not implemented here.
+
+The worker limit of 64 is a local process-safety bound, not a TON protocol
+limit. Pool startup, serial-reference artifact export, and the serial-versus-
+parallel equivalence check are reported separately and excluded. Lane planning,
+worker artifact export, deterministic merge, and the prepared-artifact handoff
+remain in the measured path. The probe is opt-in, offline-only, and requires a
+complete account-proof replay. It does not mutate a Collator, submit a
+candidate, or participate in consensus.
+
+Two batches of five independent Release processes on copied block `88028077`
+used four workers and passed exact merged-artifact and final replay-result
+checks for all 138 ordinary transactions across 108 accounts. The first batch
+measured separate median account times of 165.1 ms serial and 50.0 ms parallel,
+a 3.30x ratio, but its paired whole-path median was 0.989x. After lane planning
+and merge were added to the reported total, the second batch measured 157.3 ms
+serial and 55.2 ms parallel, a 2.85x ratio. Median planning and merge costs were
+0.362 and 0.333 ms. Its paired whole-path median was 1.083x.
+
+These whole-path medians do not establish a speedup. Every invocation must
+first obtain the serial reference artifacts and only then runs the parallel
+path in the same process; the JSON declares this cache/order bias. The two
+batches straddle 1.0 because augmented-root time varies by more than the saved
+account time. In the second batch the serial augmented-root stage alone had a
+3.082 s median, versus 3.246 s for the complete serial replay. Only the two
+descriptor roots were available because the copied corpus has no matching
+candidate collated-data witness; all four roots remain a required later gate.
+
+This result invalidates any claim that account TVM parallelism alone already
+raises sustainable shard TPS. It instead selects prefix-safe parallel
+state-dictionary construction and deterministic root merge as the next
+executor gate. `mainnet_sustainable_raw_tps` remains `null`.
+
 The output also contains `single_shard_capacity`. It reads Config 23/29/30 from
 the state-bound masterchain proof and reports the exact archive block-file size.
 For the copied basechain block `87341675`, Config 29 at masterchain seqno
@@ -308,7 +351,8 @@ tvm-replay-bundle \
   --account-proof <account>=account.tl \
   --library-bodies libraries.tl \
   --account-workers 4 \
-  --account-samples 5
+  --account-samples 5 \
+  --offline-collator-workers 4
 ```
 
 The target block can be replayed without a complete archive package by using
@@ -322,7 +366,8 @@ tvm-replay-bundle \
   --account-proof <account>=account.tl \
   --library-bodies libraries.tl \
   --account-workers 4 \
-  --account-samples 5
+  --account-samples 5 \
+  --offline-collator-workers 4
 ```
 
 `saveblock` requires a full `BlockIdExt`, verifies the server's returned id,
