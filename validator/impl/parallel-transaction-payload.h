@@ -5,6 +5,7 @@
 #include <optional>
 #include <vector>
 
+#include "block/block.h"
 #include "td/utils/Status.h"
 #include "vm/cells/Cell.h"
 
@@ -36,11 +37,17 @@ struct CanonicalTransactionEffects {
   Hash256 pre_account_state_hash{};
   Hash256 transaction_hash{};
   Hash256 post_account_state_hash{};
+  Hash256 total_fees_hash{};
   Hash256 effects_hash{};
   Hash256 proof_journal_hash{};
   std::uint64_t transaction_start_lt{0};
   std::uint64_t transaction_end_lt{0};
   std::uint64_t gas_used{0};
+  std::uint8_t original_account_status{0};
+  std::uint8_t end_account_status{0};
+  block::CurrencyCollection total_fees;
+  td::Ref<vm::Cell> transaction_root;
+  td::Ref<vm::Cell> post_account_state;
   std::vector<OutboundMessageEffect> outbound_messages;
 };
 
@@ -51,6 +58,7 @@ enum class PayloadError {
   mutable_payload_cell,
   malformed_transaction,
   malformed_state_update,
+  malformed_total_fees,
   invalid_post_account_state,
   post_state_hash_mismatch,
   malformed_description,
@@ -122,7 +130,40 @@ PrecommitValidationResult validate_precommit_set(
     const std::vector<std::optional<CanonicalTransactionPayload>>& payloads,
     const std::map<Hash256, AccountCheckpoint>& initial_checkpoints);
 
+// Basechain Transaction::update_limits() can be reproduced from validated
+// canonical effects. Masterchain public-library accounting, account-dictionary
+// proofs and queue/descriptor effects are separate coordinator operations.
+enum class BasechainLimitError {
+  none,
+  size_mismatch,
+  missing_transaction,
+  missing_post_account_state,
+};
+
+struct BasechainLimitApplyResult {
+  BasechainLimitError error{BasechainLimitError::none};
+  std::size_t applied_transactions{0};
+
+  explicit operator bool() const {
+    return error == BasechainLimitError::none;
+  }
+};
+
+struct BasechainLimitContext {
+  bool account_is_first{false};
+  bool charge_gas{true};
+};
+
+// Applies a validated prefix to a shadow copy and publishes it atomically.
+// Context flags must be derived by the coordinator from the account chain and
+// message phase, never accepted from a worker. The target is unchanged on
+// validation failure.
+BasechainLimitApplyResult apply_basechain_block_limits_atomic(block::BlockLimitStatus& target,
+                                                              const std::vector<CanonicalTransactionEffects>& effects,
+                                                              const std::vector<BasechainLimitContext>& contexts);
+
 const char* to_string(PayloadError error);
 const char* to_string(PrecommitError error);
+const char* to_string(BasechainLimitError error);
 
 }  // namespace ton::validator::parallel_inbound

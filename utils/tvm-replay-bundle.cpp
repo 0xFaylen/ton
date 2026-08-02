@@ -52,6 +52,7 @@
 #include "validator/impl/parallel-transaction-payload.h"
 #include "validator/interfaces/tvm-hotpath-stats.h"
 #include "vm/boc.h"
+#include "vm/cells/CellUsageTree.h"
 #include "vm/cells/DataCell.h"
 #include "vm/cells/MerkleProof.h"
 #include "vm/db/StaticBagOfCellsDb.h"
@@ -133,6 +134,11 @@ struct ReplayResult {
   std::size_t tvm_transactions = 0;
   std::size_t canonical_payloads_validated = 0;
   std::size_t canonical_payload_out_messages = 0;
+  std::size_t canonical_fee_augmentations_validated = 0;
+  std::size_t basechain_limit_effects_applied = 0;
+  std::size_t basechain_limit_accounts = 0;
+  td::uint64 basechain_limit_gas = 0;
+  ton::LogicalTime basechain_limit_max_end_lt = 0;
   TvmHotpathStats hotpaths;
   std::map<StdSmcAddress, AccountWork> account_work;
 
@@ -650,6 +656,8 @@ td::Result<ReplayResult> replay_transactions(const BlockContext& target, const L
                                          block::tlb::aug_ShardAccountBlocks};
 
   ReplayResult result;
+  std::vector<ton::validator::parallel_inbound::CanonicalTransactionEffects> canonical_limit_effects;
+  std::vector<ton::validator::parallel_inbound::BasechainLimitContext> canonical_limit_contexts;
   td::Status replay_status = td::Status::OK();
   std::set<td::Bits256> missing_libraries;
   bool accounts_ok = account_blocks.check_for_each_extra([&](Ref<vm::CellSlice> account_block_slice, Ref<vm::CellSlice>,
@@ -719,6 +727,14 @@ td::Result<ReplayResult> replay_transactions(const BlockContext& target, const L
 
     vm::AugmentedDictionary transactions{vm::DictNonEmpty(), std::move(account_block.transactions), 64,
                                          block::tlb::aug_AccountTransactions};
+    block::CurrencyCollection declared_account_fees;
+    if (!declared_account_fees.validate_unpack(transactions.get_root_extra())) {
+      replay_status =
+          td::Status::Error(PSTRING() << "cannot unpack transaction fee augmentation for " << address.to_hex());
+      return false;
+    }
+    block::CurrencyCollection derived_account_fees{0};
+    bool first_account_transaction = true;
     bool account_missing_libraries = false;
     bool transactions_ok = transactions.check_for_each_extra(
         [&](Ref<vm::CellSlice> transaction_slice, Ref<vm::CellSlice>, td::ConstBitPtr tx_key, int tx_key_len) {
@@ -763,10 +779,10 @@ td::Result<ReplayResult> replay_transactions(const BlockContext& target, const L
                                                         .proof_journals = {}};
           auto payload_result = inspect_transaction_payload(canonical_payload);
           if (!payload_result) {
-            replay_status = td::Status::Error(
-                PSTRING() << "canonical PSAE payload validation failed for transaction " << tx_key.get_uint(64)
-                          << " of " << address.to_hex() << ": "
-                          << ton::validator::parallel_inbound::to_string(payload_result.error));
+            replay_status =
+                td::Status::Error(PSTRING() << "canonical PSAE payload validation failed for transaction "
+                                            << tx_key.get_uint(64) << " of " << address.to_hex() << ": "
+                                            << ton::validator::parallel_inbound::to_string(payload_result.error));
             return false;
           }
           const auto& payload_effects = payload_result.effects.value();
@@ -776,13 +792,22 @@ td::Result<ReplayResult> replay_transactions(const BlockContext& target, const L
               payload_effects.post_account_state_hash !=
                   as_hash256(emulated.account.total_state->get_hash().as_bits256()) ||
               payload_effects.gas_used != emulated.vm.billed_gas_used) {
-            replay_status = td::Status::Error(
-                PSTRING() << "canonical PSAE payload fields disagree with replay for transaction "
-                          << tx_key.get_uint(64) << " of " << address.to_hex());
+            replay_status =
+                td::Status::Error(PSTRING() << "canonical PSAE payload fields disagree with replay for transaction "
+                                            << tx_key.get_uint(64) << " of " << address.to_hex());
             return false;
           }
           ++result.canonical_payloads_validated;
           result.canonical_payload_out_messages += payload_effects.outbound_messages.size();
+          derived_account_fees += payload_effects.total_fees;
+          if (!derived_account_fees.is_valid()) {
+            replay_status =
+                td::Status::Error(PSTRING() << "canonical fee accumulation failed for " << address.to_hex());
+            return false;
+          }
+          canonical_limit_effects.push_back(payload_effects);
+          canonical_limit_contexts.push_back({.account_is_first = first_account_transaction, .charge_gas = true});
+          first_account_transaction = false;
           ++result.transactions;
           auto& account_work = result.account_work[address];
           ++account_work.transactions;
@@ -803,6 +828,14 @@ td::Result<ReplayResult> replay_transactions(const BlockContext& target, const L
     if (!transactions_ok && replay_status.is_ok()) {
       replay_status = td::Status::Error(PSTRING() << "invalid transaction dictionary for " << address.to_hex());
     }
+    if (transactions_ok && !(derived_account_fees == declared_account_fees)) {
+      replay_status = td::Status::Error(PSTRING() << "canonical transaction fees disagree with AccountBlock "
+                                                  << "augmentation for " << address.to_hex());
+      return false;
+    }
+    if (transactions_ok) {
+      ++result.canonical_fee_augmentations_validated;
+    }
     return transactions_ok;
   });
 
@@ -814,6 +847,23 @@ td::Result<ReplayResult> replay_transactions(const BlockContext& target, const L
     return td::Status::Error(PSTRING() << "replay requires public library bodies absent from --library-bodies: "
                                        << join_library_hashes(missing_libraries));
   }
+  block::BlockLimits shadow_limits;
+  auto synthetic_usage_tree = std::make_shared<vm::CellUsageTree>();
+  shadow_limits.usage_tree = synthetic_usage_tree.get();
+  block::BlockLimitStatus shadow_limit_status{shadow_limits};
+  auto limit_result = ton::validator::parallel_inbound::apply_basechain_block_limits_atomic(
+      shadow_limit_status, canonical_limit_effects, canonical_limit_contexts);
+  if (!limit_result) {
+    return td::Status::Error(PSTRING() << "canonical basechain block-limit effect application failed: "
+                                       << ton::validator::parallel_inbound::to_string(limit_result.error));
+  }
+  if (shadow_limit_status.transactions != result.transactions || shadow_limit_status.accounts != result.accounts) {
+    return td::Status::Error("canonical basechain block-limit counters disagree with replay scope");
+  }
+  result.basechain_limit_effects_applied = limit_result.applied_transactions;
+  result.basechain_limit_accounts = shadow_limit_status.accounts;
+  result.basechain_limit_gas = shadow_limit_status.gas_used;
+  result.basechain_limit_max_end_lt = shadow_limit_status.cur_lt;
   return result;
 }
 
@@ -940,9 +990,15 @@ std::string replay_json(const BlockContext& target, const LoadedState* account_s
       << ",\"equivalence\":\"transaction_hash_and_account_state_hash\""
       << ",\"psae_payload_validation\":{\"canonical_payloads\":" << replay.canonical_payloads_validated
       << ",\"ordered_out_messages\":" << replay.canonical_payload_out_messages
+      << ",\"fee_augmentations\":" << replay.canonical_fee_augmentations_validated
+      << ",\"basechain_limit_effects\":" << replay.basechain_limit_effects_applied
+      << ",\"basechain_limit_accounts\":" << replay.basechain_limit_accounts
+      << ",\"basechain_limit_gas\":" << replay.basechain_limit_gas
+      << ",\"basechain_limit_gas_status\":\"billed_gas_sum_special_context_not_reconstructed\""
+      << ",\"basechain_limit_max_end_lt\":" << replay.basechain_limit_max_end_lt
+      << ",\"block_size_status\":\"not_claimed_without_collator_usage_tree\""
       << ",\"proof_journals\":\"empty_in_transaction_replay\",\"global_effects\":\"not_applied\"}"
-      << ",\"hotpaths_wall\":"
-      << replay.hotpaths.to_json(false, 0, replay.hotpaths.size());
+      << ",\"hotpaths_wall\":" << replay.hotpaths.to_json(false, 0, replay.hotpaths.size());
 #if TD_WINDOWS
   out << ",\"hotpaths_cpu\":null,\"cpu_metric_status\":\"unsupported_windows_timer_resolution\"";
 #else

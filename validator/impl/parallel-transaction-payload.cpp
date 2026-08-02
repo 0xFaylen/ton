@@ -46,6 +46,18 @@ Hash256 extract_hash(td::Sha256State& state) {
   return to_hash256(result);
 }
 
+td::Result<Hash256> currency_collection_hash(const block::CurrencyCollection& value) {
+  vm::CellBuilder builder;
+  if (!value.store(builder)) {
+    return td::Status::Error("cannot serialize CurrencyCollection");
+  }
+  auto cell = builder.finalize_novm();
+  if (cell.is_null()) {
+    return td::Status::Error("cannot materialize CurrencyCollection cell");
+  }
+  return to_hash256(cell->get_hash().as_bits256());
+}
+
 td::Result<std::uint64_t> extract_gas_used(const td::Ref<vm::Cell>& description) {
   td::Ref<vm::CellSlice> compute_phase;
   const auto tag = block::gen::t_TransactionDescr.get_tag(vm::load_cell_slice(description));
@@ -145,7 +157,7 @@ td::Result<Hash256> proof_journal_set_commitment(const std::vector<CellUsageJour
 }
 
 Hash256 effects_commitment(const CanonicalTransactionEffects& effects) {
-  static constexpr char domain[] = "TON-PSAE-CANONICAL-TRANSACTION-EFFECTS-V1";
+  static constexpr char domain[] = "TON-PSAE-CANONICAL-TRANSACTION-EFFECTS-V2";
   td::Sha256State state;
   state.init();
   state.feed(td::Slice{domain, sizeof(domain) - 1});
@@ -153,9 +165,12 @@ Hash256 effects_commitment(const CanonicalTransactionEffects& effects) {
   feed_hash(state, effects.pre_account_state_hash);
   feed_hash(state, effects.transaction_hash);
   feed_hash(state, effects.post_account_state_hash);
+  feed_hash(state, effects.total_fees_hash);
   feed_u64(state, effects.transaction_start_lt);
   feed_u64(state, effects.transaction_end_lt);
   feed_u64(state, effects.gas_used);
+  feed_u64(state, effects.original_account_status);
+  feed_u64(state, effects.end_account_status);
   feed_u64(state, effects.outbound_messages.size());
   for (const auto& message : effects.outbound_messages) {
     feed_u64(state, message.logical_time);
@@ -189,6 +204,14 @@ PayloadValidationResult inspect_transaction_payload(const CanonicalTransactionPa
   if (!tlb::type_unpack_cell(transaction.state_update, block::gen::t_HASH_UPDATE_Account, state_update)) {
     return error(PayloadError::malformed_state_update);
   }
+  block::CurrencyCollection total_fees;
+  if (!total_fees.validate_unpack(transaction.total_fees)) {
+    return error(PayloadError::malformed_total_fees);
+  }
+  auto total_fees_hash = currency_collection_hash(total_fees);
+  if (total_fees_hash.is_error()) {
+    return error(PayloadError::malformed_total_fees);
+  }
   if (!block::gen::t_Account.validate_ref(payload.post_account_state)) {
     return error(PayloadError::invalid_post_account_state);
   }
@@ -206,6 +229,7 @@ PayloadValidationResult inspect_transaction_payload(const CanonicalTransactionPa
   effects.pre_account_state_hash = to_hash256(state_update.old_hash);
   effects.transaction_hash = to_hash256(payload.transaction_root->get_hash().as_bits256());
   effects.post_account_state_hash = to_hash256(state_update.new_hash);
+  effects.total_fees_hash = total_fees_hash.move_as_ok();
   effects.transaction_start_lt = transaction.lt;
   if (transaction.outmsg_cnt < 0 || transaction.lt > std::numeric_limits<std::uint64_t>::max() -
                                                          static_cast<std::uint64_t>(transaction.outmsg_cnt) - 1) {
@@ -213,6 +237,11 @@ PayloadValidationResult inspect_transaction_payload(const CanonicalTransactionPa
   }
   effects.transaction_end_lt = transaction.lt + static_cast<std::uint64_t>(transaction.outmsg_cnt) + 1;
   effects.gas_used = gas_result.move_as_ok();
+  effects.original_account_status = static_cast<std::uint8_t>(transaction.orig_status);
+  effects.end_account_status = static_cast<std::uint8_t>(transaction.end_status);
+  effects.total_fees = std::move(total_fees);
+  effects.transaction_root = payload.transaction_root;
+  effects.post_account_state = payload.post_account_state;
 
   try {
     vm::Dictionary out_messages{transaction.r1.out_msgs, 15};
@@ -354,6 +383,43 @@ PrecommitValidationResult validate_precommit_set(
   return result;
 }
 
+BasechainLimitApplyResult apply_basechain_block_limits_atomic(block::BlockLimitStatus& target,
+                                                              const std::vector<CanonicalTransactionEffects>& effects,
+                                                              const std::vector<BasechainLimitContext>& contexts) {
+  if (effects.size() != contexts.size()) {
+    return {.error = BasechainLimitError::size_mismatch};
+  }
+  for (const auto& transaction : effects) {
+    if (transaction.transaction_root.is_null()) {
+      return {.error = BasechainLimitError::missing_transaction};
+    }
+    if (transaction.post_account_state.is_null()) {
+      return {.error = BasechainLimitError::missing_post_account_state};
+    }
+  }
+
+  auto shadow = target;
+  for (std::size_t i = 0; i < effects.size(); ++i) {
+    const auto& transaction = effects[i];
+    shadow.update_lt(transaction.transaction_end_lt);
+    shadow.update_gas(contexts[i].charge_gas ? transaction.gas_used : 0);
+    shadow.add_proof(transaction.post_account_state);
+    shadow.add_cell(transaction.transaction_root);
+    shadow.add_transaction();
+    shadow.add_account(contexts[i].account_is_first);
+  }
+
+  target.cur_lt = shadow.cur_lt;
+  target.gas_used = shadow.gas_used;
+  target.st_stat = std::move(shadow.st_stat);
+  target.accounts = shadow.accounts;
+  target.transactions = shadow.transactions;
+  target.extra_out_msgs = shadow.extra_out_msgs;
+  target.collated_data_size_estimate = shadow.collated_data_size_estimate;
+  target.public_library_diff = shadow.public_library_diff;
+  return {.applied_transactions = effects.size()};
+}
+
 const char* to_string(PayloadError error) {
   switch (error) {
     case PayloadError::none:
@@ -368,6 +434,8 @@ const char* to_string(PayloadError error) {
       return "malformed_transaction";
     case PayloadError::malformed_state_update:
       return "malformed_state_update";
+    case PayloadError::malformed_total_fees:
+      return "malformed_total_fees";
     case PayloadError::invalid_post_account_state:
       return "invalid_post_account_state";
     case PayloadError::post_state_hash_mismatch:
@@ -418,6 +486,20 @@ const char* to_string(PrecommitError error) {
       return "payload_invalid";
     case PrecommitError::receipt_invalid:
       return "receipt_invalid";
+  }
+  return "unknown";
+}
+
+const char* to_string(BasechainLimitError error) {
+  switch (error) {
+    case BasechainLimitError::none:
+      return "none";
+    case BasechainLimitError::size_mismatch:
+      return "size_mismatch";
+    case BasechainLimitError::missing_transaction:
+      return "missing_transaction";
+    case BasechainLimitError::missing_post_account_state:
+      return "missing_post_account_state";
   }
   return "unknown";
 }

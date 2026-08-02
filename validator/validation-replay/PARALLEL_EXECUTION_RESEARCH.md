@@ -131,6 +131,19 @@ preserving exact transaction/account-state hashes. Journals were empty and
 global effects were not applied in that replay, so this is an ABI/equivalence
 gate rather than measured parallel execution.
 
+The next coordinator-delta subset is executable for basechain transactions.
+Canonical effects now commit total fees and account status transitions, and a
+fail-closed batch helper applies the same transaction-level LT, gas, proof/cell,
+transaction-count and first-account-count mutations as `Transaction::update_limits`
+to a shadow `BlockLimitStatus` before publishing it. Gas charging is a
+coordinator-supplied per-transaction phase flag; it is not worker-controlled.
+Offline replay additionally
+requires the sum of canonical transaction fees for each account to equal its
+existing `AccountBlock` augmentation. Masterchain public-library deltas,
+collator usage-tree proof size, account-dictionary proofs, message descriptors,
+queues, storage-dictionary updates, `ProcessedUpto`, value flow and state merge
+remain outside this gate.
+
 ## Dead ends and cautions
 
 - Search results did not expose a public TON trace JIT or public intra-block

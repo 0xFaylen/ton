@@ -114,11 +114,19 @@ resulting account-state hashes.
 
 Each replayed transaction is also passed through the in-process PSAE canonical
 payload validator. It reparses the Transaction and post-account cells, derives
-state/transaction hashes, gas and LT, validates the contiguous out-message
-dictionary, and reports counts under `psae_payload_validation`. This field is
-an ABI/equivalence check, not parallel execution: transaction replay supplies
-no proof journals and applies no global descriptor, limit, queue, or state-merge
-effects.
+state/transaction hashes, gas, LT, account statuses and total fees, validates
+the contiguous out-message dictionary, and reports counts under
+`psae_payload_validation`. Per-account canonical fees must equal the existing
+`AccountBlock` fee augmentation. The replay also applies the basechain subset
+of `Transaction::update_limits` to a shadow status: max LT, gas, transaction and
+first-account counters, plus the canonical Transaction/post-account cells.
+This field is an ABI/equivalence check, not parallel execution. Transaction
+replay supplies no proof journals or collator `CellUsageTree`, so it makes no
+block-size claim. It also does not reconstruct the special mint/recover routing
+context, so reported limit gas is the billed-gas sum rather than a claim about
+the historical block-limit counter. Descriptors, queues, `ProcessedUpto`,
+account dictionary proofs, storage-dictionary updates, and state merge are not
+applied.
 
 The replay JSON also contains `account_lane_ceiling`. It groups measured
 transaction and TVM wall time by account and reports greedy ideal makespans for

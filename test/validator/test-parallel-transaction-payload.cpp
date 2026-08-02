@@ -8,6 +8,7 @@
 #include "impl/parallel-transaction-payload.h"
 #include "td/utils/tests.h"
 #include "vm/cells/CellBuilder.h"
+#include "vm/cells/CellUsageTree.h"
 
 namespace ton::validator::parallel_inbound::test {
 namespace {
@@ -79,7 +80,8 @@ td::Ref<vm::Cell> skipped_ordinary_description() {
 }
 
 td::Ref<vm::Cell> make_transaction(std::uint64_t account, std::uint64_t pre_state,
-                                   const td::Bits256& declared_post_state, std::uint64_t lt) {
+                                   const td::Bits256& declared_post_state, std::uint64_t lt,
+                                   std::uint64_t total_fees = 0) {
   block::gen::HASH_UPDATE::Record update_record;
   update_record.old_hash = bits(pre_state);
   update_record.new_hash = declared_post_state;
@@ -97,7 +99,7 @@ td::Ref<vm::Cell> make_transaction(std::uint64_t account, std::uint64_t pre_stat
   transaction.end_status = block::gen::AccountStatus::acc_state_nonexist;
   transaction.r1.in_msg = none();
   transaction.r1.out_msgs = none();
-  block::CurrencyCollection{0}.pack_to(transaction.total_fees);
+  block::CurrencyCollection{static_cast<long long>(total_fees)}.pack_to(transaction.total_fees);
   transaction.state_update = std::move(state_update);
   transaction.description = skipped_ordinary_description();
 
@@ -126,9 +128,10 @@ td::Ref<vm::Cell> make_transaction(std::uint64_t account, std::uint64_t pre_stat
   return root;
 }
 
-CanonicalTransactionPayload payload(std::uint64_t account, std::uint64_t pre_state, std::uint64_t lt) {
+CanonicalTransactionPayload payload(std::uint64_t account, std::uint64_t pre_state, std::uint64_t lt,
+                                    std::uint64_t total_fees = 0) {
   auto post = account_none();
-  auto transaction = make_transaction(account, pre_state, post->get_hash().as_bits256(), lt);
+  auto transaction = make_transaction(account, pre_state, post->get_hash().as_bits256(), lt, total_fees);
   return {.transaction_root = std::move(transaction), .post_account_state = std::move(post), .proof_journals = {}};
 }
 
@@ -146,10 +149,104 @@ TEST(ParallelTransactionPayload, DerivesCanonicalReceiptFieldsFromCells) {
   ASSERT_EQ(inspected.effects->transaction_start_lt, 11u);
   ASSERT_EQ(inspected.effects->transaction_end_lt, 12u);
   ASSERT_EQ(inspected.effects->gas_used, 0u);
+  ASSERT_EQ(inspected.effects->original_account_status, block::gen::AccountStatus::acc_state_nonexist);
+  ASSERT_EQ(inspected.effects->end_account_status, block::gen::AccountStatus::acc_state_nonexist);
+  ASSERT_TRUE(inspected.effects->total_fees == block::CurrencyCollection{0});
+  ASSERT_EQ(inspected.effects->transaction_root->get_hash(), canonical.transaction_root->get_hash());
+  ASSERT_EQ(inspected.effects->post_account_state->get_hash(), canonical.post_account_state->get_hash());
   ASSERT_TRUE(inspected.effects->outbound_messages.empty());
 
   auto receipt = build_worker_receipt(input(1, 1), 0, canonical).move_as_ok();
   ASSERT_TRUE(validate_worker_payload(canonical, receipt));
+}
+
+TEST(ParallelTransactionPayload, CommitsCanonicalTotalFees) {
+  const auto zero_fees = inspect_transaction_payload(payload(10, 100, 11, 0));
+  const auto nonzero_fees = inspect_transaction_payload(payload(10, 100, 11, 123456));
+  ASSERT_TRUE(zero_fees);
+  ASSERT_TRUE(nonzero_fees);
+  ASSERT_TRUE(nonzero_fees.effects->total_fees == block::CurrencyCollection{123456});
+  ASSERT_TRUE(zero_fees.effects->total_fees_hash != nonzero_fees.effects->total_fees_hash);
+  ASSERT_TRUE(zero_fees.effects->effects_hash != nonzero_fees.effects->effects_hash);
+}
+
+TEST(ParallelTransactionPayload, AppliesBasechainBlockLimitEffectsAtomically) {
+  const auto first = inspect_transaction_payload(payload(10, 100, 11, 10));
+  const auto second = inspect_transaction_payload(payload(10, 200, 21, 20));
+  ASSERT_TRUE(first);
+  ASSERT_TRUE(second);
+
+  block::BlockLimits limits;
+  auto usage_tree = std::make_shared<vm::CellUsageTree>();
+  limits.usage_tree = usage_tree.get();
+  block::BlockLimitStatus actual{limits, 5};
+  block::BlockLimitStatus expected{limits, 5};
+  const std::vector<CanonicalTransactionEffects> effects{*first.effects, *second.effects};
+
+  expected.update_lt(first.effects->transaction_end_lt);
+  expected.update_gas(first.effects->gas_used);
+  expected.add_proof(first.effects->post_account_state);
+  expected.add_cell(first.effects->transaction_root);
+  expected.add_transaction();
+  expected.add_account(true);
+  expected.update_lt(second.effects->transaction_end_lt);
+  expected.update_gas(second.effects->gas_used);
+  expected.add_proof(second.effects->post_account_state);
+  expected.add_cell(second.effects->transaction_root);
+  expected.add_transaction();
+  expected.add_account(false);
+
+  const auto applied =
+      apply_basechain_block_limits_atomic(actual, effects, {{.account_is_first = true}, {.account_is_first = false}});
+  ASSERT_TRUE(applied);
+  ASSERT_EQ(applied.applied_transactions, 2u);
+  ASSERT_EQ(actual.cur_lt, expected.cur_lt);
+  ASSERT_EQ(actual.gas_used, expected.gas_used);
+  ASSERT_EQ(actual.accounts, expected.accounts);
+  ASSERT_EQ(actual.transactions, expected.transactions);
+  ASSERT_EQ(actual.st_stat.get_total_stat(), expected.st_stat.get_total_stat());
+  ASSERT_EQ(actual.estimate_block_size(), expected.estimate_block_size());
+
+  const auto before_lt = actual.cur_lt;
+  const auto before_gas = actual.gas_used;
+  const auto before_accounts = actual.accounts;
+  const auto before_transactions = actual.transactions;
+  const auto before_stat = actual.st_stat.get_total_stat();
+  const auto before_size = actual.estimate_block_size();
+  auto invalid = effects;
+  invalid[1].post_account_state.clear();
+  const auto rejected =
+      apply_basechain_block_limits_atomic(actual, invalid, {{.account_is_first = true}, {.account_is_first = false}});
+  ASSERT_EQ(rejected.error, BasechainLimitError::missing_post_account_state);
+  ASSERT_EQ(rejected.applied_transactions, 0u);
+  ASSERT_EQ(actual.cur_lt, before_lt);
+  ASSERT_EQ(actual.gas_used, before_gas);
+  ASSERT_EQ(actual.accounts, before_accounts);
+  ASSERT_EQ(actual.transactions, before_transactions);
+  ASSERT_EQ(actual.st_stat.get_total_stat(), before_stat);
+  ASSERT_EQ(actual.estimate_block_size(), before_size);
+
+  ASSERT_EQ(apply_basechain_block_limits_atomic(actual, effects, {{.account_is_first = true}}).error,
+            BasechainLimitError::size_mismatch);
+}
+
+TEST(ParallelTransactionPayload, AppliesPerTransactionGasPolicy) {
+  auto charged = inspect_transaction_payload(payload(10, 100, 11));
+  auto free = inspect_transaction_payload(payload(20, 200, 21));
+  ASSERT_TRUE(charged);
+  ASSERT_TRUE(free);
+  charged.effects->gas_used = 70;
+  free.effects->gas_used = 90;
+
+  block::BlockLimits limits;
+  auto usage_tree = std::make_shared<vm::CellUsageTree>();
+  limits.usage_tree = usage_tree.get();
+  block::BlockLimitStatus status{limits};
+  const auto applied = apply_basechain_block_limits_atomic(
+      status, {*charged.effects, *free.effects},
+      {{.account_is_first = true, .charge_gas = true}, {.account_is_first = true, .charge_gas = false}});
+  ASSERT_TRUE(applied);
+  ASSERT_EQ(status.gas_used, 70u);
 }
 
 TEST(ParallelTransactionPayload, RejectsEveryTamperedDerivedHeaderField) {
