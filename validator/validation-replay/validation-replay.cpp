@@ -18,6 +18,7 @@
 #include <map>
 
 #include "impl/parallel-inbound-scheduler.h"
+#include "td/utils/port/FileFd.h"
 #include "ton/ton-io.hpp"
 
 #include "block-auto.h"
@@ -33,6 +34,14 @@ namespace ton::validator {
 namespace {
 
 using AccountWorkMap = std::map<TvmHotpathStats::AccountId, double>;
+
+td::Status write_new_file(td::CSlice path, td::Slice data) {
+  TRY_RESULT(file, td::FileFd::open(path, td::FileFd::Write | td::FileFd::CreateNew, 0600));
+  TRY_STATUS(file.write_all(data));
+  TRY_STATUS(file.sync());
+  file.close();
+  return td::Status::OK();
+}
 
 std::string account_lane_scope_json(const char* scope, const AccountWorkMap& work_by_account,
                                     std::optional<double> full_collation_wall) {
@@ -234,6 +243,7 @@ class ValidationReplayerImpl : public ValidationReplayer {
       ReplayMode mode = ReplayMode::validate;
       bool log_work_time = false;
       bool exact_tvm_hotpaths = false;
+      std::optional<std::string> collated_data_output;
       std::vector<std::string> params;
       while (!eoln()) {
         std::string token = CO_TRY(next());
@@ -243,6 +253,14 @@ class ValidationReplayerImpl : public ValidationReplayer {
           log_work_time = true;
         } else if (token == "--exact-tvm-hotpaths") {
           exact_tvm_hotpaths = true;
+        } else if (token == "--export-collated-data") {
+          if (collated_data_output) {
+            co_return td::Status::Error("--export-collated-data may be specified only once");
+          }
+          collated_data_output = CO_TRY(next());
+          if (collated_data_output->empty()) {
+            co_return td::Status::Error("--export-collated-data path is empty");
+          }
         } else if (token[0] == '-') {
           co_return td::Status::Error(PSTRING() << "unknown flag " << token);
         } else {
@@ -252,11 +270,19 @@ class ValidationReplayerImpl : public ValidationReplayer {
       if (params.empty()) {
         co_return td::Status::Error("Expected at least one block id");
       }
+      if (collated_data_output && params.size() != 1) {
+        co_return td::Status::Error("--export-collated-data requires exactly one block id");
+      }
+      if (collated_data_output && mode == ReplayMode::validate) {
+        co_return td::Status::Error("--export-collated-data requires collate or both mode");
+      }
       std::vector<BlockId> block_ids;
       for (const std::string& s : params) {
         block_ids.push_back(CO_TRY(BlockId::from_str(s)));
       }
-      command_run(std::move(block_ids), mode, log_work_time, exact_tvm_hotpaths).start().detach_silent();
+      command_run(std::move(block_ids), mode, log_work_time, exact_tvm_hotpaths, std::move(collated_data_output))
+          .start()
+          .detach_silent();
       co_return "Started. `vrp show` to see results.";
     }
     if (tokens[0] == "run-range") {
@@ -334,6 +360,7 @@ class ValidationReplayerImpl : public ValidationReplayer {
            "\t--mode mode\tcollate/validate/both (default: validate)\n"
            "\t--log-work-time\tshow detailed work time stats\n"
            "\t--exact-tvm-hotpaths\tretain every executed code hash and exact per-hash account counts\n"
+           "\t--export-collated-data <path>\twrite one newly collated candidate artifact; refuses overwrite\n"
            "vrp run-range [--mode mode] <start> <end>\tprocess all blocks between mc seqnos <start> and <end>\n"
            "\t--mode mode\tcollate/validate/both (default: validate)\n"
            "\t--log-work-time\tshow detailed work time stats\n"
@@ -420,7 +447,7 @@ class ValidationReplayerImpl : public ValidationReplayer {
   }
 
   td::actor::Task<> command_run(std::vector<BlockId> block_ids, ReplayMode mode, bool log_work_time,
-                                bool exact_tvm_hotpaths) {
+                                bool exact_tvm_hotpaths, std::optional<std::string> collated_data_output) {
     std::string description;
     CHECK(!block_ids.empty());
     if (block_ids.size() == 1) {
@@ -431,8 +458,13 @@ class ValidationReplayerImpl : public ValidationReplayer {
     if (exact_tvm_hotpaths) {
       description += ", tvm_hotpaths=exact";
     }
+    if (collated_data_output) {
+      description += ", collated_data_export=enabled";
+    }
     co_await run_start(description);
-    auto result = co_await command_run_inner(std::move(block_ids), mode, log_work_time, exact_tvm_hotpaths).wrap();
+    auto result = co_await command_run_inner(std::move(block_ids), mode, log_work_time, exact_tvm_hotpaths,
+                                             std::move(collated_data_output))
+                      .wrap();
     if (result.is_error()) {
       LOG(ERROR) << "ERROR run #" << current_run_.idx << ": " << result.error();
       current_run_.status = PSTRING() << "ERROR: " << result.error().to_string()
@@ -443,7 +475,7 @@ class ValidationReplayerImpl : public ValidationReplayer {
   }
 
   td::actor::Task<> command_run_inner(std::vector<BlockId> block_ids, ReplayMode mode, bool log_work_time,
-                                      bool exact_tvm_hotpaths) {
+                                      bool exact_tvm_hotpaths, std::optional<std::string> collated_data_output) {
     auto cancellation_token = cancellation_.get_cancellation_token();
     ProcessBlockResult total;
     size_t processed_ok = 0;
@@ -451,7 +483,7 @@ class ValidationReplayerImpl : public ValidationReplayer {
       BlockId block_id = block_ids[i];
       auto handle = co_await get_block_by_id(manager_, block_id);
       current_run_.status = "Processing block " + block_id.to_str();
-      auto R = co_await process_block(handle, mode, exact_tvm_hotpaths).wrap();
+      auto R = co_await process_block(handle, mode, exact_tvm_hotpaths, collated_data_output).wrap();
       if (R.is_ok()) {
         total += R.ok();
         ++processed_ok;
@@ -546,7 +578,7 @@ class ValidationReplayerImpl : public ValidationReplayer {
     auto process_block_outer = [](ValidationReplayerImpl* self, size_t run_idx, std::shared_ptr<State> state,
                                   ReplayMode mode, bool exact_tvm_hotpaths,
                                   ConstBlockHandle handle) -> td::actor::Task<> {
-      auto R = co_await self->process_block(handle, mode, exact_tvm_hotpaths).wrap();
+      auto R = co_await self->process_block(handle, mode, exact_tvm_hotpaths, std::nullopt).wrap();
       ++state->processed_total;
       if (R.is_ok()) {
         ++state->processed_ok;
@@ -698,7 +730,8 @@ class ValidationReplayerImpl : public ValidationReplayer {
       return sb.as_cslice().str();
     }
   };
-  td::actor::Task<ProcessBlockResult> process_block(ConstBlockHandle handle, ReplayMode mode, bool exact_tvm_hotpaths) {
+  td::actor::Task<ProcessBlockResult> process_block(ConstBlockHandle handle, ReplayMode mode, bool exact_tvm_hotpaths,
+                                                    const std::optional<std::string>& collated_data_output) {
     Ref<BlockData> block = co_await td::actor::ask(manager_, &ValidatorManager::get_block_data_from_db, handle);
     ProcessBlockResult result;
     result.block_size = (double)block->data().size();
@@ -755,6 +788,9 @@ class ValidationReplayerImpl : public ValidationReplayer {
           .time = timer.elapsed(),
           .work_time = stats.work_time,
       };
+      if (collated_data_output) {
+        CO_TRY(write_new_file(*collated_data_output, candidate.collated_data.as_slice()));
+      }
     } else {
       block::gen::ConsensusExtraData::Record rec;
       rec.flags = 0;

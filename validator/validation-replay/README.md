@@ -61,6 +61,18 @@ it is not a measured parallel speedup. Bounded online mode retains no
 per-account timing map. Do not run this profiling mode on a validator
 participating in consensus or on a latency-sensitive production node.
 
+A single offline collation can export the exact candidate collated-data BOC:
+
+```text
+vrp run --mode collate --export-collated-data <new-path> '(0,8000000000000000,SEQNO)'
+```
+
+Export is unavailable for ranges and validate-only runs. The destination is
+created with owner-only permissions and must not already exist. This only
+persists the newly replayed candidate artifact; it does not change the database,
+consensus state, or network configuration. Use it on a dedicated copied
+validator database, then pass the file to `tvm-replay-bundle --collated-data`.
+
 Collection work is timed separately as `trx_tvm_profile`; it is not included in
 the per-code `time_tvm` values. Exact maps can make the replay itself slower,
 but do not inflate the measured TVM execution time.

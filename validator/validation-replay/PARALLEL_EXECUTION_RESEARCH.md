@@ -193,6 +193,13 @@ historical candidate collated data, so the current mainnet-derived result
 correctly remains at two roots. A target state, block BOC, or fabricated queue
 baseline would make the check circular and is rejected as a substitute.
 
+`ValidationReplayer` can now export one newly replayed candidate's collated-data
+BOC from a single offline collate run. The export uses create-new semantics and
+is disabled for ranges and validate-only mode. This provides the positive
+four-root fixture path without retaining candidate bytes in the bounded run
+history or changing consensus behavior. It still requires a dedicated copied
+validator database; the latency-sensitive production node remains out of scope.
+
 The descriptor baseline is `target minus validated deltas`; it is an exact
 delta round-trip through the real augmented dictionaries, not proof of the
 historical predecessor-to-target transition. Replay output encodes this as
