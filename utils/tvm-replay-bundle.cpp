@@ -243,6 +243,14 @@ struct ParallelAccountReplayProbe {
 
 td::Result<BlockContext> unpack_block_context(LoadedBlock block_data);
 
+struct BlockWorkloadSummary {
+  std::size_t distinct_accounts{0};
+  std::size_t raw_transactions{0};
+  std::size_t max_account_transactions{0};
+};
+
+td::Result<BlockWorkloadSummary> summarize_account_blocks(const BlockContext& block_context);
+
 td::Result<LoadedBlock> load_block_from_archive(const std::string& archive, const BlockId& requested_id) {
   TRY_RESULT(package, ton::Package::open(archive, true, false));
   LoadedBlock found;
@@ -301,6 +309,7 @@ td::Result<std::string> list_archive_blocks(const std::string& archive) {
     std::size_t file_bytes;
     BlockIdExt masterchain_ref;
     td::uint32 gen_utime;
+    BlockWorkloadSummary workload;
   };
   std::vector<Summary> blocks;
   td::Status scan_status = td::Status::OK();
@@ -333,7 +342,13 @@ td::Result<std::string> list_archive_blocks(const std::string& archive) {
             return;
           }
           auto loaded = context.move_as_ok();
-          blocks.push_back(Summary{loaded.id, loaded.file_bytes, loaded.mc_id, loaded.gen_utime});
+          auto workload = summarize_account_blocks(loaded);
+          if (workload.is_error()) {
+            scan_status = workload.move_as_error_prefix("cannot summarize archive block: ");
+            return;
+          }
+          blocks.push_back(
+              Summary{loaded.id, loaded.file_bytes, loaded.mc_id, loaded.gen_utime, workload.move_as_ok()});
         },
         [&](const auto&) {}));
     return scan_status.is_ok();
@@ -343,15 +358,112 @@ td::Result<std::string> list_archive_blocks(const std::string& archive) {
   std::sort(blocks.begin(), blocks.end(), [](const auto& left, const auto& right) {
     return left.id.id < right.id.id;
   });
+  std::size_t nonempty_blocks = 0;
+  std::size_t total_file_bytes = 0;
+  std::size_t total_raw_transactions = 0;
+  for (const auto& block : blocks) {
+    nonempty_blocks += block.workload.raw_transactions != 0;
+    total_file_bytes += block.file_bytes;
+    total_raw_transactions += block.workload.raw_transactions;
+  }
+  struct SizeFit {
+    std::size_t samples{0};
+    double fixed_bytes{0};
+    double marginal_bytes_per_raw_transaction{0};
+    double r_squared{0};
+    bool valid{false};
+  };
+  const auto fit_serialized_size = [&](std::size_t minimum_transactions) {
+    double sum_x = 0;
+    double sum_y = 0;
+    double sum_xx = 0;
+    double sum_xy = 0;
+    SizeFit fit;
+    for (const auto& block : blocks) {
+      if (block.workload.raw_transactions < minimum_transactions) {
+        continue;
+      }
+      const double x = static_cast<double>(block.workload.raw_transactions);
+      const double y = static_cast<double>(block.file_bytes);
+      ++fit.samples;
+      sum_x += x;
+      sum_y += y;
+      sum_xx += x * x;
+      sum_xy += x * y;
+    }
+    const double sample_count = static_cast<double>(fit.samples);
+    const double denominator = sample_count * sum_xx - sum_x * sum_x;
+    if (fit.samples < 2 || denominator == 0) {
+      return fit;
+    }
+    fit.marginal_bytes_per_raw_transaction = (sample_count * sum_xy - sum_x * sum_y) / denominator;
+    fit.fixed_bytes = (sum_y - fit.marginal_bytes_per_raw_transaction * sum_x) / sample_count;
+    const double mean_y = sum_y / sample_count;
+    double total_square = 0;
+    double residual_square = 0;
+    for (const auto& block : blocks) {
+      if (block.workload.raw_transactions < minimum_transactions) {
+        continue;
+      }
+      const double x = static_cast<double>(block.workload.raw_transactions);
+      const double y = static_cast<double>(block.file_bytes);
+      const double predicted = fit.fixed_bytes + fit.marginal_bytes_per_raw_transaction * x;
+      total_square += (y - mean_y) * (y - mean_y);
+      residual_square += (y - predicted) * (y - predicted);
+    }
+    if (total_square == 0) {
+      return fit;
+    }
+    fit.r_squared = 1 - residual_square / total_square;
+    fit.valid = true;
+    return fit;
+  };
+  const auto write_fit = [](td::StringBuilder& builder, const SizeFit& fit) {
+    if (!fit.valid) {
+      builder << "null";
+      return;
+    }
+    builder << "{\"samples\":" << fit.samples << ",\"fixed_bytes\":" << fit.fixed_bytes
+            << ",\"marginal_bytes_per_raw_transaction\":" << fit.marginal_bytes_per_raw_transaction
+            << ",\"r_squared\":" << fit.r_squared << "}";
+  };
+  const auto all_blocks_fit = fit_serialized_size(0);
+  const auto nonempty_blocks_fit = fit_serialized_size(1);
+  const auto forty_transaction_blocks_fit = fit_serialized_size(40);
   td::StringBuilder out;
-  out << "{\"mode\":\"archive_block_list\",\"blocks\":[";
+  out << "{\"schema_version\":1,\"mode\":\"archive_block_list\",\"block_count\":" << blocks.size()
+      << ",\"nonempty_block_count\":" << nonempty_blocks << ",\"total_file_bytes\":" << total_file_bytes
+      << ",\"total_raw_transactions\":" << total_raw_transactions << ",\"aggregate_bytes_per_raw_transaction\":";
+  if (total_raw_transactions == 0) {
+    out << "null";
+  } else {
+    out << static_cast<double>(total_file_bytes) / static_cast<double>(total_raw_transactions);
+  }
+  out << ",\"diagnostic_serialized_size_ols\":{\"measurement_domain\":\"serialized_block_boc\""
+         ",\"capacity_measurement\":false,\"all_blocks\":";
+  write_fit(out, all_blocks_fit);
+  out << ",\"nonempty_blocks\":";
+  write_fit(out, nonempty_blocks_fit);
+  out << ",\"blocks_with_at_least_40_transactions\":";
+  write_fit(out, forty_transaction_blocks_fit);
+  out << "}";
+  out << ",\"blocks\":[";
   for (std::size_t i = 0; i < blocks.size(); ++i) {
     if (i != 0) {
       out << ",";
     }
     out << "{\"block_id\":\"" << blocks[i].id.to_str() << "\",\"file_bytes\":" << blocks[i].file_bytes
-        << ",\"masterchain_ref\":\"" << blocks[i].masterchain_ref.to_str() << "\",\"gen_utime\":"
-        << blocks[i].gen_utime << "}";
+        << ",\"masterchain_ref\":\"" << blocks[i].masterchain_ref.to_str() << "\",\"gen_utime\":" << blocks[i].gen_utime
+        << ",\"distinct_accounts\":" << blocks[i].workload.distinct_accounts
+        << ",\"raw_transactions\":" << blocks[i].workload.raw_transactions
+        << ",\"max_account_transactions\":" << blocks[i].workload.max_account_transactions
+        << ",\"bytes_per_raw_transaction\":";
+    if (blocks[i].workload.raw_transactions == 0) {
+      out << "null";
+    } else {
+      out << static_cast<double>(blocks[i].file_bytes) / static_cast<double>(blocks[i].workload.raw_transactions);
+    }
+    out << "}";
   }
   out << "]}";
   return out.as_cslice().str();
@@ -380,6 +492,56 @@ td::Result<BlockContext> unpack_block_context(LoadedBlock block_data) {
   result.out_msg_descr = std::move(extra.out_msg_descr);
   result.account_blocks = std::move(extra.account_blocks);
   result.state_update = std::move(block_record.state_update);
+  return result;
+}
+
+td::Result<BlockWorkloadSummary> summarize_account_blocks(const BlockContext& block_context) {
+  vm::AugmentedDictionary account_blocks{vm::load_cell_slice_ref(block_context.account_blocks), 256,
+                                         block::tlb::aug_ShardAccountBlocks};
+  BlockWorkloadSummary result;
+  td::Status scan_status = td::Status::OK();
+  const bool accounts_ok = account_blocks.check_for_each_extra(
+      [&](Ref<vm::CellSlice> account_block_slice, Ref<vm::CellSlice>, td::ConstBitPtr key, int key_len) {
+        if (key_len != 256) {
+          scan_status = td::Status::Error("invalid account block key length");
+          return false;
+        }
+        const StdSmcAddress address = key;
+        block::gen::AccountBlock::Record account_block;
+        if (!tlb::csr_unpack(std::move(account_block_slice), account_block) || account_block.account_addr != address) {
+          scan_status = td::Status::Error("cannot unpack AccountBlock");
+          return false;
+        }
+
+        std::size_t account_transactions = 0;
+        vm::AugmentedDictionary transactions{vm::DictNonEmpty(), std::move(account_block.transactions), 64,
+                                             block::tlb::aug_AccountTransactions};
+        const bool transactions_ok = transactions.check_for_each_extra(
+            [&](Ref<vm::CellSlice> transaction_slice, Ref<vm::CellSlice>, td::ConstBitPtr, int tx_key_len) {
+              if (tx_key_len != 64 || transaction_slice->prefetch_ref().is_null()) {
+                scan_status = td::Status::Error("invalid transaction entry in AccountBlock");
+                return false;
+              }
+              ++account_transactions;
+              return true;
+            });
+        if (!transactions_ok) {
+          if (scan_status.is_ok()) {
+            scan_status = td::Status::Error("cannot scan AccountBlock transactions");
+          }
+          return false;
+        }
+        ++result.distinct_accounts;
+        result.raw_transactions += account_transactions;
+        result.max_account_transactions = std::max(result.max_account_transactions, account_transactions);
+        return true;
+      });
+  if (!accounts_ok) {
+    if (scan_status.is_ok()) {
+      scan_status = td::Status::Error("cannot scan AccountBlocks dictionary");
+    }
+    return scan_status;
+  }
   return result;
 }
 

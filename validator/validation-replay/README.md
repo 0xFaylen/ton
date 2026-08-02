@@ -114,10 +114,16 @@ tvm-replay-bundle --archive <closed-shard.pack> \
 
 `--list-blocks` verifies every archived block file against the file and root
 hashes in its filename before reporting the full block id, referenced
-masterchain block, timestamp, and serialized size. The inspection output also
-reports `recommended_account_proof_reference`. For a linear block this is the
-exact predecessor shard block, which avoids advancing older account proofs
-through intermediate blocks.
+masterchain block, timestamp, serialized size, distinct-account count, raw
+transaction count, hottest-account transaction count, and serialized bytes per
+raw transaction. Archive-level totals make the workload-density calculation
+reproducible without replay state. The output also contains explicitly labelled
+ordinary-least-squares diagnostics for all blocks, non-empty blocks, and blocks
+with at least 40 transactions. These values describe finalized block BOCs; they
+are not `BlockLimitStatus` estimates or a sustainable-TPS measurement. The
+inspection output also reports `recommended_account_proof_reference`. For a
+linear block this is the exact predecessor shard block, which avoids advancing
+older account proofs through intermediate blocks.
 
 For every account covered by the supplied state, the tool re-executes the
 historical transaction chain and requires both the serialized transaction hash

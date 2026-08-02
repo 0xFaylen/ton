@@ -305,7 +305,27 @@ result.
 The sparse replay can now enumerate a closed shard archive without trusting a
 separate index. It checked the file and root hashes of 99 archived basechain
 blocks, covering seqnos `87341652..87341750`, and exposed each exact block id,
-masterchain reference, timestamp, and serialized size.
+masterchain reference, timestamp, serialized size, distinct-account count and
+raw transaction count. The slice contains 1,470 raw transactions in 99 blocks;
+68 blocks are non-empty and the files total 3,752,862 bytes. Over the 41-second
+timestamp span the observed finalized rate is 35.85 raw tx/s. This is demand,
+not capacity.
+
+An ordinary least-squares diagnostic over all 99 blocks gives
+`serialized_bytes = 5,057 + 2,212.39 * raw_transactions` with `R^2 = 0.9707`.
+Extrapolating that workload mix to the 2 MiB serialized-candidate limit at the
+400 ms target rate gives 2,364 raw tx/s. Separate fits over the 68 non-empty
+blocks and the 12 blocks with at least 40 transactions give 2,444 and 2,370 raw
+tx/s respectively. Their convergence supports the earlier single-block 2,351
+raw tx/s byte-envelope estimate, but does not turn it into sustainable mainnet
+throughput: the largest observed block is only 255,924 bytes, 12.20% of the
+limit, so every hard-limit result still extrapolates far beyond the sample.
+
+The largest copied block, `87341719`, contains 111 raw transactions across 77
+accounts, with at most eight transactions on one account. It is the first
+priority for a new exact-predecessor proof set because its existing proof set
+is state-stale while its block, configuration proof and library bundle are
+already available locally.
 
 Two additional proof sets appeared complete by address coverage: 29 accounts
 for block `87341683` and 77 accounts for block `87341719`. Both were rejected
