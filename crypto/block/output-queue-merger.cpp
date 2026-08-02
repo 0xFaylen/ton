@@ -195,6 +195,15 @@ bool OutputQueueMerger::next() {
   }
 }
 
+bool OutputQueueMerger::rewind(std::size_t checkpoint) {
+  if (checkpoint >= msg_list.size() || !msg_list[checkpoint]) {
+    return false;
+  }
+  pos = checkpoint;
+  eof = false;
+  return true;
+}
+
 bool OutputQueueMerger::load() {
   if (heap.empty() || failed) {
     return false;

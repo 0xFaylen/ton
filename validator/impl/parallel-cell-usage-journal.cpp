@@ -61,9 +61,17 @@ td::Status CellUsageJournal::validate() const {
 
 td::Status CellUsageJournal::replay_into(const td::Ref<vm::Cell>& pure_root,
                                          const std::shared_ptr<vm::CellUsageTree>& coordinator_tree) const {
-  TRY_STATUS(validate());
-  if (pure_root.is_null() || !coordinator_tree) {
+  if (!coordinator_tree) {
     return td::Status::Error("cell-usage journal replay requires a root and a coordinator tree");
+  }
+  return replay_into(pure_root, coordinator_tree->root_ptr());
+}
+
+td::Status CellUsageJournal::replay_into(const td::Ref<vm::Cell>& pure_root,
+                                         const vm::CellUsageTree::NodePtr& coordinator_anchor) const {
+  TRY_STATUS(validate());
+  if (pure_root.is_null() || coordinator_anchor.empty()) {
+    return td::Status::Error("cell-usage journal replay requires a root and a coordinator anchor");
   }
   if (!pure_root->get_tree_node().empty()) {
     return td::Status::Error("cell-usage journal replay requires an immutable pure root");
@@ -99,7 +107,7 @@ td::Status CellUsageJournal::replay_into(const td::Ref<vm::Cell>& pure_root,
   }
 
   for (std::size_t i = 0; i < entries_.size(); ++i) {
-    auto coordinator_node = coordinator_tree->root_ptr();
+    auto coordinator_node = coordinator_anchor;
     for (auto ref_id : entries_[i].ref_path) {
       coordinator_node = coordinator_node.create_child(ref_id);
     }

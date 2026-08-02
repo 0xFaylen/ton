@@ -564,6 +564,35 @@ are now the direct next gate on copied validator state. Only that gate can turn
 the diagnostic 1,634 raw tx/s rate into evidence about sustainable single-shard
 capacity.
 
+## Replay-only Collator integration - implementation gate
+
+The Collator now contains a default-off, replay-only path for inbound internal
+messages to previously untouched, distinct destination accounts. Each worker
+gets private account, message, configuration, and cell-usage state. The
+coordinator replays the recorded account/message/storage load journals into the
+original proof anchors and commits successful transactions in canonical
+`(lt, message hash)` order. Existing tick/tock execution stays serial, and any
+account already touched by tick/tock, dispatch, or an earlier transaction is a
+serial barrier. A later transaction to an account already committed by a worker
+currently fails the replay closed: the worker cell-usage context is deliberately
+not reused after the batch, so silently continuing would make proof accounting
+incomplete.
+
+The corresponding `vrp` option requires `--mode both`. It always produces a
+serial reference and a parallel candidate from the same replay inputs, rejects
+any byte difference in block or collated data, and runs the ordinary
+`ValidateQuery` on the parallel result. A live Collator rejects the non-zero
+worker option, so this code does not change consensus behavior, configuration,
+fees, TVM semantics, or validator voting.
+
+This is an implemented but unmeasured integration gate. The local smoke
+database contains only genesis, and the copied proof corpus used above is not a
+validator database. Therefore no candidate-equivalence result, end-to-end
+speedup, or sustainable single-shard TPS is claimed for this path yet. Matched
+serial-first and `--parallel-first` runs on a copied mainnet validator database
+remain required before the implementation can advance beyond experimental
+status.
+
 ## Dead ends and cautions
 
 - Search results did not expose a public TON trace JIT or public intra-block

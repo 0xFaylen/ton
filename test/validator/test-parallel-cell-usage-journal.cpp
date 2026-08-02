@@ -33,7 +33,8 @@ bool load_path(td::Ref<vm::Cell> current, const std::vector<unsigned>& path) {
     if (loaded.is_error() || ref_id >= loaded.ok().data_cell->get_refs_cnt()) {
       return false;
     }
-    current = loaded.ok().data_cell->get_ref(ref_id);
+    current = vm::UsageCell::create(loaded.ok().data_cell->get_ref(ref_id),
+                                    loaded.ok().tree_node.create_child(ref_id));
   }
   return current->load_cell().is_ok();
 }
@@ -109,6 +110,23 @@ TEST(ParallelCellUsageJournal, UnionIsIndependentOfWorkerArrivalOrder) {
   ASSERT_TRUE(left.replay_into(root, right_then_left).is_ok());
 
   ASSERT_EQ(proof_for(root, left_then_right)->get_hash(), proof_for(root, right_then_left)->get_hash());
+}
+
+TEST(ParallelCellUsageJournal, ReplaysBelowAnExistingCoordinatorAnchor) {
+  const auto root = make_tree();
+  const auto root_data = root->load_cell().move_as_ok().data_cell;
+  const td::Ref<vm::Cell> subtree = root_data->get_ref(1);
+
+  auto serial_tree = std::make_shared<vm::CellUsageTree>();
+  auto serial_root = vm::UsageCell::create(root, serial_tree->root_ptr());
+  ASSERT_TRUE(load_path(serial_root, {1, 0}));
+
+  const auto journal = record_journal(subtree, {{0}});
+  auto coordinator_tree = std::make_shared<vm::CellUsageTree>();
+  ASSERT_TRUE(load_path(vm::UsageCell::create(root, coordinator_tree->root_ptr()), {}));
+  ASSERT_TRUE(journal.replay_into(subtree, coordinator_tree->root_ptr().create_child(1)).is_ok());
+
+  ASSERT_EQ(proof_for(root, serial_tree)->get_hash(), proof_for(root, coordinator_tree)->get_hash());
 }
 
 TEST(ParallelCellUsageJournal, RejectsWrongAnchorPathCellAndDuplicate) {

@@ -33,6 +33,8 @@ class CellUsageJournal {
   td::Status validate() const;
   td::Status replay_into(const td::Ref<vm::Cell>& pure_root,
                          const std::shared_ptr<vm::CellUsageTree>& coordinator_tree) const;
+  td::Status replay_into(const td::Ref<vm::Cell>& pure_root,
+                         const vm::CellUsageTree::NodePtr& coordinator_anchor) const;
   td::Bits256 commitment() const;
 
   const td::Bits256& anchor_root_hash() const {

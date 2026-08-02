@@ -74,6 +74,10 @@ struct OutputQueueMerger {
   MsgKeyValue* cur();
   std::unique_ptr<MsgKeyValue> extract_cur();
   bool next();
+  std::size_t checkpoint() const {
+    return pos;
+  }
+  bool rewind(std::size_t checkpoint);
 
  private:
   td::BitArray<32 + 64> common_pfx;

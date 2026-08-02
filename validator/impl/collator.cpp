@@ -56,6 +56,133 @@ static constexpr int HIGH_PRIORITY_EXTERNAL = 10;  // don't skip high priority e
 
 static constexpr int MAX_ATTEMPTS = 5;
 
+namespace {
+
+struct ParallelCellUsageContext {
+  td::Ref<vm::Cell> pure_root;
+  vm::CellUsageTree::NodePtr coordinator_anchor;
+  std::shared_ptr<vm::CellUsageTree> worker_tree;
+  std::unique_ptr<parallel_inbound::CellUsageJournal> ordinary_journal;
+  std::unique_ptr<parallel_inbound::CellUsageJournal> storage_journal;
+  std::string error;
+
+  static td::Result<std::unique_ptr<ParallelCellUsageContext>> create(const td::Ref<vm::Cell>& coordinator_root) {
+    if (coordinator_root.is_null()) {
+      return td::Status::Error("parallel cell context requires a non-empty root");
+    }
+    TRY_RESULT(loaded, coordinator_root->load_cell());
+    return create_from_pure(std::move(loaded.data_cell), loaded.tree_node);
+  }
+
+  static td::Result<std::unique_ptr<ParallelCellUsageContext>> create_from_pure(
+      td::Ref<vm::Cell> pure_root, vm::CellUsageTree::NodePtr coordinator_anchor) {
+    if (pure_root.is_null() || !pure_root->get_tree_node().empty()) {
+      return td::Status::Error("parallel cell context requires an immutable pure root");
+    }
+    auto context = std::make_unique<ParallelCellUsageContext>();
+    context->pure_root = std::move(pure_root);
+    context->coordinator_anchor = std::move(coordinator_anchor);
+    if (!context->coordinator_anchor.empty()) {
+      context->ordinary_journal =
+          std::make_unique<parallel_inbound::CellUsageJournal>(context->pure_root->get_hash().as_bits256());
+      context->storage_journal =
+          std::make_unique<parallel_inbound::CellUsageJournal>(context->pure_root->get_hash().as_bits256());
+      context->worker_tree = std::make_shared<vm::CellUsageTree>();
+      context->worker_tree->set_cell_load_path_callback([self = context.get()](const vm::LoadedCell& cell) {
+        if (!self->error.empty()) {
+          return;
+        }
+        auto storage_context = block::StorageStatCalculationContext::get();
+        auto& journal = storage_context && storage_context->calculating_storage_stat() ? self->storage_journal
+                                                                                       : self->ordinary_journal;
+        auto status = journal->record(cell);
+        if (status.is_error()) {
+          self->error = status.move_as_error().message().str();
+        }
+      });
+    }
+    return context;
+  }
+
+  td::Ref<vm::Cell> worker_root() const {
+    return worker_tree ? vm::UsageCell::create(pure_root, worker_tree->root_ptr()) : pure_root;
+  }
+
+  td::Status validate_recording() const {
+    return error.empty() ? td::Status::OK() : td::Status::Error(error);
+  }
+};
+
+struct ParallelWorkerConfig {
+  block::StoragePhaseConfig storage;
+  block::ComputePhaseConfig compute;
+  block::ActionPhaseConfig action;
+  block::SerializeConfig serialize;
+};
+
+td::Status copy_parallel_worker_config(const block::StoragePhaseConfig& storage,
+                                       const block::ComputePhaseConfig& compute,
+                                       const block::ActionPhaseConfig& action,
+                                       const block::SerializeConfig& serialize, ParallelWorkerConfig& target) {
+  target.storage = storage;
+  target.action = action;
+  target.serialize = serialize;
+
+  target.compute.gas_price = compute.gas_price;
+  target.compute.gas_limit = compute.gas_limit;
+  target.compute.special_gas_limit = compute.special_gas_limit;
+  target.compute.gas_credit = compute.gas_credit;
+  target.compute.flat_gas_limit = compute.flat_gas_limit;
+  target.compute.flat_gas_price = compute.flat_gas_price;
+  target.compute.special_gas_full = compute.special_gas_full;
+  target.compute.mc_gas_prices = compute.mc_gas_prices;
+  target.compute.gas_price256 = compute.gas_price256;
+  target.compute.max_gas_threshold = compute.max_gas_threshold;
+  if (compute.libraries) {
+    target.compute.libraries =
+        std::make_unique<vm::Dictionary>(compute.libraries->get_root_cell(), compute.libraries->get_key_bits());
+  }
+  target.compute.global_config = compute.global_config;
+  target.compute.block_rand_seed = compute.block_rand_seed;
+  target.compute.ignore_chksig = compute.ignore_chksig;
+  target.compute.profile_ed25519 = compute.profile_ed25519;
+  target.compute.with_vm_log = compute.with_vm_log;
+  target.compute.max_vm_data_depth = compute.max_vm_data_depth;
+  target.compute.global_version = compute.global_version;
+  target.compute.prev_blocks_info = compute.prev_blocks_info;
+  target.compute.unpacked_config_tuple = compute.unpacked_config_tuple;
+  if (compute.suspended_addresses) {
+    target.compute.suspended_addresses = std::make_unique<vm::Dictionary>(
+        compute.suspended_addresses->get_root_cell(), compute.suspended_addresses->get_key_bits());
+  }
+  target.compute.size_limits = compute.size_limits;
+  target.compute.vm_log_verbosity = compute.vm_log_verbosity;
+  target.compute.stop_on_accept_message = compute.stop_on_accept_message;
+  target.compute.precompiled_contracts.list = vm::Dictionary(compute.precompiled_contracts.list.get_root_cell(), 256);
+  target.compute.dont_run_precompiled_ = compute.dont_run_precompiled_;
+  target.compute.allow_external_unfreeze = compute.allow_external_unfreeze;
+  target.compute.disable_anycast = compute.disable_anycast;
+  return td::Status::OK();
+}
+
+}  // namespace
+
+struct ParallelInboundPrepared {
+  ton::StdSmcAddress account_address;
+  ton::LogicalTime message_lt{0};
+  ton::LogicalTime after_lt{0};
+  int source{-1};
+  td::Bits256 message_hash = td::Bits256::zero();
+  std::unique_ptr<ParallelCellUsageContext> account_usage;
+  std::unique_ptr<ParallelCellUsageContext> message_usage;
+  std::unique_ptr<ParallelCellUsageContext> storage_usage;
+  std::unique_ptr<block::Account> account;
+  std::unique_ptr<block::transaction::Transaction> transaction;
+  ParallelWorkerConfig config;
+  CollationStats stats;
+  td::Status status = td::Status::OK();
+};
+
 /**
  * Constructs a Collator object.
  *
@@ -110,6 +237,15 @@ Collator::Collator(CollateParams params, td::actor::ActorId<ValidatorManager> ma
 void Collator::start_up() {
   LOG(WARNING) << "Collator for shard " << shard_ << " started"
                << (params_.attempt_idx ? PSTRING() << " (attempt #" << params_.attempt_idx << ")" : "");
+  if (params_.collator_opts->replay_parallel_account_workers != 0 && !params_.is_replay) {
+    fatal_error(-667, "parallel account execution is restricted to offline replay");
+    return;
+  }
+  if (params_.collator_opts->replay_parallel_account_workers == 1 ||
+      params_.collator_opts->replay_parallel_account_workers > 64) {
+    fatal_error(-667, "parallel replay worker count must be zero or between 2 and 64");
+    return;
+  }
   if (!check_cancelled()) {
     return;
   }
@@ -3357,6 +3493,10 @@ Ref<vm::Cell> Collator::create_ordinary_transaction(Ref<vm::Cell> msg_root,
   if (!block::tlb::t_MsgAddressInt.extract_std_address(dest, wc, addr) || wc != workchain()) {
     return {};
   }
+  if (replay_parallel_committed_accounts_.count(addr) != 0) {
+    fatal_error("a replay-parallel account received another transaction in the same block");
+    return {};
+  }
   LOG(DEBUG) << "inbound message to our smart contract " << addr.to_hex();
   auto acc_res = make_account(addr.cbits(), true);
   if (acc_res.is_error()) {
@@ -3988,7 +4128,7 @@ bool Collator::precheck_inbound_message(Ref<vm::CellSlice> enq_msg, ton::Logical
  * @returns True if the message was processed successfully, false otherwise.
  */
 bool Collator::process_inbound_message(Ref<vm::CellSlice> enq_msg, ton::LogicalTime lt, td::ConstBitPtr key,
-                                       int src_nb_idx) {
+                                       int src_nb_idx, ParallelInboundPrepared* prepared) {
   const auto& src_nb = neighbors_.at(src_nb_idx);
   ton::LogicalTime enqueued_lt = enq_msg->prefetch_ulong(64);
   auto msg_env = enq_msg->prefetch_ref();
@@ -4108,8 +4248,9 @@ bool Collator::process_inbound_message(Ref<vm::CellSlice> enq_msg, ton::LogicalT
   // process the message by an ordinary transaction similarly to process_one_new_message()
   //
   // 8. create a Transaction processing this Message
-  auto trans_root =
-      create_ordinary_transaction(env.msg, env.metadata, 0, TvmHotpathStats::AccountWorkPhase::inbound_internal);
+  auto trans_root = prepared ? commit_parallel_inbound_transaction(*prepared, env.msg, env.metadata)
+                             : create_ordinary_transaction(env.msg, env.metadata, 0,
+                                                           TvmHotpathStats::AccountWorkPhase::inbound_internal);
   if (trans_root.is_null()) {
     return fatal_error("cannot create transaction for processing inbound message");
   }
@@ -4140,6 +4281,336 @@ bool Collator::process_inbound_message(Ref<vm::CellSlice> enq_msg, ton::LogicalT
     return fatal_error("cannot insert InMsg into InMsgDescr");
   }
   return true;
+}
+
+Ref<vm::Cell> Collator::commit_parallel_inbound_transaction(
+    ParallelInboundPrepared& prepared, const td::Ref<vm::Cell>& expected_message,
+    const td::optional<block::MsgMetadata>& msg_metadata) {
+  if (prepared.status.is_error() || !prepared.account || !prepared.transaction || expected_message.is_null() ||
+      expected_message->get_hash().as_bits256() != prepared.message_hash ||
+      prepared.transaction->account.addr != prepared.account_address ||
+      &prepared.transaction->account != prepared.account.get() || lookup_account(prepared.account_address.cbits())) {
+    fatal_error("parallel inbound transaction failed its coordinator precommit checks");
+    return {};
+  }
+
+  set_current_tx_storage_dict(*prepared.account);
+  auto replay_journal = [&](const std::unique_ptr<ParallelCellUsageContext>& context, bool storage) -> bool {
+    if (!context) {
+      return true;
+    }
+    auto status = context->validate_recording();
+    if (status.is_ok() && !context->coordinator_anchor.empty()) {
+      const auto& journal = storage ? context->storage_journal : context->ordinary_journal;
+      status = journal->replay_into(context->pure_root, context->coordinator_anchor);
+    }
+    if (status.is_error()) {
+      fatal_error(status.move_as_error_prefix("cannot replay parallel cell-usage journal: "));
+      return false;
+    }
+    return true;
+  };
+
+  if (!replay_journal(prepared.account_usage, false) || !replay_journal(prepared.message_usage, false) ||
+      !replay_journal(prepared.storage_usage, false)) {
+    current_tx_storage_dict_ = nullptr;
+    return {};
+  }
+  {
+    block::StorageStatCalculationContext storage_context{true};
+    block::StorageStatCalculationContext::Guard guard{&storage_context};
+    if (!replay_journal(prepared.account_usage, true) || !replay_journal(prepared.message_usage, true) ||
+        !replay_journal(prepared.storage_usage, true)) {
+      current_tx_storage_dict_ = nullptr;
+      return {};
+    }
+  }
+  current_tx_storage_dict_ = nullptr;
+
+  stats_.work_time += prepared.stats.work_time;
+  auto& trans = prepared.transaction;
+  if (!trans->update_limits(*block_limit_status_)) {
+    fatal_error("cannot update block limits for a parallel inbound transaction");
+    return {};
+  }
+  auto trans_root = trans->commit(*prepared.account);
+  if (trans_root.is_null()) {
+    fatal_error("cannot commit a parallel inbound transaction");
+    return {};
+  }
+
+  auto [account_it, inserted] = accounts.emplace(prepared.account_address, std::move(prepared.account));
+  if (!inserted || !account_it->second) {
+    fatal_error("cannot publish a parallel inbound account state");
+    return {};
+  }
+  replay_parallel_committed_accounts_.insert(prepared.account_address);
+  if (!update_account_dict_estimation(*trans)) {
+    fatal_error("cannot update account dictionary estimate for a parallel inbound transaction");
+    return {};
+  }
+  update_account_storage_dict_info(*trans);
+
+  td::optional<block::MsgMetadata> new_msg_metadata;
+  if (msg_metadata) {
+    new_msg_metadata = msg_metadata;
+    ++new_msg_metadata.value().depth;
+  }
+  register_new_msgs(*trans, std::move(new_msg_metadata));
+  update_max_lt(account_it->second->last_trans_end_lt_);
+  value_flow_.burned += trans->blackhole_burned;
+  ++stats_.transactions;
+  return trans_root;
+}
+
+td::Result<std::size_t> Collator::process_parallel_inbound_batch() {
+  const auto worker_count = params_.collator_opts->replay_parallel_account_workers;
+  if (worker_count < 2 || is_masterchain() || nb_out_msgs_->is_eof() || have_unprocessed_account_dispatch_queue_) {
+    return std::size_t{0};
+  }
+
+  const auto checkpoint = nb_out_msgs_->checkpoint();
+  std::vector<std::unique_ptr<ParallelInboundPrepared>> batch;
+  std::set<ton::StdSmcAddress> batch_accounts;
+  batch.reserve(worker_count);
+
+  while (batch.size() < worker_count && !nb_out_msgs_->is_eof()) {
+    auto* item = nb_out_msgs_->cur();
+    if (!item || item->msg.is_null() || item->limit_exceeded) {
+      break;
+    }
+    auto msg_env = item->msg->prefetch_ref();
+    block::tlb::MsgEnvelope::Record_std env;
+    if (msg_env.is_null() || !tlb::unpack_cell(msg_env, env)) {
+      break;
+    }
+    vm::CellSlice cs{vm::NoVmOrd{}, env.msg};
+    if (block::gen::t_CommonMsgInfo.get_tag(cs) != block::gen::CommonMsgInfo::int_msg_info) {
+      break;
+    }
+    block::gen::CommonMsgInfo::Record_int_msg_info info;
+    if (!tlb::unpack(cs, info)) {
+      break;
+    }
+    ton::WorkchainId destination_workchain;
+    ton::StdSmcAddress destination;
+    if (!block::tlb::t_MsgAddressInt.extract_std_address(info.dest, destination_workchain, destination) ||
+        destination_workchain != workchain() || !is_our_address(destination) || lookup_account(destination.cbits()) ||
+        !batch_accounts.insert(destination).second) {
+      break;
+    }
+
+    auto src_prefix = block::tlb::t_MsgAddressInt.get_prefix(info.src);
+    auto dest_prefix = block::tlb::t_MsgAddressInt.get_prefix(info.dest);
+    if (!src_prefix.is_valid() || !dest_prefix.is_valid()) {
+      break;
+    }
+    auto cur_prefix = block::interpolate_addr(src_prefix, dest_prefix, env.cur_addr);
+    auto next_prefix = block::interpolate_addr(src_prefix, dest_prefix, env.next_addr);
+    if (!cur_prefix.is_valid() || !next_prefix.is_valid()) {
+      break;
+    }
+    block::EnqueuedMsgDescr descriptor{cur_prefix, next_prefix,
+                                       env.emitted_lt ? env.emitted_lt.value() : info.created_lt,
+                                       item->msg->prefetch_ulong(64), env.msg->get_hash().bits()};
+    if (processed_upto_->already_processed(descriptor)) {
+      break;
+    }
+
+    auto prepared = std::make_unique<ParallelInboundPrepared>();
+    prepared->account_address = destination;
+    prepared->message_lt = item->lt;
+    prepared->source = item->source;
+    prepared->message_hash = env.msg->get_hash().as_bits256();
+    batch.push_back(std::move(prepared));
+    if (batch.size() == worker_count || !nb_out_msgs_->next()) {
+      break;
+    }
+  }
+
+  if (!nb_out_msgs_->rewind(checkpoint)) {
+    return td::Status::Error("cannot restore inbound queue after parallel lookahead");
+  }
+  if (batch.size() < 2) {
+    return std::size_t{0};
+  }
+
+  for (auto& prepared : batch) {
+    TRY_RESULT(account_usage, ParallelCellUsageContext::create(account_dict->get_root_cell()));
+    prepared->account_usage = std::move(account_usage);
+    vm::AugmentedDictionary private_accounts(prepared->account_usage->worker_root(), 256,
+                                             block::tlb::aug_ShardAccounts);
+    auto account_entry = private_accounts.lookup_extra(prepared->account_address.cbits(), 256);
+    prepared->account = std::make_unique<block::Account>(workchain(), prepared->account_address.cbits());
+    if (account_entry.first.is_null()) {
+      if (!prepared->account->init_new(now_)) {
+        return td::Status::Error("cannot initialize a parallel destination account");
+      }
+    } else if (!prepared->account->unpack(std::move(account_entry.first), now_,
+                                          config_->is_special_smartcontract(prepared->account_address))) {
+      return td::Status::Error("cannot unpack a parallel destination account");
+    }
+    prepared->account->block_lt = start_lt;
+
+    auto* queue_item = nb_out_msgs_->cur();
+    if (!queue_item || queue_item->lt != prepared->message_lt || queue_item->source != prepared->source) {
+      return td::Status::Error("parallel inbound queue changed during preparation");
+    }
+    auto message_envelope = queue_item->msg->prefetch_ref();
+    block::tlb::MsgEnvelope::Record_std message_env;
+    if (!tlb::unpack_cell(message_envelope, message_env) ||
+        message_env.msg->get_hash().as_bits256() != prepared->message_hash) {
+      return td::Status::Error("parallel inbound message changed during preparation");
+    }
+    TRY_RESULT(message_usage, ParallelCellUsageContext::create(message_env.msg));
+    prepared->message_usage = std::move(message_usage);
+
+    {
+      td::ScopedRealCpuTimer timer{stats_.work_time.prelim_storage_stat};
+      auto& account = *prepared->account;
+      if (account.storage_dict_hash && account.storage.is_null()) {
+        return td::Status::Error("parallel account has a storage dictionary hash without storage");
+      }
+      if (account.storage_dict_hash && !account.storage_dict_hash.value().is_zero()) {
+        const auto storage_hash = account.storage_dict_hash.value();
+        auto cached_root = storage_stat_cache_ ? storage_stat_cache_(storage_hash) : td::Ref<vm::Cell>{};
+        if (cached_root.not_null()) {
+          if (cached_root->get_hash().as_bits256() != storage_hash) {
+            return td::Status::Error("parallel storage-stat cache returned the wrong root");
+          }
+          storage_stat_cache_update_.emplace_back(cached_root, account.storage_used.cells);
+          ++stats_.storage_stat_cache.hit_cnt;
+          stats_.storage_stat_cache.hit_cells += account.storage_used.cells;
+        } else if (account.storage_used.cells >= StorageStatCache::MIN_ACCOUNT_CELLS) {
+          ++stats_.storage_stat_cache.miss_cnt;
+          stats_.storage_stat_cache.miss_cells += account.storage_used.cells;
+        } else {
+          ++stats_.storage_stat_cache.small_cnt;
+          stats_.storage_stat_cache.small_cells += account.storage_used.cells;
+        }
+
+        if (!full_collated_data_) {
+          if (cached_root.not_null()) {
+            TRY_STATUS(account.init_account_storage_stat(std::move(cached_root)));
+          }
+        } else {
+          AccountStorageDict& storage_dict = account_storage_dicts_[storage_hash];
+          if (!storage_dict.inited) {
+            storage_dict.inited = true;
+            td::Ref<vm::Cell> storage_root = std::move(cached_root);
+            if (storage_root.is_null()) {
+              if (prepared->account_usage->worker_tree) {
+                prepared->account_usage->worker_tree->set_ignore_loads(true);
+              }
+              auto storage_root_result = account.compute_account_storage_dict();
+              if (storage_root_result.is_error()) {
+                if (prepared->account_usage->worker_tree) {
+                  prepared->account_usage->worker_tree->set_ignore_loads(false);
+                }
+                return storage_root_result.move_as_error_prefix("cannot compute parallel account storage dictionary: ");
+              }
+              storage_root = storage_root_result.move_as_ok();
+              if (prepared->account_usage->worker_tree) {
+                storage_root = clean_usage_cells({}, storage_root, *prepared->account_usage->worker_tree);
+              }
+              if (prepared->account_usage->worker_tree) {
+                prepared->account_usage->worker_tree->set_ignore_loads(false);
+              }
+            }
+            if (storage_root.is_null() || storage_root->get_hash().as_bits256() != storage_hash) {
+              return td::Status::Error("parallel account storage dictionary has the wrong root");
+            }
+            storage_dict.mpb = vm::MerkleProofBuilder(std::move(storage_root));
+            storage_dict.mpb.set_cell_load_callback([&](const vm::LoadedCell& cell) { on_cell_loaded(cell); });
+          }
+          TRY_RESULT(storage_usage,
+                     ParallelCellUsageContext::create_from_pure(storage_dict.mpb.original_root(),
+                                                                storage_dict.mpb.root()->get_tree_node()));
+          prepared->storage_usage = std::move(storage_usage);
+          TRY_STATUS(account.init_account_storage_stat(prepared->storage_usage->worker_root()));
+        }
+      }
+    }
+
+    TRY_STATUS(copy_parallel_worker_config(storage_phase_cfg_, compute_phase_cfg_, action_phase_cfg_, serialize_cfg_,
+                                           prepared->config));
+    auto dispatch_it = last_dispatch_queue_emitted_lt_.find(prepared->account_address);
+    if (dispatch_it != last_dispatch_queue_emitted_lt_.end()) {
+      prepared->after_lt = dispatch_it->second;
+    }
+    if (stats_.work_time.tvm_hotpath.is_exact()) {
+      prepared->stats.work_time.tvm_hotpath.enable_exact();
+    }
+    if (!nb_out_msgs_->next() && prepared.get() != batch.back().get()) {
+      return td::Status::Error("parallel inbound queue ended during preparation");
+    }
+  }
+  if (!nb_out_msgs_->rewind(checkpoint)) {
+    return td::Status::Error("cannot restore inbound queue after parallel preparation");
+  }
+
+  if (!replay_parallel_worker_pool_) {
+    TRY_RESULT(pool, parallel_inbound::ReusableWorkerPool::create(worker_count));
+    replay_parallel_worker_pool_ = std::move(pool);
+  }
+  std::vector<parallel_inbound::ReusableWorkerPool::Task> tasks;
+  tasks.reserve(batch.size());
+  for (auto& prepared : batch) {
+    tasks.emplace_back([item = prepared.get(), now = now_, transaction_lt = start_lt] {
+      auto result = Collator::impl_create_ordinary_transaction(
+          item->message_usage->worker_root(), item->account.get(), now, transaction_lt, &item->config.storage,
+          &item->config.compute, &item->config.action, &item->config.serialize, false, item->after_lt, &item->stats,
+          TvmHotpathStats::AccountWorkPhase::inbound_internal);
+      if (result.is_error()) {
+        item->status = result.move_as_error();
+        return;
+      }
+      item->transaction = result.move_as_ok();
+      for (const auto* context : {item->account_usage.get(), item->message_usage.get(), item->storage_usage.get()}) {
+        if (context) {
+          auto status = context->validate_recording();
+          if (status.is_error()) {
+            item->status = std::move(status);
+            return;
+          }
+        }
+      }
+    });
+  }
+  TRY_STATUS(replay_parallel_worker_pool_->run_batch(std::move(tasks)));
+  for (const auto& prepared : batch) {
+    if (prepared->status.is_error()) {
+      return prepared->status.clone().move_as_error_prefix("parallel inbound worker failed: ");
+    }
+  }
+
+  std::size_t committed = 0;
+  for (auto& prepared : batch) {
+    block_full_ = !block_limit_status_->fits(block::ParamLimits::cl_normal);
+    if (block_full_ || internal_msg_timeout_.is_in_past(td::Timestamp::now())) {
+      return td::Status::Error("parallel inbound batch crossed a serial commit boundary");
+    }
+    if (!check_cancelled()) {
+      return td::Status::Error("parallel inbound batch was cancelled");
+    }
+    auto* current = nb_out_msgs_->cur();
+    if (!current || current->lt != prepared->message_lt || current->source != prepared->source ||
+        td::bitstring::bits_memcmp(current->key.cbits() + 96, prepared->message_hash.cbits(), 256)) {
+      return td::Status::Error("parallel inbound canonical order changed before commit");
+    }
+    if (!precheck_inbound_message(current->msg, current->lt)) {
+      return td::Status::Error("parallel inbound message failed serial precheck");
+    }
+    auto item = nb_out_msgs_->extract_cur();
+    auto& neighbor_stats = stats_.neighbors.at(item->source);
+    ++neighbor_stats.processed_msgs;
+    if (!process_inbound_message(item->msg, item->lt, item->key.cbits(), item->source, prepared.get())) {
+      return td::Status::Error("parallel inbound message failed serial commit");
+    }
+    ++committed;
+    nb_out_msgs_->next();
+  }
+  return committed;
 }
 
 /**
@@ -4181,6 +4652,16 @@ bool Collator::process_inbound_internal_messages() {
   };
   while (!nb_out_msgs_->is_eof()) {
     block_full_ = !block_limit_status_->fits(block::ParamLimits::cl_normal);
+    if (!block_full_ && !internal_msg_timeout_.is_in_past(td::Timestamp::now()) &&
+        params_.collator_opts->replay_parallel_account_workers >= 2) {
+      auto parallel_result = process_parallel_inbound_batch();
+      if (parallel_result.is_error()) {
+        return fatal_error(parallel_result.move_as_error_prefix("parallel inbound replay failed: "));
+      }
+      if (parallel_result.ok() != 0) {
+        continue;
+      }
+    }
     auto kv = nb_out_msgs_->extract_cur();
     CHECK(kv && kv->msg.not_null());
     auto& neighbor_stats = stats_.neighbors.at(kv->source);

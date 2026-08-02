@@ -300,6 +300,35 @@ later gate. The measured offline rate is not sustainable shard TPS, and
 live-Collator wiring on copied validator state plus exact candidate and
 `ValidateQuery` equivalence, not another projection from this proof corpus.
 
+### Replay-only Collator candidate gate
+
+`vrp run --mode both --parallel-account-workers N <block-id>` enables the next
+gate on an isolated validator database. It runs the ordinary serial Collator and
+the replay-only parallel inbound-account path from the same predecessor inputs.
+The command requires byte-identical block data, byte-identical collated data,
+the same block id and collated-data file hash, and then submits the parallel
+candidate to the normal `ValidateQuery`. Any worker, proof-journal, block-limit,
+queue-frontier, candidate-equality, or validation failure rejects the run.
+
+The option is accepted only for replay and only with `--mode both`. A non-zero
+worker count on a live Collator is rejected during startup. Tick/tock,
+dispatch-queue accounts, repeated destination accounts, transit messages, and
+other barriers remain on the serial coordinator path. Completed worker results
+are committed only in the canonical inbound queue order; a batch that reaches a
+limit or timeout before its complete prefix is committed fails closed instead
+of advancing `ProcessedUpto` over a hole. Until worker proof contexts can be
+preserved across later transactions, a second transaction to an account already
+committed by a parallel worker also rejects the replay instead of continuing
+with incomplete proof accounting.
+
+`--parallel-first` reverses the two pass order. Run matched serial-first and
+parallel-first samples before interpreting timings so storage and OS cache
+warming cannot be mistaken for executor speedup. No result from this gate is
+yet recorded here because the available Windows smoke database contains only
+genesis. It is not evidence of sustainable shard TPS until a copied mainnet
+validator database passes the exact-candidate and `ValidateQuery` gates across
+a representative block set.
+
 The output also contains `single_shard_capacity`. It reads Config 23/29/30 from
 the state-bound masterchain proof and reports the exact archive block-file size.
 For the copied basechain block `87341675`, Config 29 at masterchain seqno

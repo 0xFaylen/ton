@@ -19,6 +19,7 @@
 #pragma once
 #include <map>
 #include <queue>
+#include <set>
 
 #include "block/block-db.h"
 #include "block/block.h"
@@ -35,6 +36,8 @@
 
 #include "block-parse.h"
 #include "fabric.h"
+#include "parallel-cell-usage-journal.h"
+#include "parallel-worker-pool.h"
 #include "shard.hpp"
 #include "top-shard-descr.hpp"
 
@@ -42,6 +45,8 @@ namespace ton {
 
 namespace validator {
 using td::Ref;
+
+struct ParallelInboundPrepared;
 
 class Collator final : public td::actor::Actor {
  public:
@@ -149,6 +154,8 @@ class Collator final : public td::actor::Actor {
   std::map<ShardIdFull, td::int32> neighbor_msg_queues_limits_;
   std::vector<block::McShardDescr> neighbors_;
   std::unique_ptr<block::OutputQueueMerger> nb_out_msgs_;
+  std::unique_ptr<parallel_inbound::ReusableWorkerPool> replay_parallel_worker_pool_;
+  std::set<ton::StdSmcAddress> replay_parallel_committed_accounts_;
   std::vector<ton::StdSmcAddress> special_smcs;
   Ref<vm::Cell> prev_block_root;
   Ref<vm::Cell> prev_state_root_, prev_state_root_pure_;
@@ -357,8 +364,13 @@ class Collator final : public td::actor::Actor {
   bool process_new_messages(bool& enqueue_only);
   int process_one_new_message(block::NewOutMsg msg, bool enqueue_only = false, Ref<vm::Cell>* is_special = nullptr);
   bool process_inbound_internal_messages();
+  td::Result<std::size_t> process_parallel_inbound_batch();
   bool precheck_inbound_message(Ref<vm::CellSlice> msg, ton::LogicalTime lt);
-  bool process_inbound_message(Ref<vm::CellSlice> msg, ton::LogicalTime lt, td::ConstBitPtr key, int src_nb_idx);
+  bool process_inbound_message(Ref<vm::CellSlice> msg, ton::LogicalTime lt, td::ConstBitPtr key, int src_nb_idx,
+                               ParallelInboundPrepared* prepared = nullptr);
+  Ref<vm::Cell> commit_parallel_inbound_transaction(ParallelInboundPrepared& prepared,
+                                                    const td::Ref<vm::Cell>& expected_message,
+                                                    const td::optional<block::MsgMetadata>& msg_metadata);
   td::actor::Task<> process_external_and_new_messages();
   td::actor::Task<bool> process_inbound_external_messages();
   int process_external_message(Ref<vm::Cell> msg);

@@ -43,6 +43,27 @@ td::Status write_new_file(td::CSlice path, td::Slice data) {
   return td::Status::OK();
 }
 
+td::Ref<CollatorOptions> clone_collator_options(const td::Ref<CollatorOptions>& source,
+                                                td::uint32 replay_parallel_account_workers) {
+  auto target = td::Ref<CollatorOptions>{true};
+  auto& mutable_target = target.write();
+  if (source.not_null()) {
+    mutable_target.deferring_enabled = source->deferring_enabled;
+    mutable_target.defer_messages_after = source->defer_messages_after;
+    mutable_target.defer_out_queue_size_limit = source->defer_out_queue_size_limit;
+    mutable_target.dispatch_phase_2_max_total = source->dispatch_phase_2_max_total;
+    mutable_target.dispatch_phase_3_max_total = source->dispatch_phase_3_max_total;
+    mutable_target.dispatch_phase_2_max_per_initiator = source->dispatch_phase_2_max_per_initiator;
+    mutable_target.dispatch_phase_3_max_per_initiator = source->dispatch_phase_3_max_per_initiator;
+    mutable_target.whitelist = source->whitelist;
+    mutable_target.prioritylist = source->prioritylist;
+    mutable_target.force_full_collated_data = source->force_full_collated_data;
+    mutable_target.ignore_collated_data_limits = source->ignore_collated_data_limits;
+  }
+  mutable_target.replay_parallel_account_workers = replay_parallel_account_workers;
+  return target;
+}
+
 std::string account_lane_scope_json(const char* scope, const AccountWorkMap& work_by_account,
                                     std::optional<double> full_collation_wall) {
   td::StringBuilder out;
@@ -243,6 +264,8 @@ class ValidationReplayerImpl : public ValidationReplayer {
       ReplayMode mode = ReplayMode::validate;
       bool log_work_time = false;
       bool exact_tvm_hotpaths = false;
+      td::uint32 parallel_account_workers = 0;
+      bool parallel_first = false;
       std::optional<std::string> collated_data_output;
       std::vector<std::string> params;
       while (!eoln()) {
@@ -253,6 +276,10 @@ class ValidationReplayerImpl : public ValidationReplayer {
           log_work_time = true;
         } else if (token == "--exact-tvm-hotpaths") {
           exact_tvm_hotpaths = true;
+        } else if (token == "--parallel-account-workers") {
+          parallel_account_workers = CO_TRY(td::to_integer_safe<td::uint32>(CO_TRY(next())));
+        } else if (token == "--parallel-first") {
+          parallel_first = true;
         } else if (token == "--export-collated-data") {
           if (collated_data_output) {
             co_return td::Status::Error("--export-collated-data may be specified only once");
@@ -276,11 +303,22 @@ class ValidationReplayerImpl : public ValidationReplayer {
       if (collated_data_output && mode == ReplayMode::validate) {
         co_return td::Status::Error("--export-collated-data requires collate or both mode");
       }
+      if (parallel_account_workers == 1 || parallel_account_workers > 64) {
+        co_return td::Status::Error("parallel-account-workers must be zero or between 2 and 64");
+      }
+      if (parallel_account_workers != 0 && mode != ReplayMode::both) {
+        co_return td::Status::Error("--parallel-account-workers requires both mode so ValidateQuery is mandatory");
+      }
+      if (parallel_first && parallel_account_workers == 0) {
+        co_return td::Status::Error("--parallel-first requires --parallel-account-workers");
+      }
       std::vector<BlockId> block_ids;
       for (const std::string& s : params) {
         block_ids.push_back(CO_TRY(BlockId::from_str(s)));
       }
-      command_run(std::move(block_ids), mode, log_work_time, exact_tvm_hotpaths, std::move(collated_data_output))
+      command_run(std::move(block_ids), mode, log_work_time, exact_tvm_hotpaths, parallel_account_workers,
+                  parallel_first,
+                  std::move(collated_data_output))
           .start()
           .detach_silent();
       co_return "Started. `vrp show` to see results.";
@@ -360,6 +398,8 @@ class ValidationReplayerImpl : public ValidationReplayer {
            "\t--mode mode\tcollate/validate/both (default: validate)\n"
            "\t--log-work-time\tshow detailed work time stats\n"
            "\t--exact-tvm-hotpaths\tretain every executed code hash and exact per-hash account counts\n"
+           "\t--parallel-account-workers <n>\toffline exact-candidate plus ValidateQuery gate, 2..64; mode=both\n"
+           "\t--parallel-first\trun the parallel pass before the serial reference to expose warm-cache bias\n"
            "\t--export-collated-data <path>\twrite one newly collated candidate artifact; refuses overwrite\n"
            "vrp run-range [--mode mode] <start> <end>\tprocess all blocks between mc seqnos <start> and <end>\n"
            "\t--mode mode\tcollate/validate/both (default: validate)\n"
@@ -447,7 +487,9 @@ class ValidationReplayerImpl : public ValidationReplayer {
   }
 
   td::actor::Task<> command_run(std::vector<BlockId> block_ids, ReplayMode mode, bool log_work_time,
-                                bool exact_tvm_hotpaths, std::optional<std::string> collated_data_output) {
+                                bool exact_tvm_hotpaths, td::uint32 parallel_account_workers,
+                                bool parallel_first,
+                                std::optional<std::string> collated_data_output) {
     std::string description;
     CHECK(!block_ids.empty());
     if (block_ids.size() == 1) {
@@ -461,8 +503,13 @@ class ValidationReplayerImpl : public ValidationReplayer {
     if (collated_data_output) {
       description += ", collated_data_export=enabled";
     }
+    if (parallel_account_workers != 0) {
+      description += PSTRING() << ", parallel_account_workers=" << parallel_account_workers
+                               << ", pass_order=" << (parallel_first ? "parallel-first" : "serial-first");
+    }
     co_await run_start(description);
     auto result = co_await command_run_inner(std::move(block_ids), mode, log_work_time, exact_tvm_hotpaths,
+                                             parallel_account_workers, parallel_first,
                                              std::move(collated_data_output))
                       .wrap();
     if (result.is_error()) {
@@ -475,7 +522,9 @@ class ValidationReplayerImpl : public ValidationReplayer {
   }
 
   td::actor::Task<> command_run_inner(std::vector<BlockId> block_ids, ReplayMode mode, bool log_work_time,
-                                      bool exact_tvm_hotpaths, std::optional<std::string> collated_data_output) {
+                                      bool exact_tvm_hotpaths, td::uint32 parallel_account_workers,
+                                      bool parallel_first,
+                                      std::optional<std::string> collated_data_output) {
     auto cancellation_token = cancellation_.get_cancellation_token();
     ProcessBlockResult total;
     size_t processed_ok = 0;
@@ -483,7 +532,9 @@ class ValidationReplayerImpl : public ValidationReplayer {
       BlockId block_id = block_ids[i];
       auto handle = co_await get_block_by_id(manager_, block_id);
       current_run_.status = "Processing block " + block_id.to_str();
-      auto R = co_await process_block(handle, mode, exact_tvm_hotpaths, collated_data_output).wrap();
+      auto R = co_await process_block(handle, mode, exact_tvm_hotpaths, collated_data_output,
+                                      parallel_account_workers, parallel_first)
+                   .wrap();
       if (R.is_ok()) {
         total += R.ok();
         ++processed_ok;
@@ -668,6 +719,10 @@ class ValidationReplayerImpl : public ValidationReplayer {
       double new_block_size = 0;
       double new_collated_data_size = 0;
       double time = 0.0;
+      double serial_time = 0.0;
+      td::uint32 parallel_account_workers = 0;
+      bool parallel_first = false;
+      bool exact_candidate_match = false;
       CollationStats::WorkTimeStats work_time;
     };
     std::optional<Collate> collate;
@@ -685,6 +740,13 @@ class ValidationReplayerImpl : public ValidationReplayer {
         collate->new_block_size += r.collate->new_block_size;
         collate->new_collated_data_size += r.collate->new_collated_data_size;
         collate->time += r.collate->time;
+        collate->serial_time += r.collate->serial_time;
+        collate->parallel_account_workers =
+            collate->parallel_account_workers == r.collate->parallel_account_workers
+                ? collate->parallel_account_workers
+                : 0;
+        collate->parallel_first = collate->parallel_first == r.collate->parallel_first && collate->parallel_first;
+        collate->exact_candidate_match = collate->exact_candidate_match && r.collate->exact_candidate_match;
         collate->work_time += r.collate->work_time;
       }
       if (!validate) {
@@ -703,6 +765,15 @@ class ValidationReplayerImpl : public ValidationReplayer {
         sb << (n == 1.0 ? "" : "Avg ") << "Collate: size=" << Fixed(collate->new_block_size / n, 0) << "/"
            << Fixed(block_size / n, 0) << ", cdata_size=" << Fixed(collate->new_collated_data_size / n, 0)
            << ", time=" << Fixed(collate->time / n, 6);
+        if (collate->parallel_account_workers != 0) {
+          const auto serial_time = collate->serial_time / n;
+          const auto parallel_time = collate->time / n;
+          sb << "\n  Parallel account replay: workers=" << collate->parallel_account_workers
+             << ", pass_order=" << (collate->parallel_first ? "parallel-first" : "serial-first")
+             << ", serial_time=" << Fixed(serial_time, 6) << ", parallel_time=" << Fixed(parallel_time, 6)
+             << ", speedup=" << Fixed(parallel_time > 0.0 ? serial_time / parallel_time : 0.0, 3)
+             << ", exact_candidate_match=" << collate->exact_candidate_match;
+        }
         if (log_work_time) {
           auto wt = collate->work_time;
           wt *= 1.0 / n;
@@ -731,7 +802,9 @@ class ValidationReplayerImpl : public ValidationReplayer {
     }
   };
   td::actor::Task<ProcessBlockResult> process_block(ConstBlockHandle handle, ReplayMode mode, bool exact_tvm_hotpaths,
-                                                    const std::optional<std::string>& collated_data_output) {
+                                                    const std::optional<std::string>& collated_data_output,
+                                                    td::uint32 parallel_account_workers = 0,
+                                                    bool parallel_first = false) {
     Ref<BlockData> block = co_await td::actor::ask(manager_, &ValidatorManager::get_block_data_from_db, handle);
     ProcessBlockResult result;
     result.block_size = (double)block->data().size();
@@ -752,44 +825,84 @@ class ValidationReplayerImpl : public ValidationReplayer {
       shard_blocks = co_await get_shard_block_descriptions(new_mc_state, prev_mc_state, manager_);
     }
 
-    BlockCandidate candidate;
+    std::unique_ptr<BlockCandidate> candidate;
     if (mode == ReplayMode::collate || mode == ReplayMode::both) {
-      auto [task, promise] = td::actor::StartedTask<BlockCandidate>::make_bridge();
-      auto [stats_task, stats_promise] = td::actor::StartedTask<CollationStats>::make_bridge();
+      struct CollatePass {
+        BlockCandidate candidate;
+        CollationStats stats;
+        double elapsed = 0.0;
+      };
+      auto run_collate_pass = [&](td::uint32 workers) -> td::actor::Task<CollatePass> {
+        auto [task, promise] = td::actor::StartedTask<BlockCandidate>::make_bridge();
+        auto [stats_task, stats_promise] = td::actor::StartedTask<CollationStats>::make_bridge();
+        td::Timer timer;
+        run_collate_query(
+            CollateParams{
+                .shard = block_id.shard_full(),
+                .min_masterchain_block_id = min_mc_block_id,
+                .prev = unpacked.prev,
+                .creator = unpacked.creator,
+                .validator_set = validator_set,
+                .collator_opts = clone_collator_options(opts_->get_collator_options(), workers),
+                .utime = (double)unpacked.gen_utime,
+                .hard_timeout = td::Timestamp::in(10.0),
+                .is_replay = true,
+                .in_top_mc_block_id = unpacked.mc_block_id,
+                .in_external_messages = unpacked.ext_msgs,
+                .in_shard_blocks = shard_blocks,
+                .in_rand_seed = unpacked.rand_seed,
+                .exact_tvm_hotpaths = exact_tvm_hotpaths,
+                .store_stats_to = std::move(stats_promise),
+            },
+            manager_, {}, std::move(promise));
+        auto pass_candidate = co_await std::move(task).trace("collate " + block_id.id.to_str());
+        auto elapsed = timer.elapsed();
+        auto pass_stats = co_await std::move(stats_task);
+        co_return CollatePass{std::move(pass_candidate), std::move(pass_stats), elapsed};
+      };
+
       LOG(WARNING) << "Collating block " << block_id.id;
-      td::Timer timer;
-      run_collate_query(
-          CollateParams{
-              .shard = block_id.shard_full(),
-              .min_masterchain_block_id = min_mc_block_id,
-              .prev = unpacked.prev,
-              .creator = unpacked.creator,
-              .validator_set = validator_set,
-              .collator_opts = opts_->get_collator_options(),
-              .utime = (double)unpacked.gen_utime,
-              .hard_timeout = td::Timestamp::in(10.0),
-              .is_replay = true,
-              .in_top_mc_block_id = unpacked.mc_block_id,
-              .in_external_messages = unpacked.ext_msgs,
-              .in_shard_blocks = shard_blocks,
-              .in_rand_seed = unpacked.rand_seed,
-              .exact_tvm_hotpaths = exact_tvm_hotpaths,
-              .store_stats_to = std::move(stats_promise),
-          },
-          manager_, {}, std::move(promise));
-      candidate = co_await std::move(task).trace("collate " + block_id.id.to_str());
-      LOG(WARNING) << "Collating block " << block_id.id << ": done, size=" << candidate.data.size() << "/"
-                   << block->data().size() << ", cdata_size=" << candidate.collated_data.size()
-                   << ", time=" << timer.elapsed();
-      auto stats = co_await std::move(stats_task);
+      std::unique_ptr<CollatePass> selected;
+      double serial_time = 0.0;
+      bool exact_candidate_match = false;
+      if (parallel_account_workers != 0) {
+        std::unique_ptr<CollatePass> serial;
+        std::unique_ptr<CollatePass> parallel;
+        if (parallel_first) {
+          parallel = std::make_unique<CollatePass>(co_await run_collate_pass(parallel_account_workers));
+          serial = std::make_unique<CollatePass>(co_await run_collate_pass(0));
+        } else {
+          serial = std::make_unique<CollatePass>(co_await run_collate_pass(0));
+          parallel = std::make_unique<CollatePass>(co_await run_collate_pass(parallel_account_workers));
+        }
+        serial_time = serial->elapsed;
+        if (serial->candidate.id != parallel->candidate.id ||
+            serial->candidate.collated_file_hash != parallel->candidate.collated_file_hash ||
+            serial->candidate.data.as_slice() != parallel->candidate.data.as_slice() ||
+            serial->candidate.collated_data.as_slice() != parallel->candidate.collated_data.as_slice()) {
+          co_return td::Status::Error(PSTRING() << "serial/parallel candidate mismatch for " << block_id.id);
+        }
+        exact_candidate_match = true;
+        selected = std::move(parallel);
+      } else {
+        selected = std::make_unique<CollatePass>(co_await run_collate_pass(0));
+      }
+      candidate = std::make_unique<BlockCandidate>(std::move(selected->candidate));
+      LOG(WARNING) << "Collating block " << block_id.id << ": done, size=" << candidate->data.size() << "/"
+                   << block->data().size() << ", cdata_size=" << candidate->collated_data.size()
+                   << ", time=" << selected->elapsed;
       result.collate = ProcessBlockResult::Collate{
-          .new_block_size = (double)candidate.data.size(),
-          .new_collated_data_size = (double)candidate.collated_data.size(),
-          .time = timer.elapsed(),
-          .work_time = stats.work_time,
+          .new_block_size = (double)candidate->data.size(),
+          .new_collated_data_size = (double)candidate->collated_data.size(),
+          .time = selected->elapsed,
+          .serial_time = serial_time,
+          .parallel_account_workers = parallel_account_workers,
+          .parallel_first = parallel_first,
+          .exact_candidate_match = exact_candidate_match,
+          .work_time = selected->stats.work_time,
       };
       if (collated_data_output) {
-        CO_TRY(write_new_file(*collated_data_output, candidate.collated_data.as_slice()));
+        CO_TRY(write_new_file(*collated_data_output, candidate->collated_data.as_slice()));
       }
     } else {
       block::gen::ConsensusExtraData::Record rec;
@@ -802,8 +915,8 @@ class ValidationReplayerImpl : public ValidationReplayer {
         roots.push_back(create_collated_data_shard_block_descr(shard_blocks));
       }
       td::BufferSlice collated_data = vm::std_boc_serialize_multi(std::move(roots), 2).ensure().move_as_ok();
-      candidate = BlockCandidate{unpacked.creator, block_id, td::sha256_bits256(collated_data), block->data(),
-                                 collated_data.clone()};
+      candidate = std::make_unique<BlockCandidate>(BlockCandidate{
+          unpacked.creator, block_id, td::sha256_bits256(collated_data), block->data(), collated_data.clone()});
     }
 
     if (mode == ReplayMode::validate || mode == ReplayMode::both) {
@@ -811,7 +924,7 @@ class ValidationReplayerImpl : public ValidationReplayer {
       auto [task, promise] = td::actor::StartedTask<ValidateCandidateResult>::make_bridge();
       auto [stats_task, stats_promise] = td::actor::StartedTask<ValidationStats>::make_bridge();
       td::Timer timer;
-      run_validate_query(std::move(candidate),
+      run_validate_query(std::move(*candidate),
                          ValidateParams{
                              .shard = block_id.shard_full(),
                              .min_masterchain_block_id = min_mc_block_id,

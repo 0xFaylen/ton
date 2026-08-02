@@ -77,6 +77,9 @@ struct CollatorOptions : public td::CntObject {
   bool force_full_collated_data = false;
   // Ignore collated data size limits from block limits and catchain config
   bool ignore_collated_data_limits = false;
+
+  // Replay-only experiment. Live collation rejects non-zero values.
+  td::uint32 replay_parallel_account_workers = 0;
 };
 
 struct CollatorsList : public td::CntObject {
