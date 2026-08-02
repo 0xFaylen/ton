@@ -50,6 +50,15 @@ class TvmHotpathStats {
     unspecified,
   };
 
+  enum class ExecutionKind : td::uint8 {
+    ordinary,
+    tick_tock,
+    other,
+    count,
+  };
+
+  static constexpr std::size_t execution_kind_count = static_cast<std::size_t>(ExecutionKind::count);
+
   struct AccountId {
     WorkchainId workchain = workchainInvalid;
     StdSmcAddress address = StdSmcAddress::zero();
@@ -92,6 +101,7 @@ class TvmHotpathStats {
     td::uint64 vm_steps = 0;
     td::uint64 ed25519_verifications = 0;
     td::RealCpuTimer::Time ed25519_time;
+    std::array<td::uint64, execution_kind_count> execution_kinds{};
     td::uint64 account_bitmap = 0;
     std::array<AccountEntry, max_accounts_per_code> accounts;
     std::size_t accounts_size = 0;
@@ -100,6 +110,10 @@ class TvmHotpathStats {
 
     bool accounts_estimate_saturated() const {
       return account_bitmap == ~td::uint64{0};
+    }
+
+    td::uint64 execution_count(ExecutionKind kind) const {
+      return execution_kinds[static_cast<std::size_t>(kind)];
     }
 
     td::uint64 estimated_distinct_accounts() const {
@@ -273,8 +287,10 @@ class TvmHotpathStats {
 
   void record(const td::Bits256& code_hash, WorkchainId workchain, const StdSmcAddress& account,
               td::RealCpuTimer::Time time, td::uint64 vm_gas_used, td::uint64 billed_gas_used, td::uint64 vm_steps,
-              td::uint64 ed25519_verifications = 0, td::RealCpuTimer::Time ed25519_time = {}) {
+              td::uint64 ed25519_verifications = 0, td::RealCpuTimer::Time ed25519_time = {},
+              ExecutionKind execution_kind = ExecutionKind::ordinary) {
     ++total_executions_;
+    ++total_execution_kinds_[static_cast<std::size_t>(execution_kind)];
     total_time_ += time;
     total_vm_gas_used_ += vm_gas_used;
     total_billed_gas_used_ += billed_gas_used;
@@ -292,6 +308,7 @@ class TvmHotpathStats {
     entry.vm_steps = vm_steps;
     entry.ed25519_verifications = ed25519_verifications;
     entry.ed25519_time = ed25519_time;
+    entry.execution_kinds[static_cast<std::size_t>(execution_kind)] = 1;
     entry.add_account(workchain, account, 1, 0, exact_);
     add_entry(std::move(entry));
   }
@@ -314,6 +331,9 @@ class TvmHotpathStats {
 
   void merge(const TvmHotpathStats& other) {
     total_executions_ += other.total_executions_;
+    for (std::size_t i = 0; i < execution_kind_count; ++i) {
+      total_execution_kinds_[i] += other.total_execution_kinds_[i];
+    }
     total_time_ += other.total_time_;
     total_vm_gas_used_ += other.total_vm_gas_used_;
     total_billed_gas_used_ += other.total_billed_gas_used_;
@@ -343,7 +363,11 @@ class TvmHotpathStats {
 
   void scale(double factor) {
     total_time_ *= factor;
-    total_executions_ = scale_u64(total_executions_, factor);
+    total_executions_ = 0;
+    for (auto& executions : total_execution_kinds_) {
+      executions = scale_u64(executions, factor);
+      total_executions_ += executions;
+    }
     total_vm_gas_used_ = scale_u64(total_vm_gas_used_, factor);
     total_billed_gas_used_ = scale_u64(total_billed_gas_used_, factor);
     total_vm_steps_ = scale_u64(total_vm_steps_, factor);
@@ -354,7 +378,11 @@ class TvmHotpathStats {
       entry.observed_time *= factor;
       entry.estimated_wall *= factor;
       entry.wall_error *= factor;
-      entry.executions = scale_u64(entry.executions, factor);
+      entry.executions = 0;
+      for (auto& executions : entry.execution_kinds) {
+        executions = scale_u64(executions, factor);
+        entry.executions += executions;
+      }
       entry.vm_gas_used = scale_u64(entry.vm_gas_used, factor);
       entry.billed_gas_used = scale_u64(entry.billed_gas_used, factor);
       entry.vm_steps = scale_u64(entry.vm_steps, factor);
@@ -391,8 +419,10 @@ class TvmHotpathStats {
     for (const auto& entry : entries_) {
       observed += entry.observed_time.get(is_cpu);
     }
-    out << "{exec=" << total_executions_ << " " << (is_cpu ? "cpu" : "wall") << "_s=" << total
-        << " vm_gas=" << total_vm_gas_used_ << " billed_gas=" << total_billed_gas_used_
+    out << "{exec=" << total_executions_ << " ordinary=" << total_execution_count(ExecutionKind::ordinary)
+        << " tick_tock=" << total_execution_count(ExecutionKind::tick_tock)
+        << " other=" << total_execution_count(ExecutionKind::other) << " " << (is_cpu ? "cpu" : "wall")
+        << "_s=" << total << " vm_gas=" << total_vm_gas_used_ << " billed_gas=" << total_billed_gas_used_
         << " vm_steps=" << total_vm_steps_ << " ed25519_verifications=" << total_ed25519_verifications_
         << " ed25519_s=" << total_ed25519_time_.get(is_cpu)
         << " retained_coverage=" << (total > 0.0 ? observed / total : 1.0) << " capacity=";
@@ -412,12 +442,14 @@ class TvmHotpathStats {
       first = false;
       const auto top1 = entry.top_account_share(1);
       const auto top10 = entry.top_account_share(max_accounts_per_code);
-      out << "{code_hash=" << entry.code_hash.to_hex() << " exec=" << entry.executions << " "
-          << (is_cpu ? "cpu" : "wall") << "_s=" << entry.observed_time.get(is_cpu)
-          << " wall_rank_estimate_s=" << entry.estimated_wall << " wall_rank_error_s=" << entry.wall_error
-          << " vm_gas=" << entry.vm_gas_used << " billed_gas=" << entry.billed_gas_used
-          << " vm_steps=" << entry.vm_steps << " ed25519_verifications=" << entry.ed25519_verifications
-          << " ed25519_s=" << entry.ed25519_time.get(is_cpu)
+      out << "{code_hash=" << entry.code_hash.to_hex() << " exec=" << entry.executions
+          << " ordinary=" << entry.execution_count(ExecutionKind::ordinary)
+          << " tick_tock=" << entry.execution_count(ExecutionKind::tick_tock)
+          << " other=" << entry.execution_count(ExecutionKind::other) << " " << (is_cpu ? "cpu" : "wall")
+          << "_s=" << entry.observed_time.get(is_cpu) << " wall_rank_estimate_s=" << entry.estimated_wall
+          << " wall_rank_error_s=" << entry.wall_error << " vm_gas=" << entry.vm_gas_used
+          << " billed_gas=" << entry.billed_gas_used << " vm_steps=" << entry.vm_steps
+          << " ed25519_verifications=" << entry.ed25519_verifications << " ed25519_s=" << entry.ed25519_time.get(is_cpu)
           << " distinct_accounts_est=" << entry.estimated_distinct_accounts()
           << (entry.accounts_estimate_saturated() ? "+" : "") << " top1_share=[" << top1.first << "," << top1.second
           << "] top10_share=[" << top10.first << "," << top10.second
@@ -440,6 +472,9 @@ class TvmHotpathStats {
     out << "{\"exact\":" << exact_ << ",\"exact_complete\":" << (exact_ && exact_complete_) << ",\"metric\":\""
         << (is_cpu ? "cpu" : "wall") << "\",\"total_entries\":" << ordered.size() << ",\"offset\":" << begin
         << ",\"returned\":" << end - begin << ",\"total_executions\":" << total_executions_
+        << ",\"total_execution_kinds\":{\"ordinary\":" << total_execution_count(ExecutionKind::ordinary)
+        << ",\"tick_tock\":" << total_execution_count(ExecutionKind::tick_tock)
+        << ",\"other\":" << total_execution_count(ExecutionKind::other) << "}"
         << ",\"total_seconds\":" << total << ",\"retained_coverage\":" << (total > 0.0 ? observed / total : 1.0)
         << ",\"total_vm_gas\":" << total_vm_gas_used_ << ",\"total_billed_gas\":" << total_billed_gas_used_
         << ",\"total_vm_steps\":" << total_vm_steps_
@@ -457,6 +492,9 @@ class TvmHotpathStats {
       const auto top1 = entry.top_account_share(1);
       const auto top10 = entry.top_account_share(max_accounts_per_code);
       out << "{\"code_hash\":\"" << entry.code_hash.to_hex() << "\",\"executions\":" << entry.executions
+          << ",\"execution_kinds\":{\"ordinary\":" << entry.execution_count(ExecutionKind::ordinary)
+          << ",\"tick_tock\":" << entry.execution_count(ExecutionKind::tick_tock)
+          << ",\"other\":" << entry.execution_count(ExecutionKind::other) << "}"
           << ",\"seconds\":" << entry.observed_time.get(is_cpu)
           << ",\"wall_rank_estimate_seconds\":" << entry.estimated_wall
           << ",\"wall_rank_error_seconds\":" << entry.wall_error << ",\"vm_gas\":" << entry.vm_gas_used
@@ -498,6 +536,10 @@ class TvmHotpathStats {
 
   td::uint64 total_executions() const {
     return total_executions_;
+  }
+
+  td::uint64 total_execution_count(ExecutionKind kind) const {
+    return total_execution_kinds_[static_cast<std::size_t>(kind)];
   }
 
   td::RealCpuTimer::Time total_time() const {
@@ -583,6 +625,9 @@ class TvmHotpathStats {
     entry.vm_steps += incoming.vm_steps;
     entry.ed25519_verifications += incoming.ed25519_verifications;
     entry.ed25519_time += incoming.ed25519_time;
+    for (std::size_t i = 0; i < execution_kind_count; ++i) {
+      entry.execution_kinds[i] += incoming.execution_kinds[i];
+    }
     entry.merge_accounts(incoming, exact_);
   }
 
@@ -595,6 +640,7 @@ class TvmHotpathStats {
   bool account_work_complete_ = true;
   td::uint64 replacements_ = 0;
   td::uint64 total_executions_ = 0;
+  std::array<td::uint64, execution_kind_count> total_execution_kinds_{};
   td::RealCpuTimer::Time total_time_;
   td::uint64 total_vm_gas_used_ = 0;
   td::uint64 total_billed_gas_used_ = 0;

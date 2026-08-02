@@ -6025,9 +6025,14 @@ bool ValidateQuery::CheckAccountTxs::check_one_transaction(block::Account& accou
     ctx_.work_time.check_transactions_other -= elapsed;
     if (trs->tvm_executed) {
       td::RealCpuTimer profile_timer;
-      ctx_.work_time.tvm_hotpath.record(trs->tvm_code_hash, trs->account.workchain, trs->account.addr, trs->time_tvm,
-                                        trs->tvm_gas_used, trs->gas_used(), trs->tvm_steps,
-                                        trs->tvm_ed25519_verifications, trs->time_tvm_ed25519);
+      ctx_.work_time.tvm_hotpath.record(
+          trs->tvm_code_hash, trs->account.workchain, trs->account.addr, trs->time_tvm, trs->tvm_gas_used,
+          trs->gas_used(), trs->tvm_steps, trs->tvm_ed25519_verifications, trs->time_tvm_ed25519,
+          trans_type == block::transaction::Transaction::tr_tick ||
+                  trans_type == block::transaction::Transaction::tr_tock
+              ? TvmHotpathStats::ExecutionKind::tick_tock
+          : trans_type == block::transaction::Transaction::tr_ord ? TvmHotpathStats::ExecutionKind::ordinary
+                                                                  : TvmHotpathStats::ExecutionKind::other);
       auto profile_elapsed = profile_timer.elapsed_both();
       ctx_.work_time.trx_tvm_profile += trs->time_tvm_profile + profile_elapsed;
       ctx_.work_time.check_transactions_other -= profile_elapsed;

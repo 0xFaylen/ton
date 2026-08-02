@@ -159,6 +159,32 @@ struct ShadowCoordinatorCandidate {
   Ref<vm::Cell> pre_account_state;
 };
 
+struct TransactionKindCounts {
+  std::size_t ordinary{0};
+  std::size_t tick{0};
+  std::size_t tock{0};
+  std::size_t storage{0};
+  std::size_t split_prepare{0};
+  std::size_t split_install{0};
+  std::size_t merge_prepare{0};
+  std::size_t merge_install{0};
+
+  void add(const TransactionKindCounts& other) {
+    ordinary += other.ordinary;
+    tick += other.tick;
+    tock += other.tock;
+    storage += other.storage;
+    split_prepare += other.split_prepare;
+    split_install += other.split_install;
+    merge_prepare += other.merge_prepare;
+    merge_install += other.merge_install;
+  }
+
+  std::size_t total() const {
+    return ordinary + tick + tock + storage + split_prepare + split_install + merge_prepare + merge_install;
+  }
+};
+
 struct ReplayResult {
   struct LimitTriplet {
     td::uint32 underload = 0;
@@ -179,6 +205,7 @@ struct ReplayResult {
   std::size_t skipped_accounts = 0;
   std::size_t transactions = 0;
   std::size_t tvm_transactions = 0;
+  TransactionKindCounts transaction_kinds;
   std::size_t canonical_payloads_validated = 0;
   std::size_t canonical_payload_out_messages = 0;
   std::size_t canonical_outbound_registrations = 0;
@@ -256,9 +283,13 @@ struct BlockWorkloadSummary {
   std::size_t distinct_accounts{0};
   std::size_t raw_transactions{0};
   std::size_t max_account_transactions{0};
+  TransactionKindCounts transaction_kinds;
 };
 
 td::Result<BlockWorkloadSummary> summarize_account_blocks(const BlockContext& block_context);
+td::Result<TvmHotpathStats::ExecutionKind> classify_and_count_transaction(Ref<vm::Cell> transaction,
+                                                                          TransactionKindCounts& counts);
+std::string transaction_kinds_json(const TransactionKindCounts& counts);
 
 td::Status write_new_file(td::CSlice path, td::Slice data) {
   TRY_RESULT(file, td::FileFd::open(path, td::FileFd::Write | td::FileFd::CreateNew, 0600));
@@ -346,6 +377,15 @@ td::Result<LoadedBlock> load_unanchored_block_boc(const std::string& path) {
   return LoadedBlock{derived_id, std::move(root), data.size()};
 }
 
+td::Result<std::string> derive_block_boc_id_json(const std::string& path) {
+  TRY_RESULT(block, load_unanchored_block_boc(path));
+  td::StringBuilder out;
+  out << "{\"schema_version\":1,\"mode\":\"derive_block_boc_id\",\"block_id\":\"" << block.id.to_str()
+      << "\",\"file_bytes\":" << block.file_bytes
+      << ",\"anchored\":false,\"warning\":\"self_derived_identity_not_an_external_trust_anchor\"}";
+  return out.as_cslice().str();
+}
+
 td::Result<std::string> export_block_boc(const std::string& archive, const BlockId& requested_id,
                                          const std::string& output_path) {
   TRY_RESULT(file, load_block_file_from_archive(archive, requested_id));
@@ -416,10 +456,12 @@ td::Result<std::string> list_archive_blocks(const std::string& archive) {
   std::size_t nonempty_blocks = 0;
   std::size_t total_file_bytes = 0;
   std::size_t total_raw_transactions = 0;
+  TransactionKindCounts total_transaction_kinds;
   for (const auto& block : blocks) {
     nonempty_blocks += block.workload.raw_transactions != 0;
     total_file_bytes += block.file_bytes;
     total_raw_transactions += block.workload.raw_transactions;
+    total_transaction_kinds.add(block.workload.transaction_kinds);
   }
   struct SizeFit {
     std::size_t samples{0};
@@ -488,7 +530,9 @@ td::Result<std::string> list_archive_blocks(const std::string& archive) {
   td::StringBuilder out;
   out << "{\"schema_version\":1,\"mode\":\"archive_block_list\",\"block_count\":" << blocks.size()
       << ",\"nonempty_block_count\":" << nonempty_blocks << ",\"total_file_bytes\":" << total_file_bytes
-      << ",\"total_raw_transactions\":" << total_raw_transactions << ",\"aggregate_bytes_per_raw_transaction\":";
+      << ",\"total_raw_transactions\":" << total_raw_transactions
+      << ",\"transaction_kinds\":" << transaction_kinds_json(total_transaction_kinds)
+      << ",\"aggregate_bytes_per_raw_transaction\":";
   if (total_raw_transactions == 0) {
     out << "null";
   } else {
@@ -511,6 +555,7 @@ td::Result<std::string> list_archive_blocks(const std::string& archive) {
         << ",\"masterchain_ref\":\"" << blocks[i].masterchain_ref.to_str() << "\",\"gen_utime\":" << blocks[i].gen_utime
         << ",\"distinct_accounts\":" << blocks[i].workload.distinct_accounts
         << ",\"raw_transactions\":" << blocks[i].workload.raw_transactions
+        << ",\"transaction_kinds\":" << transaction_kinds_json(blocks[i].workload.transaction_kinds)
         << ",\"max_account_transactions\":" << blocks[i].workload.max_account_transactions
         << ",\"bytes_per_raw_transaction\":";
     if (blocks[i].workload.raw_transactions == 0) {
@@ -587,6 +632,61 @@ td::Result<BlockContext> load_intermediate_block(const std::string& archive, con
   return it->second;
 }
 
+td::Result<TvmHotpathStats::ExecutionKind> classify_and_count_transaction(Ref<vm::Cell> transaction,
+                                                                          TransactionKindCounts& counts) {
+  if (transaction.is_null()) {
+    return td::Status::Error("cannot classify a null transaction");
+  }
+  block::gen::Transaction::Record record;
+  if (!tlb::unpack_cell(transaction, record)) {
+    return td::Status::Error("cannot unpack transaction while classifying its kind");
+  }
+  const auto tag = block::gen::t_TransactionDescr.get_tag(vm::load_cell_slice(record.description));
+  switch (tag) {
+    case block::gen::TransactionDescr::trans_ord:
+      ++counts.ordinary;
+      return TvmHotpathStats::ExecutionKind::ordinary;
+    case block::gen::TransactionDescr::trans_tick_tock: {
+      block::gen::TransactionDescr::Record_trans_tick_tock tick_tock;
+      if (!tlb::unpack_cell(record.description, tick_tock)) {
+        return td::Status::Error("cannot unpack tick-tock transaction description while classifying its kind");
+      }
+      if (tick_tock.is_tock) {
+        ++counts.tock;
+      } else {
+        ++counts.tick;
+      }
+      return TvmHotpathStats::ExecutionKind::tick_tock;
+    }
+    case block::gen::TransactionDescr::trans_storage:
+      ++counts.storage;
+      return TvmHotpathStats::ExecutionKind::other;
+    case block::gen::TransactionDescr::trans_split_prepare:
+      ++counts.split_prepare;
+      return TvmHotpathStats::ExecutionKind::other;
+    case block::gen::TransactionDescr::trans_split_install:
+      ++counts.split_install;
+      return TvmHotpathStats::ExecutionKind::other;
+    case block::gen::TransactionDescr::trans_merge_prepare:
+      ++counts.merge_prepare;
+      return TvmHotpathStats::ExecutionKind::other;
+    case block::gen::TransactionDescr::trans_merge_install:
+      ++counts.merge_install;
+      return TvmHotpathStats::ExecutionKind::other;
+    default:
+      return td::Status::Error("unknown transaction description tag while classifying its kind");
+  }
+}
+
+std::string transaction_kinds_json(const TransactionKindCounts& counts) {
+  td::StringBuilder out;
+  out << "{\"total\":" << counts.total() << ",\"ordinary\":" << counts.ordinary << ",\"tick\":" << counts.tick
+      << ",\"tock\":" << counts.tock << ",\"storage\":" << counts.storage
+      << ",\"split_prepare\":" << counts.split_prepare << ",\"split_install\":" << counts.split_install
+      << ",\"merge_prepare\":" << counts.merge_prepare << ",\"merge_install\":" << counts.merge_install << "}";
+  return out.as_cslice().str();
+}
+
 td::Result<BlockWorkloadSummary> summarize_account_blocks(const BlockContext& block_context) {
   vm::AugmentedDictionary account_blocks{vm::load_cell_slice_ref(block_context.account_blocks), 256,
                                          block::tlb::aug_ShardAccountBlocks};
@@ -610,8 +710,14 @@ td::Result<BlockWorkloadSummary> summarize_account_blocks(const BlockContext& bl
                                              block::tlb::aug_AccountTransactions};
         const bool transactions_ok = transactions.check_for_each_extra(
             [&](Ref<vm::CellSlice> transaction_slice, Ref<vm::CellSlice>, td::ConstBitPtr, int tx_key_len) {
-              if (tx_key_len != 64 || transaction_slice->prefetch_ref().is_null()) {
+              auto transaction = transaction_slice->prefetch_ref();
+              if (tx_key_len != 64 || transaction.is_null()) {
                 scan_status = td::Status::Error("invalid transaction entry in AccountBlock");
+                return false;
+              }
+              auto kind = classify_and_count_transaction(std::move(transaction), result.transaction_kinds);
+              if (kind.is_error()) {
+                scan_status = kind.move_as_error();
                 return false;
               }
               ++account_transactions;
@@ -633,6 +739,9 @@ td::Result<BlockWorkloadSummary> summarize_account_blocks(const BlockContext& bl
       scan_status = td::Status::Error("cannot scan AccountBlocks dictionary");
     }
     return scan_status;
+  }
+  if (result.transaction_kinds.total() != result.raw_transactions) {
+    return td::Status::Error("transaction kind counts do not cover the complete block workload");
   }
   return result;
 }
@@ -1418,6 +1527,14 @@ td::Result<ReplayResult> replay_transactions(
             replay_status = td::Status::Error("transaction dictionary contains a null transaction");
             return false;
           }
+          TransactionKindCounts transaction_kind;
+          auto classified_kind = classify_and_count_transaction(transaction, transaction_kind);
+          if (classified_kind.is_error()) {
+            replay_status = classified_kind.move_as_error_prefix(PSTRING() << "transaction " << tx_key.get_uint(64)
+                                                                           << " of " << address.to_hex() << ": ");
+            return false;
+          }
+          const auto execution_kind = classified_kind.move_as_ok();
           auto required = required_libraries(account, transaction);
           if (required.is_error()) {
             replay_status = required.move_as_error_prefix(PSTRING() << "transaction " << tx_key.get_uint(64) << " of "
@@ -1595,6 +1712,7 @@ td::Result<ReplayResult> replay_transactions(
           }
           first_account_transaction = false;
           ++result.transactions;
+          result.transaction_kinds.add(transaction_kind);
           auto& account_work = result.account_work[address];
           ++account_work.transactions;
           account_work.transaction_seconds += emulated.elapsed_time;
@@ -1603,7 +1721,7 @@ td::Result<ReplayResult> replay_transactions(
             account_work.tvm_seconds += emulated.vm.time.real;
             result.hotpaths.record(emulated.vm.code_hash, target.id.id.workchain, address, emulated.vm.time,
                                    emulated.vm.vm_gas_used, emulated.vm.billed_gas_used, emulated.vm.vm_steps,
-                                   emulated.vm.ed25519_verifications, emulated.vm.ed25519_time);
+                                   emulated.vm.ed25519_verifications, emulated.vm.ed25519_time, execution_kind);
           }
           account = std::move(emulated.account);
           return true;
@@ -1638,6 +1756,9 @@ td::Result<ReplayResult> replay_transactions(
   if (!missing_libraries.empty()) {
     return td::Status::Error(PSTRING() << "replay requires public library bodies absent from --library-bodies: "
                                        << join_library_hashes(missing_libraries));
+  }
+  if (result.transaction_kinds.total() != result.transactions) {
+    return td::Status::Error("transaction kind counts do not cover the complete replay scope");
   }
   auto phase_elapsed = replay_timer.elapsed();
   result.phase_account_replay_seconds = phase_elapsed - phase_checkpoint;
@@ -2212,6 +2333,7 @@ td::Result<std::string> inspect_json(const BlockContext& target, int split_depth
       << ",\"before_split\":" << target.before_split << ",\"file_bytes\":" << target.file_bytes
       << ",\"distinct_accounts\":" << workload.distinct_accounts
       << ",\"raw_transactions\":" << workload.raw_transactions
+      << ",\"transaction_kinds\":" << transaction_kinds_json(workload.transaction_kinds)
       << ",\"max_account_transactions\":" << workload.max_account_transactions << ",\"predecessors\":[";
   for (std::size_t i = 0; i < target.prev.size(); ++i) {
     if (i != 0) {
@@ -2331,6 +2453,7 @@ std::string single_shard_capacity_json(const BlockContext& target, const ReplayR
       << ",\"hard\":" << replay.block_limit_collated_bytes.hard << "}}"
       << ",\"sample\":{\"scope\":\"" << (full_block ? "full_block" : "account_subset")
       << "\",\"block_file_bytes\":" << target.file_bytes << ",\"raw_transactions\":" << replay.transactions
+      << ",\"transaction_kinds\":" << transaction_kinds_json(replay.transaction_kinds)
       << ",\"distinct_accounts\":" << replay.accounts << ",\"billed_gas_sum\":" << replay.basechain_limit_gas
       << ",\"bytes_per_raw_transaction\":";
   if (full_block && replay.transactions > 0) {
@@ -2417,6 +2540,7 @@ std::string replay_json(const BlockContext& target, const LoadedState* account_s
                                        : "account_subset")
       << "\",\"target_accounts\":" << replay.target_accounts << ",\"accounts\":" << replay.accounts
       << ",\"skipped_accounts\":" << replay.skipped_accounts << ",\"transactions\":" << replay.transactions
+      << ",\"transaction_kinds\":" << transaction_kinds_json(replay.transaction_kinds)
       << ",\"tvm_transactions\":" << replay.tvm_transactions << ",\"ed25519_profiled\":" << profile_ed25519
       << ",\"equivalence\":\"transaction_hash_and_account_state_hash\""
       << ",\"psae_payload_validation\":{\"canonical_payloads\":" << replay.canonical_payloads_validated
@@ -2648,6 +2772,7 @@ int main(int argc, char** argv) {
   SET_VERBOSITY_LEVEL(verbosity_ERROR);
   std::string archive;
   std::string block_boc;
+  std::string derive_block_boc_id_path;
   std::string export_block_boc_path;
   std::string mc_archive;
   std::string block_id;
@@ -2672,6 +2797,9 @@ int main(int argc, char** argv) {
   options.add_option('a', "archive", "closed archive .pack file", [&](td::Slice value) { archive = value.str(); });
   options.add_option(0, "block-boc", "raw block BOC; requires a full --block-id and predecessor-bound proofs",
                      [&](td::Slice value) { block_boc = value.str(); });
+  options.add_option(0, "derive-block-boc-id",
+                     "derive a block id from one BOC for diagnostics; the result is not an external trust anchor",
+                     [&](td::Slice value) { derive_block_boc_id_path = value.str(); });
   options.add_option(0, "history-block-boc",
                      "intermediate raw block BOC linking an older account proof to the predecessor; may be repeated",
                      [&](td::Slice value) { history_block_bocs.push_back(value.str()); });
@@ -2736,7 +2864,13 @@ int main(int argc, char** argv) {
                                  !collated_data.empty() || !library_bodies.empty() || !account_parts.empty() ||
                                  !account_proofs.empty() || !history_block_bocs.empty() || profile_ed25519 ||
                                  account_workers != 0;
-  if (!inspect_state.empty()) {
+  if (!derive_block_boc_id_path.empty()) {
+    if (!archive.empty() || !block_boc.empty() || !export_block_boc_path.empty() || !block_id.empty() ||
+        !inspect_state.empty() || list_blocks || inspect || split_depth != 4 || has_replay_inputs) {
+      std::cerr << "Error: --derive-block-boc-id cannot be combined with other modes or options\n";
+      return 1;
+    }
+  } else if (!inspect_state.empty()) {
     if (!archive.empty() || !block_boc.empty() || !export_block_boc_path.empty() || !block_id.empty() || list_blocks ||
         inspect || split_depth != 4 || has_replay_inputs) {
       std::cerr << "Error: --inspect-state cannot be combined with block-source, replay, or block-inspection options\n";
@@ -2782,7 +2916,9 @@ int main(int argc, char** argv) {
 
   try {
     td::Result<std::string> result = td::Status::Error("uninitialized mode");
-    if (list_blocks) {
+    if (!derive_block_boc_id_path.empty()) {
+      result = derive_block_boc_id_json(derive_block_boc_id_path);
+    } else if (list_blocks) {
       result = list_archive_blocks(archive);
     } else if (!export_block_boc_path.empty()) {
       auto requested_id = BlockId::from_str(block_id);

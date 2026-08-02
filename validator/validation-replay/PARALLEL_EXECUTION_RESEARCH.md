@@ -403,9 +403,11 @@ and all 138 resulting account-state hashes across 108/108 accounts. It validated
 134 TVM executions, 19,226 VM steps, 791,308 billed gas and 30 Ed25519 checks.
 The isolated account probe measured 166.568 ms serial and 46.424 ms with four
 workers, a 3.588x wall speedup, with the 108 accounts distributed 26/28/27/27.
-This is one process sample and includes thread creation plus deliberately
-duplicated per-lane setup; it excludes live Collator integration, reusable actor
-workers, augmented-root commit, ValidateQuery, network and consensus.
+A later independent process passed the same exact equivalence gate and measured
+2.981x. The spread confirms that one-shot timings are not a stable performance
+result. Both samples include thread creation plus deliberately duplicated
+per-lane setup; they exclude live Collator integration, reusable actor workers,
+augmented-root commit, ValidateQuery, network and consensus.
 
 The target is only 17.88% of the 2 MiB serialized candidate cap. Its linear
 byte-envelope projection is 1,930 raw tx/s at the 400 ms configured target rate;
@@ -415,6 +417,44 @@ a mixed, unsaturated workload. `mainnet_sustainable_raw_tps` therefore remains
 replay reconstructs the two descriptor roots. Matching historical collated data
 is still required for the ShardAccounts and OutMsgQueue transition roots; the
 result correctly reports two validated roots rather than four.
+
+## Tick/tock isolation gate - 2026-08-02
+
+Source inspection confirms that `ValidateQuery` rejects tick/tock outside the
+masterchain. The collator creates masterchain ticks before ordinary processing
+and tocks after it, and accounts for them without user gas in its block-limit
+update. They are deterministic system work on the masterchain, not basechain
+user transactions and not independent account lanes for the single-shard
+executor.
+
+Hot-path telemetry now labels every TVM execution as `ordinary`, `tick_tock`, or
+`other` in both the total and per-code-hash counters. Historical BOC inspection
+separately classifies ordinary, tick, tock, storage, split, and merge transaction
+descriptions. The classifier fails closed on malformed or unknown descriptions,
+and the sum must equal the raw transaction count. This prevents permanent
+masterchain system work from selecting an ordinary-contract JIT target or from
+being reported as basechain workload.
+
+The fresh basechain fixture `88028077` contains 138 ordinary transactions, zero
+tick/tock transactions, and 134 ordinary TVM executions. A separate bounded
+read-only collection of 16 consecutive masterchain blocks
+`83536320..83536335` contains exactly 48 transactions: every block has one
+ordinary transaction, one tick, and one tock. The files total 162,945 bytes.
+This measured window supports treating two tick/tock transactions per
+masterchain block as a stable serial residue; it does not prove a longer-term
+frequency distribution.
+
+Collection used block lookups and downloads only. The node remained active with
+zero restarts, `/var` at 37%, and no configuration or database mutation. The
+locally configured external lite-server endpoint subsequently refused a new
+connection while the node's internal service remained healthy; already copied
+BOCs were therefore classified offline. A diagnostic self-derived block id is
+explicitly unanchored, while normal inspection and replay still require the
+independently obtained full id.
+
+The executor design consequence is narrow: tick/tock remains in the serial
+masterchain floor. It does not lower the measured basechain account-lane ceiling
+and cannot be used to claim a higher or lower sustainable basechain TPS.
 
 ## Dead ends and cautions
 

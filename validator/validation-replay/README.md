@@ -40,6 +40,10 @@ VM steps, Ed25519 verification count and time, exact distinct-account count,
 top-account concentration, and the ten most active workchain-and-address pairs
 for each returned code hash. Ed25519 timing is enabled only by exact offline
 replay; normal collation and validation do not start the inner crypto timer.
+Both the response total and every retained code hash also split executions into
+`ordinary`, `tick_tock`, and `other`. Tick/tock is masterchain system work and
+must not be mixed into basechain capacity or ordinary-contract JIT target
+selection.
 
 For a full-wall PSAE shadow projection, replay collation on a dedicated copied
 validator database:
@@ -122,9 +126,10 @@ ordinary-least-squares diagnostics for all blocks, non-empty blocks, and blocks
 with at least 40 transactions. These values describe finalized block BOCs; they
 are not `BlockLimitStatus` estimates or a sustainable-TPS measurement. The
 inspection output reports the block file size, LT interval, account/transaction
-counts and `recommended_account_proof_reference`. For a linear block the latter
-is the exact predecessor shard block, which avoids advancing older account
-proofs through intermediate blocks.
+counts, a fail-closed `transaction_kinds` split, and
+`recommended_account_proof_reference`. For a linear block the latter is the
+exact predecessor shard block, which avoids advancing older account proofs
+through intermediate blocks.
 
 For every account covered by the supplied state, the tool re-executes the
 historical transaction chain and requires both the serialized transaction hash
@@ -268,9 +273,12 @@ a representative saturated multi-block corpus have all passed.
 A fresh exact-predecessor raw-BOC replay of basechain block `88028077` covers
 138 transactions across all 108 touched accounts. Its 374,873-byte BOC occupies
 17.88% of the 2 MiB candidate cap. All historical transaction and resulting
-account-state hashes match. One Release process measured 166.6 ms for the
-isolated serial account replay and 46.4 ms with four workers, or 3.59x. This is
-an isolated-account replay result, not block collation or shard TPS. The same
+account-state hashes match. Its transaction-kind split is `138 ordinary, 0
+tick, 0 tock`; the 134 TVM executions are also all ordinary. One Release process
+measured 166.6 ms for the isolated serial account replay and 46.4 ms with four
+workers, or 3.59x. A later independent process passed the same equivalence gate
+but measured 2.98x, so neither one-shot speedup is treated as stable. These are
+isolated-account replay results, not block collation or shard TPS. The same
 sample gives a 1,930 raw tx/s linear byte-envelope projection, but remains far
 from saturation and keeps `mainnet_sustainable_raw_tps=null`. Without matching
 historical collated data it validates the two descriptor roots, not the complete
@@ -317,6 +325,12 @@ tvm-replay-bundle \
 the SHA-256 file hash and the BOC root hash, and creates an owner-only output
 file without overwriting an existing path. `--block-boc` repeats both hash
 checks before parsing the block.
+
+For diagnostics on an already copied BOC, `--derive-block-boc-id <path>` derives
+the header identity and both local hashes. Its JSON is deliberately labelled
+`anchored=false`; pass an independently obtained full id to `--block-boc` for
+inspection or replay. The diagnostic mode cannot be combined with replay and
+does not weaken the externally anchored replay path.
 
 An account proof may be older than the target predecessor. In raw-BOC mode,
 repeat `--history-block-boc <path>` for every intervening block. The replayer

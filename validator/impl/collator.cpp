@@ -3265,7 +3265,8 @@ bool Collator::create_ticktock_transaction(const ton::StdSmcAddress& smc_addr, t
       td::RealCpuTimer profile_timer;
       stats_.work_time.tvm_hotpath.record(trans->tvm_code_hash, trans->account.workchain, trans->account.addr,
                                           trans->time_tvm, trans->tvm_gas_used, trans->gas_used(), trans->tvm_steps,
-                                          trans->tvm_ed25519_verifications, trans->time_tvm_ed25519);
+                                          trans->tvm_ed25519_verifications, trans->time_tvm_ed25519,
+                                          TvmHotpathStats::ExecutionKind::tick_tock);
       stats_.work_time.trx_tvm_profile += trans->time_tvm_profile + profile_timer.elapsed_both();
     }
   };
@@ -3466,7 +3467,8 @@ td::Result<std::unique_ptr<block::transaction::Transaction>> Collator::impl_crea
           td::RealCpuTimer profile_timer;
           stats->work_time.tvm_hotpath.record(trans->tvm_code_hash, trans->account.workchain, trans->account.addr,
                                               trans->time_tvm, trans->tvm_gas_used, trans->gas_used(), trans->tvm_steps,
-                                              trans->tvm_ed25519_verifications, trans->time_tvm_ed25519);
+                                              trans->tvm_ed25519_verifications, trans->time_tvm_ed25519,
+                                              TvmHotpathStats::ExecutionKind::ordinary);
           stats->work_time.trx_tvm_profile += trans->time_tvm_profile + profile_timer.elapsed_both();
         }
         if (transaction_ready) {

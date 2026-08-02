@@ -255,6 +255,37 @@ TEST(TvmHotpathStats, AggregatesAndExportsEd25519Timing) {
   ASSERT_TRUE(json.find("\"ed25519_share_of_tvm\":0.3") != std::string::npos);
 }
 
+TEST(TvmHotpathStats, SeparatesOrdinaryTickTockAndOtherExecutions) {
+  using Kind = TvmHotpathStats::ExecutionKind;
+  TvmHotpathStats first;
+  TvmHotpathStats second;
+  first.enable_exact();
+  second.enable_exact();
+  const auto code_hash = make_hash(1);
+  const auto account = make_hash(2);
+  for (std::size_t i = 0; i < 2; ++i) {
+    first.record(code_hash, basechainId, account, make_time(0.1, 0.08), 10, 10, 1, 0, {}, Kind::ordinary);
+    second.record(code_hash, masterchainId, account, make_time(0.2, 0.16), 20, 20, 2, 0, {}, Kind::tick_tock);
+    second.record(code_hash, masterchainId, account, make_time(0.3, 0.24), 30, 30, 3, 0, {}, Kind::other);
+  }
+
+  first.merge(second);
+  first.scale(0.5);
+
+  ASSERT_EQ(first.total_executions(), 3u);
+  ASSERT_EQ(first.total_execution_count(Kind::ordinary), 1u);
+  ASSERT_EQ(first.total_execution_count(Kind::tick_tock), 1u);
+  ASSERT_EQ(first.total_execution_count(Kind::other), 1u);
+  const auto entry = first.entries_by_wall(1)[0];
+  ASSERT_EQ(entry.executions, 3u);
+  ASSERT_EQ(entry.execution_count(Kind::ordinary), 1u);
+  ASSERT_EQ(entry.execution_count(Kind::tick_tock), 1u);
+  ASSERT_EQ(entry.execution_count(Kind::other), 1u);
+  const auto json = first.to_json(false);
+  ASSERT_TRUE(json.find("\"total_execution_kinds\":{\"ordinary\":1,\"tick_tock\":1,\"other\":1}") != std::string::npos);
+  ASSERT_TRUE(json.find("\"execution_kinds\":{\"ordinary\":1,\"tick_tock\":1,\"other\":1}") != std::string::npos);
+}
+
 TEST(ValidationReplay, ParsesOnlyCompleteAndValidBlockIds) {
   auto valid = BlockId::from_str("(0,8000000000000000,123456)");
   ASSERT_TRUE(valid.is_ok());
