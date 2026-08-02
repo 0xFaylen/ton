@@ -20,6 +20,17 @@ target_link_libraries(test-parallel-inbound-scheduler PRIVATE
 target_include_directories(test-parallel-inbound-scheduler PRIVATE ${CMAKE_SOURCE_DIR}/validator)
 ton_test(test-parallel-inbound-scheduler)
 
+add_executable(test-parallel-worker-pool
+    test-parallel-worker-pool.cpp
+    ${CMAKE_SOURCE_DIR}/validator/impl/parallel-worker-pool.cpp
+)
+target_link_libraries(test-parallel-worker-pool PRIVATE
+    td-test-main
+    tdutils
+)
+target_include_directories(test-parallel-worker-pool PRIVATE ${CMAKE_SOURCE_DIR}/validator)
+ton_test(test-parallel-worker-pool)
+
 add_executable(test-parallel-cell-usage-journal
     test-parallel-cell-usage-journal.cpp
     ${CMAKE_SOURCE_DIR}/validator/impl/parallel-cell-usage-journal.cpp

@@ -222,21 +222,23 @@ counters, and account-chain lengths. The requested worker count is capped at 64
 as a local process-safety guard and is reduced to the number of touched accounts;
 neither value is a TON protocol limit.
 
-The probe includes thread creation/join and deliberately duplicates config
-extraction, the full AccountBlocks scan, and shadow effect checks in every lane.
-The reported sample always runs the serial baseline before the parallel sample,
-so cache/order bias remains explicit in `known_biases` and repeated external
-runs are required.
-It excludes the augmented-root commit, a reusable actor/worker pool, live
-collator integration, network, and consensus. Its `wall_speedup` is therefore a
-measured isolated-account replay result, not shard TPS. On the copied 51-tx,
-29-account block, ten independent `-O3` Release processes at each width passed
-the equivalence gate. Median speedups were 1.57x at two workers, 2.15x at four,
-and 2.45x at eight; interquartile ranges were 1.49-1.95x, 1.99-2.41x, and
-2.20-2.73x respectively. Median isolated replay rates were about 3.1k raw tx/s
-for the serial baseline, 6.6k at four workers, and 8.0k at eight workers. The
-Release target builds after supplying the repository's vendored Abseil include
-path to the local CMake cache; no dependency source was changed.
+The probe creates one fixed worker set before timing and reuses it for every
+serial and parallel batch. Pool startup is reported separately and excluded
+from batch wall time. `--account-samples N` requests an odd number of paired
+runs, from 1 through 31; pair order alternates to reduce first-run cache bias.
+The default single pair remains serial-first. The JSON preserves every raw
+sample and reports medians. A task exception fails the whole batch, all tasks
+reach the barrier, and the pool remains reusable.
+
+Per-lane config extraction, the full AccountBlocks scan, and shadow effect
+checks are still deliberately duplicated. The probe excludes augmented-root
+commit, live Collator integration, network, and consensus. Its `wall_speedup`
+is therefore measured isolated-account replay, not shard TPS. On copied
+basechain block `88028077`, five Release pairs with four reusable workers passed
+the complete equivalence gate. Serial samples were 181.0-219.0 ms, parallel
+samples were 49.9-62.2 ms, and the median paired speedup was 3.24x. The median
+isolated rates were 760 raw tx/s serial and 2,440 raw tx/s parallel. Pool startup
+was 0.391 ms and is not included in either rate.
 
 The output also contains `single_shard_capacity`. It reads Config 23/29/30 from
 the state-bound masterchain proof and reports the exact archive block-file size.
@@ -277,12 +279,12 @@ account-state hashes match. Its transaction-kind split is `138 ordinary, 0
 tick, 0 tock`; the 134 TVM executions are also all ordinary. One Release process
 measured 166.6 ms for the isolated serial account replay and 46.4 ms with four
 workers, or 3.59x. A later independent process passed the same equivalence gate
-but measured 2.98x, so neither one-shot speedup is treated as stable. These are
-isolated-account replay results, not block collation or shard TPS. The same
-sample gives a 1,930 raw tx/s linear byte-envelope projection, but remains far
-from saturation and keeps `mainnet_sustainable_raw_tps=null`. Without matching
-historical collated data it validates the two descriptor roots, not the complete
-four-root state transition.
+but measured 2.98x. The reusable-pool five-pair median is 3.24x, with individual
+paired results from 3.11x to 3.76x. These are isolated-account replay results,
+not block collation or shard TPS. The same sample gives a 1,930 raw tx/s linear
+byte-envelope projection, but remains far from saturation and keeps
+`mainnet_sustainable_raw_tps=null`. Without matching historical collated data it
+validates the two descriptor roots, not the complete four-root state transition.
 
 The shard archive anchors the predecessor state through the intervening block
 chain. The masterchain archive anchors the configuration state by requiring its
@@ -305,7 +307,8 @@ tvm-replay-bundle \
   --collated-data candidate-collated-data.boc \
   --account-proof <account>=account.tl \
   --library-bodies libraries.tl \
-  --account-workers 4
+  --account-workers 4 \
+  --account-samples 5
 ```
 
 The target block can be replayed without a complete archive package by using
@@ -318,7 +321,8 @@ tvm-replay-bundle \
   --mc-proof mc-config.tl \
   --account-proof <account>=account.tl \
   --library-bodies libraries.tl \
-  --account-workers 4
+  --account-workers 4 \
+  --account-samples 5
 ```
 
 `saveblock` requires a full `BlockIdExt`, verifies the server's returned id,

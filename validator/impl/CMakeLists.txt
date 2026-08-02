@@ -12,6 +12,7 @@ set(TON_VALIDATOR_SOURCE
   message-queue.cpp
   out-msg-queue-proof.cpp
   parallel-cell-usage-journal.cpp
+  parallel-worker-pool.cpp
   proof.cpp
   shard.cpp
   top-shard-descr.cpp
@@ -30,6 +31,7 @@ set(TON_VALIDATOR_SOURCE
   message-queue.hpp
   out-msg-queue-proof.hpp
   parallel-cell-usage-journal.h
+  parallel-worker-pool.h
   proof.hpp
   shard.hpp
   top-shard-descr.hpp

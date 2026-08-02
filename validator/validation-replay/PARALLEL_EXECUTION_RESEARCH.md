@@ -456,6 +456,38 @@ The executor design consequence is narrow: tick/tock remains in the serial
 masterchain floor. It does not lower the measured basechain account-lane ceiling
 and cannot be used to claim a higher or lower sustainable basechain TPS.
 
+## Reusable worker-pool gate - 2026-08-02
+
+The executable account replay no longer creates and joins operating-system
+threads inside each measured batch. One fixed pool waits until all workers are
+ready, then executes repeated serial and parallel batches through the same
+fail-closed barrier. A task exception fails the batch after all submitted work
+has completed and does not terminate or poison the pool. Unit tests verify
+worker identity reuse, concurrent execution, invalid-batch rejection, contained
+task failure, and successful reuse after failure.
+
+The benchmark accepts an odd `--account-samples` count up to 31 and alternates
+serial-first and parallel-first pairs. Raw samples remain in JSON; summary wall
+times and lane times are medians. Pool startup is measured separately and is
+not included in either serial or parallel batch wall.
+
+Five Release pairs on basechain block `88028077` again matched all 138
+historical transaction hashes and resulting account-state hashes across 108
+accounts. The four lanes contained 26/27/27/28 accounts. Serial batch samples
+were 180.954, 181.519, 219.047, 193.244, and 181.343 ms; parallel samples were
+49.879, 56.554, 58.285, 62.223, and 56.021 ms. The paired speedups were 3.628x,
+3.210x, 3.758x, 3.106x, and 3.237x, with a 3.237x median. Pool startup was
+0.391 ms. Median isolated replay rates were 760 raw tx/s serial and 2,440 raw
+tx/s parallel.
+
+This removes thread creation from the measured executor path and bounds the
+one-shot variance observed earlier. It still duplicates per-lane setup and
+shadow checks and does not include augmented-root commit, Collator mutation,
+ValidateQuery, block delivery, or consensus. `mainnet_sustainable_raw_tps`
+therefore remains `null`. The next gate is a disabled offline Collator path that
+feeds immutable ordinary account chains to this pool, retains tick/tock on the
+coordinator, and requires serial candidate and ValidateQuery equivalence.
+
 ## Dead ends and cautions
 
 - Search results did not expose a public TON trace JIT or public intra-block
