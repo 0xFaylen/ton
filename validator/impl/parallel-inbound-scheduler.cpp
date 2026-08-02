@@ -207,4 +207,18 @@ const char* to_string(ReceiptError error) {
   return "unknown";
 }
 
+const char* to_string(FrontierError error) {
+  switch (error) {
+    case FrontierError::none:
+      return "none";
+    case FrontierError::size_mismatch:
+      return "size_mismatch";
+    case FrontierError::non_canonical_input:
+      return "non_canonical_input";
+    case FrontierError::input_not_after_frontier:
+      return "input_not_after_frontier";
+  }
+  return "unknown";
+}
+
 }  // namespace ton::validator::parallel_inbound

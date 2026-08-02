@@ -89,6 +89,8 @@ struct BlockContext {
   bool after_split = false;
   bool after_merge = false;
   bool before_split = false;
+  Ref<vm::Cell> in_msg_descr;
+  Ref<vm::Cell> out_msg_descr;
   Ref<vm::Cell> account_blocks;
 };
 
@@ -134,6 +136,9 @@ struct ReplayResult {
   std::size_t tvm_transactions = 0;
   std::size_t canonical_payloads_validated = 0;
   std::size_t canonical_payload_out_messages = 0;
+  std::size_t canonical_outbound_registrations = 0;
+  std::size_t canonical_inbound_fin_descriptors = 0;
+  std::size_t canonical_outbound_deq_imm_descriptors = 0;
   std::size_t canonical_fee_augmentations_validated = 0;
   std::size_t basechain_limit_effects_applied = 0;
   std::size_t basechain_limit_accounts = 0;
@@ -217,6 +222,8 @@ td::Result<BlockContext> unpack_block_context(std::pair<BlockIdExt, Ref<vm::Cell
   result.after_merge = info.after_merge;
   result.before_split = info.before_split;
   result.rand_seed = extra.rand_seed;
+  result.in_msg_descr = std::move(extra.in_msg_descr);
+  result.out_msg_descr = std::move(extra.out_msg_descr);
   result.account_blocks = std::move(extra.account_blocks);
   return result;
 }
@@ -639,6 +646,14 @@ td::Result<ReplayResult> replay_transactions(const BlockContext& target, const L
   }
   TRY_RESULT(prev_blocks_info, config->get_prev_blocks_info());
 
+  block::tlb::Aug_InMsgDescr in_msg_augmentation{config->get_global_version()};
+  block::tlb::Aug_OutMsgDescr out_msg_augmentation{config->get_global_version()};
+  vm::AugmentedDictionary in_msg_descr{vm::load_cell_slice_ref(target.in_msg_descr), 256, in_msg_augmentation};
+  vm::AugmentedDictionary out_msg_descr{vm::load_cell_slice_ref(target.out_msg_descr), 256, out_msg_augmentation};
+  if (!in_msg_descr.is_valid() || !out_msg_descr.is_valid()) {
+    return td::Status::Error("target block has invalid message descriptor dictionaries");
+  }
+
   emulator::TransactionEmulator emulator(config);
   emulator.set_profile_ed25519(profile_ed25519);
   auto rand_seed = target.rand_seed;
@@ -797,6 +812,77 @@ td::Result<ReplayResult> replay_transactions(const BlockContext& target, const L
                                             << tx_key.get_uint(64) << " of " << address.to_hex());
             return false;
           }
+
+          td::optional<block::MsgMetadata> inbound_metadata;
+          if (payload_effects.inbound_message.not_null()) {
+            auto message_key = payload_effects.inbound_message->get_hash().bits();
+            auto declared_in_slice = in_msg_descr.lookup(message_key, 256);
+            if (declared_in_slice.is_null()) {
+              replay_status = td::Status::Error(PSTRING() << "canonical inbound message is absent from InMsgDescr for "
+                                                          << address.to_hex() << " at " << tx_key.get_uint(64));
+              return false;
+            }
+            const auto in_tag = block::gen::t_InMsg.get_tag(*declared_in_slice);
+            const bool has_envelope = in_tag == block::gen::InMsg::msg_import_imm ||
+                                      in_tag == block::gen::InMsg::msg_import_fin ||
+                                      in_tag == block::gen::InMsg::msg_import_deferred_fin;
+            if (has_envelope) {
+              auto envelope_cell = declared_in_slice->prefetch_ref();
+              block::tlb::MsgEnvelope::Record_std envelope;
+              if (envelope_cell.is_null() || !block::tlb::unpack_cell(envelope_cell, envelope) ||
+                  envelope.msg.is_null() || envelope.msg->get_hash() != payload_effects.inbound_message->get_hash()) {
+                replay_status = td::Status::Error(PSTRING() << "canonical inbound envelope mismatch for "
+                                                            << address.to_hex() << " at " << tx_key.get_uint(64));
+                return false;
+              }
+              inbound_metadata = envelope.metadata;
+            }
+
+            if (in_tag == block::gen::InMsg::msg_import_fin) {
+              auto declared_in_cell = vm::CellBuilder().append_cellslice(declared_in_slice->clone()).finalize_novm();
+              block::gen::InMsg::Record_msg_import_fin declared_in;
+              if (declared_in_cell.is_null() || !block::gen::t_InMsg.cell_unpack(declared_in_cell, declared_in) ||
+                  declared_in.transaction.is_null() || declared_in.transaction->get_hash() != transaction->get_hash()) {
+                replay_status = td::Status::Error(PSTRING() << "invalid msg_import_fin transaction binding for "
+                                                            << address.to_hex() << " at " << tx_key.get_uint(64));
+                return false;
+              }
+
+              bool dequeued_from_current_shard = false;
+              td::Ref<vm::Cell> declared_out_cell;
+              auto declared_out_slice = out_msg_descr.lookup(message_key, 256);
+              if (declared_out_slice.not_null() &&
+                  block::gen::t_OutMsg.get_tag(*declared_out_slice) == block::gen::OutMsg::msg_export_deq_imm) {
+                dequeued_from_current_shard = true;
+                declared_out_cell = vm::CellBuilder().append_cellslice(declared_out_slice->clone()).finalize_novm();
+              }
+
+              auto descriptors = ton::validator::parallel_inbound::materialize_inbound_internal_descriptors(
+                  payload_effects,
+                  {.message_envelope = declared_in.in_msg, .dequeued_from_current_shard = dequeued_from_current_shard});
+              if (!descriptors || descriptors.delta->in_msg_descriptor->get_hash() != declared_in_cell->get_hash() ||
+                  (dequeued_from_current_shard &&
+                   (declared_out_cell.is_null() || descriptors.delta->out_msg_descriptor.is_null() ||
+                    descriptors.delta->out_msg_descriptor->get_hash() != declared_out_cell->get_hash())) ||
+                  (!dequeued_from_current_shard && descriptors.delta->out_msg_descriptor.not_null())) {
+                replay_status = td::Status::Error(PSTRING() << "canonical inbound descriptor reconstruction failed for "
+                                                            << address.to_hex() << " at " << tx_key.get_uint(64));
+                return false;
+              }
+              ++result.canonical_inbound_fin_descriptors;
+              result.canonical_outbound_deq_imm_descriptors += dequeued_from_current_shard;
+            }
+          }
+
+          auto registrations = ton::validator::parallel_inbound::materialize_outbound_registrations(
+              payload_effects,
+              {.metadata_enabled = config->has_capability(ton::capMsgMetadata), .metadata = inbound_metadata});
+          if (!registrations || registrations.batch->messages.size() != payload_effects.outbound_messages.size()) {
+            replay_status = td::Status::Error(PSTRING() << "canonical outbound registration failed for transaction "
+                                                        << tx_key.get_uint(64) << " of " << address.to_hex());
+            return false;
+          }
+          result.canonical_outbound_registrations += registrations.batch->messages.size();
           ++result.canonical_payloads_validated;
           result.canonical_payload_out_messages += payload_effects.outbound_messages.size();
           derived_account_fees += payload_effects.total_fees;
@@ -990,6 +1076,9 @@ std::string replay_json(const BlockContext& target, const LoadedState* account_s
       << ",\"equivalence\":\"transaction_hash_and_account_state_hash\""
       << ",\"psae_payload_validation\":{\"canonical_payloads\":" << replay.canonical_payloads_validated
       << ",\"ordered_out_messages\":" << replay.canonical_payload_out_messages
+      << ",\"outbound_registrations\":" << replay.canonical_outbound_registrations
+      << ",\"inbound_fin_descriptors\":" << replay.canonical_inbound_fin_descriptors
+      << ",\"outbound_deq_imm_descriptors\":" << replay.canonical_outbound_deq_imm_descriptors
       << ",\"fee_augmentations\":" << replay.canonical_fee_augmentations_validated
       << ",\"basechain_limit_effects\":" << replay.basechain_limit_effects_applied
       << ",\"basechain_limit_accounts\":" << replay.basechain_limit_accounts
@@ -997,7 +1086,9 @@ std::string replay_json(const BlockContext& target, const LoadedState* account_s
       << ",\"basechain_limit_gas_status\":\"billed_gas_sum_special_context_not_reconstructed\""
       << ",\"basechain_limit_max_end_lt\":" << replay.basechain_limit_max_end_lt
       << ",\"block_size_status\":\"not_claimed_without_collator_usage_tree\""
-      << ",\"proof_journals\":\"empty_in_transaction_replay\",\"global_effects\":\"not_applied\"}"
+      << ",\"proof_journals\":\"empty_in_transaction_replay\""
+      << ",\"processed_upto\":\"pure_prefix_gate_only\""
+      << ",\"global_effects\":\"materialized_not_applied\"}"
       << ",\"hotpaths_wall\":" << replay.hotpaths.to_json(false, 0, replay.hotpaths.size());
 #if TD_WINDOWS
   out << ",\"hotpaths_cpu\":null,\"cpu_metric_status\":\"unsupported_windows_timer_resolution\"";

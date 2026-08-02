@@ -159,6 +159,102 @@ TEST(ParallelInboundScheduler, CommitFailureCannotExposeACompletedSuffix) {
   ASSERT_EQ(committed, (std::vector<std::size_t>{0, 1}));
 }
 
+TEST(ParallelInboundScheduler, PublishesProcessedUptoOnlyForContinuousCommittedPrefix) {
+  const std::vector<WorkItem> items{item(1, 1, 10), item(1, 2, 20), item(1, 3, 30)};
+  const std::vector<CompletionStatus> completions{CompletionStatus::succeeded, CompletionStatus::pending,
+                                                  CompletionStatus::succeeded};
+  ProcessedUptoFrontier frontier;
+  std::vector<std::size_t> committed;
+  auto result = commit_ready_prefix_and_publish_frontier(
+      items, completions, frontier, [](std::size_t) { return true; },
+      [&](std::size_t index) {
+        committed.push_back(index);
+        return true;
+      });
+
+  ASSERT_TRUE(result);
+  ASSERT_EQ(result.decision.committed_count, 1u);
+  ASSERT_EQ(result.decision.stop_reason, PrefixStopReason::pending);
+  ASSERT_EQ(frontier.last_processed, std::optional<MessageKey>{items[0].key});
+  ASSERT_EQ(committed, (std::vector<std::size_t>{0}));
+
+  const std::vector<WorkItem> tail{items[1], items[2]};
+  result = commit_ready_prefix_and_publish_frontier(
+      tail, {CompletionStatus::succeeded, CompletionStatus::succeeded}, frontier, [](std::size_t) { return true; },
+      [](std::size_t) { return true; });
+  ASSERT_TRUE(result);
+  ASSERT_EQ(result.decision.committed_count, 2u);
+  ASSERT_EQ(frontier.last_processed, std::optional<MessageKey>{items[2].key});
+}
+
+TEST(ParallelInboundScheduler, FailedOrUncommittedItemNeverAdvancesProcessedUpto) {
+  const std::vector<WorkItem> items{item(1, 1, 10), item(1, 2, 20), item(1, 3, 30)};
+  ProcessedUptoFrontier frontier{items[0].key};
+  const std::vector<WorkItem> tail{items[1], items[2]};
+
+  auto failed = commit_ready_prefix_and_publish_frontier(
+      tail, {CompletionStatus::failed, CompletionStatus::succeeded}, frontier, [](std::size_t) { return true; },
+      [](std::size_t) { return true; });
+  ASSERT_TRUE(failed);
+  ASSERT_EQ(failed.decision.stop_reason, PrefixStopReason::worker_failure);
+  ASSERT_EQ(frontier.last_processed, std::optional<MessageKey>{items[0].key});
+
+  auto limited = commit_ready_prefix_and_publish_frontier(
+      tail, {CompletionStatus::succeeded, CompletionStatus::succeeded}, frontier, [](std::size_t) { return false; },
+      [](std::size_t) { return true; });
+  ASSERT_TRUE(limited);
+  ASSERT_EQ(limited.decision.stop_reason, PrefixStopReason::block_limit);
+  ASSERT_EQ(frontier.last_processed, std::optional<MessageKey>{items[0].key});
+
+  auto commit_failed = commit_ready_prefix_and_publish_frontier(
+      tail, {CompletionStatus::succeeded, CompletionStatus::succeeded}, frontier, [](std::size_t) { return true; },
+      [](std::size_t) { return false; });
+  ASSERT_TRUE(commit_failed);
+  ASSERT_EQ(commit_failed.decision.stop_reason, PrefixStopReason::commit_failure);
+  ASSERT_EQ(frontier.last_processed, std::optional<MessageKey>{items[0].key});
+}
+
+TEST(ParallelInboundScheduler, RejectsMalformedFrontierSliceBeforeCoordinatorMutation) {
+  const auto first = item(1, 1, 10);
+  ProcessedUptoFrontier frontier{first.key};
+  std::size_t callbacks = 0;
+  const std::vector<WorkItem> stale{first, item(1, 2, 20)};
+  auto result = commit_ready_prefix_and_publish_frontier(
+      stale, {CompletionStatus::succeeded, CompletionStatus::succeeded}, frontier,
+      [&](std::size_t) {
+        ++callbacks;
+        return true;
+      },
+      [&](std::size_t) {
+        ++callbacks;
+        return true;
+      });
+  ASSERT_EQ(result.error, FrontierError::input_not_after_frontier);
+  ASSERT_EQ(result.item_index, std::optional<std::size_t>{0});
+  ASSERT_EQ(callbacks, 0u);
+  ASSERT_EQ(frontier.last_processed, std::optional<MessageKey>{first.key});
+
+  const std::vector<WorkItem> reversed{item(2, 2, 10), item(2, 1, 20)};
+  result = commit_ready_prefix_and_publish_frontier(
+      reversed, {CompletionStatus::succeeded, CompletionStatus::succeeded}, frontier,
+      [&](std::size_t) {
+        ++callbacks;
+        return true;
+      },
+      [&](std::size_t) {
+        ++callbacks;
+        return true;
+      });
+  ASSERT_EQ(result.error, FrontierError::non_canonical_input);
+  ASSERT_EQ(callbacks, 0u);
+
+  result = commit_ready_prefix_and_publish_frontier(
+      std::vector<WorkItem>{item(2, 1, 10)}, {}, frontier, [](std::size_t) { return true; },
+      [](std::size_t) { return true; });
+  ASSERT_EQ(result.error, FrontierError::size_mismatch);
+  ASSERT_EQ(frontier.last_processed, std::optional<MessageKey>{first.key});
+}
+
 TEST(ParallelInboundScheduler, AccountLanesAreEquivalentToSerialAccountState) {
   const std::vector<WorkItem> items{item(1, 1, 10), item(1, 2, 20), item(1, 3, 10), item(1, 4, 30),
                                     item(1, 5, 20), item(1, 6, 10), item(1, 7, 30), item(1, 8, 40)};

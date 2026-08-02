@@ -157,7 +157,7 @@ td::Result<Hash256> proof_journal_set_commitment(const std::vector<CellUsageJour
 }
 
 Hash256 effects_commitment(const CanonicalTransactionEffects& effects) {
-  static constexpr char domain[] = "TON-PSAE-CANONICAL-TRANSACTION-EFFECTS-V2";
+  static constexpr char domain[] = "TON-PSAE-CANONICAL-TRANSACTION-EFFECTS-V3";
   td::Sha256State state;
   state.init();
   state.feed(td::Slice{domain, sizeof(domain) - 1});
@@ -171,6 +171,10 @@ Hash256 effects_commitment(const CanonicalTransactionEffects& effects) {
   feed_u64(state, effects.gas_used);
   feed_u64(state, effects.original_account_status);
   feed_u64(state, effects.end_account_status);
+  feed_u64(state, effects.inbound_message_hash.has_value());
+  if (effects.inbound_message_hash) {
+    feed_hash(state, effects.inbound_message_hash.value());
+  }
   feed_u64(state, effects.outbound_messages.size());
   for (const auto& message : effects.outbound_messages) {
     feed_u64(state, message.logical_time);
@@ -242,6 +246,18 @@ PayloadValidationResult inspect_transaction_payload(const CanonicalTransactionPa
   effects.total_fees = std::move(total_fees);
   effects.transaction_root = payload.transaction_root;
   effects.post_account_state = payload.post_account_state;
+
+  if (transaction.r1.in_msg.is_null()) {
+    return error(PayloadError::invalid_in_message);
+  }
+  auto inbound_message = transaction.r1.in_msg->prefetch_ref();
+  if (inbound_message.not_null()) {
+    if (!block::gen::t_Message_Any.validate_ref(inbound_message)) {
+      return error(PayloadError::invalid_in_message);
+    }
+    effects.inbound_message_hash = to_hash256(inbound_message->get_hash().as_bits256());
+    effects.inbound_message = std::move(inbound_message);
+  }
 
   try {
     vm::Dictionary out_messages{transaction.r1.out_msgs, 15};
@@ -322,6 +338,9 @@ PayloadValidationResult validate_worker_payload(const CanonicalTransactionPayloa
   }
   if (receipt.proof_journal_hash != effects.proof_journal_hash) {
     return error(PayloadError::proof_journal_hash_mismatch);
+  }
+  if (effects.inbound_message_hash && receipt.input.hash != effects.inbound_message_hash.value()) {
+    return error(PayloadError::input_message_hash_mismatch);
   }
   if (receipt.transaction_start_lt != effects.transaction_start_lt) {
     return error(PayloadError::transaction_start_lt_mismatch);
@@ -420,6 +439,98 @@ BasechainLimitApplyResult apply_basechain_block_limits_atomic(block::BlockLimitS
   return {.applied_transactions = effects.size()};
 }
 
+OutboundRegistrationResult materialize_outbound_registrations(const CanonicalTransactionEffects& effects,
+                                                              const OutboundRegistrationContext& context) {
+  if (effects.transaction_root.is_null()) {
+    return {
+        .error = OutboundRegistrationError::missing_transaction, .message_index = std::nullopt, .batch = std::nullopt};
+  }
+
+  CanonicalOutboundRegistrationBatch batch;
+  batch.messages.reserve(effects.outbound_messages.size());
+  for (std::size_t i = 0; i < effects.outbound_messages.size(); ++i) {
+    const auto& effect = effects.outbound_messages[i];
+    if (effect.message.is_null()) {
+      return {.error = OutboundRegistrationError::missing_message, .message_index = i, .batch = std::nullopt};
+    }
+    if (!block::gen::t_Message_Any.validate_ref(effect.message)) {
+      return {.error = OutboundRegistrationError::invalid_message, .message_index = i, .batch = std::nullopt};
+    }
+    if (to_hash256(effect.message->get_hash().as_bits256()) != effect.message_hash) {
+      return {.error = OutboundRegistrationError::message_hash_mismatch, .message_index = i, .batch = std::nullopt};
+    }
+    if (effects.transaction_start_lt > std::numeric_limits<std::uint64_t>::max() - i - 1 ||
+        effect.logical_time != effects.transaction_start_lt + i + 1) {
+      return {.error = OutboundRegistrationError::logical_time_mismatch, .message_index = i, .batch = std::nullopt};
+    }
+
+    block::NewOutMsg message{effect.logical_time, effect.message, effects.transaction_root, static_cast<unsigned>(i)};
+    if (context.metadata_enabled) {
+      message.metadata = context.metadata;
+    }
+    if (!batch.min_message_lt || effect.logical_time < batch.min_message_lt.value()) {
+      batch.min_message_lt = effect.logical_time;
+    }
+    batch.messages.push_back(std::move(message));
+  }
+  batch.extra_out_msgs_delta = batch.messages.size();
+  return {.error = OutboundRegistrationError::none, .message_index = std::nullopt, .batch = std::move(batch)};
+}
+
+InboundDescriptorResult materialize_inbound_internal_descriptors(const CanonicalTransactionEffects& effects,
+                                                                 const InboundDescriptorContext& context) {
+  if (effects.transaction_root.is_null()) {
+    return {.error = InboundDescriptorError::missing_transaction, .delta = std::nullopt};
+  }
+  if (!effects.inbound_message_hash || effects.inbound_message.is_null()) {
+    return {.error = InboundDescriptorError::missing_inbound_message, .delta = std::nullopt};
+  }
+  if (context.message_envelope.is_null()) {
+    return {.error = InboundDescriptorError::missing_message_envelope, .delta = std::nullopt};
+  }
+  if (!block::gen::t_Message_Any.validate_ref(effects.inbound_message) ||
+      to_hash256(effects.inbound_message->get_hash().as_bits256()) != effects.inbound_message_hash.value()) {
+    return {.error = InboundDescriptorError::invalid_inbound_message, .delta = std::nullopt};
+  }
+
+  auto message_slice = vm::load_cell_slice(effects.inbound_message);
+  if (!block::tlb::t_Message.extract_info(message_slice) ||
+      block::tlb::t_CommonMsgInfo.get_tag(message_slice) != block::gen::CommonMsgInfo::int_msg_info) {
+    return {.error = InboundDescriptorError::non_internal_inbound_message, .delta = std::nullopt};
+  }
+
+  block::tlb::MsgEnvelope::Record_std envelope;
+  if (!block::tlb::unpack_cell(context.message_envelope, envelope) || envelope.msg.is_null() ||
+      envelope.fwd_fee_remaining.is_null()) {
+    return {.error = InboundDescriptorError::malformed_message_envelope, .delta = std::nullopt};
+  }
+  if (to_hash256(envelope.msg->get_hash().as_bits256()) != effects.inbound_message_hash.value()) {
+    return {.error = InboundDescriptorError::envelope_message_mismatch, .delta = std::nullopt};
+  }
+
+  vm::CellBuilder builder;
+  td::Ref<vm::Cell> in_msg;
+  if (!(builder.store_long_bool(4, 3) && builder.store_ref_bool(context.message_envelope) &&
+        builder.store_ref_bool(effects.transaction_root) &&
+        block::tlb::t_Grams.store_integer_ref(builder, envelope.fwd_fee_remaining) &&
+        std::move(builder).finalize_to(in_msg))) {
+    return {.error = InboundDescriptorError::cannot_serialize_in_msg, .delta = std::nullopt};
+  }
+
+  CanonicalInboundDescriptorDelta delta;
+  delta.message_hash = effects.inbound_message_hash.value();
+  delta.in_msg_descriptor = std::move(in_msg);
+  if (context.dequeued_from_current_shard) {
+    vm::CellBuilder out_builder;
+    if (!(out_builder.store_long_bool(4, 3) && out_builder.store_ref_bool(context.message_envelope) &&
+          out_builder.store_ref_bool(delta.in_msg_descriptor) &&
+          std::move(out_builder).finalize_to(delta.out_msg_descriptor))) {
+      return {.error = InboundDescriptorError::cannot_serialize_out_msg, .delta = std::nullopt};
+    }
+  }
+  return {.error = InboundDescriptorError::none, .delta = std::move(delta)};
+}
+
 const char* to_string(PayloadError error) {
   switch (error) {
     case PayloadError::none:
@@ -442,6 +553,8 @@ const char* to_string(PayloadError error) {
       return "post_state_hash_mismatch";
     case PayloadError::malformed_description:
       return "malformed_description";
+    case PayloadError::invalid_in_message:
+      return "invalid_in_message";
     case PayloadError::invalid_out_message_dictionary:
       return "invalid_out_message_dictionary";
     case PayloadError::logical_time_overflow:
@@ -462,6 +575,8 @@ const char* to_string(PayloadError error) {
       return "effects_hash_mismatch";
     case PayloadError::proof_journal_hash_mismatch:
       return "proof_journal_hash_mismatch";
+    case PayloadError::input_message_hash_mismatch:
+      return "input_message_hash_mismatch";
     case PayloadError::transaction_start_lt_mismatch:
       return "transaction_start_lt_mismatch";
     case PayloadError::transaction_end_lt_mismatch:
@@ -500,6 +615,50 @@ const char* to_string(BasechainLimitError error) {
       return "missing_transaction";
     case BasechainLimitError::missing_post_account_state:
       return "missing_post_account_state";
+  }
+  return "unknown";
+}
+
+const char* to_string(OutboundRegistrationError error) {
+  switch (error) {
+    case OutboundRegistrationError::none:
+      return "none";
+    case OutboundRegistrationError::missing_transaction:
+      return "missing_transaction";
+    case OutboundRegistrationError::missing_message:
+      return "missing_message";
+    case OutboundRegistrationError::invalid_message:
+      return "invalid_message";
+    case OutboundRegistrationError::message_hash_mismatch:
+      return "message_hash_mismatch";
+    case OutboundRegistrationError::logical_time_mismatch:
+      return "logical_time_mismatch";
+  }
+  return "unknown";
+}
+
+const char* to_string(InboundDescriptorError error) {
+  switch (error) {
+    case InboundDescriptorError::none:
+      return "none";
+    case InboundDescriptorError::missing_transaction:
+      return "missing_transaction";
+    case InboundDescriptorError::missing_inbound_message:
+      return "missing_inbound_message";
+    case InboundDescriptorError::missing_message_envelope:
+      return "missing_message_envelope";
+    case InboundDescriptorError::invalid_inbound_message:
+      return "invalid_inbound_message";
+    case InboundDescriptorError::non_internal_inbound_message:
+      return "non_internal_inbound_message";
+    case InboundDescriptorError::malformed_message_envelope:
+      return "malformed_message_envelope";
+    case InboundDescriptorError::envelope_message_mismatch:
+      return "envelope_message_mismatch";
+    case InboundDescriptorError::cannot_serialize_in_msg:
+      return "cannot_serialize_in_msg";
+    case InboundDescriptorError::cannot_serialize_out_msg:
+      return "cannot_serialize_out_msg";
   }
   return "unknown";
 }

@@ -127,9 +127,8 @@ out-messages, then recomputes effects and journal commitments. A pure batch
 precommit gate returns the initial checkpoints on any payload or receipt-chain
 failure. Unit tests tamper every derived header field. A copied full-block
 mainnet replay validated all 51 payloads and 42 ordered out-messages while
-preserving exact transaction/account-state hashes. Journals were empty and
-global effects were not applied in that replay, so this is an ABI/equivalence
-gate rather than measured parallel execution.
+preserving exact transaction/account-state hashes. Journals were empty, so this
+is an ABI/equivalence gate rather than measured parallel execution.
 
 The next coordinator-delta subset is executable for basechain transactions.
 Canonical effects now commit total fees and account status transitions, and a
@@ -139,10 +138,23 @@ to a shadow `BlockLimitStatus` before publishing it. Gas charging is a
 coordinator-supplied per-transaction phase flag; it is not worker-controlled.
 Offline replay additionally
 requires the sum of canonical transaction fees for each account to equal its
-existing `AccountBlock` augmentation. Masterchain public-library deltas,
-collator usage-tree proof size, account-dictionary proofs, message descriptors,
-queues, storage-dictionary updates, `ProcessedUpto`, value flow and state merge
-remain outside this gate.
+existing `AccountBlock` augmentation.
+
+The canonical message subset is also executable without changing the live
+collator. It reconstructs `NewOutMsg` registrations from ordered transaction
+outputs while accepting metadata only from coordinator context. For inbound
+internal work it materializes the exact `msg_import_fin` descriptor and the
+optional paired `msg_export_deq_imm`. The copied full-block replay reconstructed
+all 42 registrations and matched cell hashes for 10 inbound and 10 paired
+outbound descriptors. A separate atomic prefix helper validates the entire
+canonical queue slice before callbacks and publishes `ProcessedUpto` only to
+the last successfully committed item; pending, failed, limited and
+commit-failed items cannot expose a completed suffix.
+
+Masterchain public-library deltas, collator usage-tree proof size,
+account-dictionary proof merge, descriptor-dictionary insertion, queue mutation,
+storage-dictionary updates, live `ProcessedUpto` wiring, value flow and state
+merge remain outside this gate.
 
 ## Dead ends and cautions
 

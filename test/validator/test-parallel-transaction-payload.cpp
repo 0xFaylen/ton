@@ -4,6 +4,7 @@
 #include <cstring>
 
 #include "block/block-auto.h"
+#include "block/block-parse.h"
 #include "block/block.h"
 #include "impl/parallel-transaction-payload.h"
 #include "td/utils/tests.h"
@@ -59,6 +60,51 @@ td::Ref<vm::Cell> account_none() {
   return vm::CellBuilder().store_zeroes(1).finalize_novm();
 }
 
+td::Ref<vm::CellSlice> std_address(std::uint64_t value) {
+  vm::CellBuilder builder;
+  ASSERT_TRUE(builder.store_long_bool(2, 2));  // addr_std$10
+  ASSERT_TRUE(builder.store_zeroes_bool(1));   // anycast:(Maybe Anycast)
+  ASSERT_TRUE(builder.store_long_bool(0, 8));  // workchain_id:int8
+  ASSERT_TRUE(builder.store_bits_bool(bits(value).cbits(), 256));
+  return builder.as_cellslice_ref();
+}
+
+td::Ref<vm::Cell> internal_message(std::uint64_t source, std::uint64_t destination, std::uint64_t created_lt) {
+  block::gen::CommonMsgInfo::Record_int_msg_info info;
+  info.ihr_disabled = true;
+  info.bounce = true;
+  info.bounced = false;
+  info.src = std_address(source);
+  info.dest = std_address(destination);
+  info.value = block::CurrencyCollection{0}.pack();
+  info.extra_flags = vm::CellBuilder().store_zeroes(4).as_cellslice_ref();
+  info.fwd_fee = vm::CellBuilder().store_zeroes(4).as_cellslice_ref();
+  info.created_lt = created_lt;
+  info.created_at = 1'700'000'000;
+  td::Ref<vm::Cell> info_cell;
+  ASSERT_TRUE(block::gen::t_CommonMsgInfo.cell_pack(info_cell, info));
+
+  block::gen::Message::Record message;
+  message.info = vm::load_cell_slice_ref(info_cell);
+  message.init = none();
+  message.body = vm::CellBuilder().store_zeroes(1).as_cellslice_ref();
+  td::Ref<vm::Cell> result;
+  ASSERT_TRUE(block::gen::t_Message_Any.cell_pack(result, message));
+  ASSERT_TRUE(block::gen::t_Message_Any.validate_ref(result));
+  return result;
+}
+
+td::Ref<vm::Cell> message_envelope(const td::Ref<vm::Cell>& message, std::uint64_t forwarding_fee) {
+  block::tlb::MsgEnvelope::Record_std envelope;
+  envelope.cur_addr = 0;
+  envelope.next_addr = 0;
+  envelope.fwd_fee_remaining = td::make_refint(forwarding_fee);
+  envelope.msg = message;
+  td::Ref<vm::Cell> result;
+  ASSERT_TRUE(block::tlb::t_MsgEnvelope.pack_cell(result, envelope));
+  return result;
+}
+
 td::Ref<vm::Cell> skipped_ordinary_description() {
   block::gen::TrComputePhase::Record_tr_phase_compute_skipped skipped;
   skipped.reason = block::gen::ComputeSkipReason::cskip_no_state;
@@ -81,7 +127,8 @@ td::Ref<vm::Cell> skipped_ordinary_description() {
 
 td::Ref<vm::Cell> make_transaction(std::uint64_t account, std::uint64_t pre_state,
                                    const td::Bits256& declared_post_state, std::uint64_t lt,
-                                   std::uint64_t total_fees = 0) {
+                                   std::uint64_t total_fees = 0, td::Ref<vm::Cell> in_message = {},
+                                   std::vector<td::Ref<vm::Cell>> out_messages = {}) {
   block::gen::HASH_UPDATE::Record update_record;
   update_record.old_hash = bits(pre_state);
   update_record.new_hash = declared_post_state;
@@ -94,11 +141,19 @@ td::Ref<vm::Cell> make_transaction(std::uint64_t account, std::uint64_t pre_stat
   transaction.prev_trans_hash = bits(900 + account);
   transaction.prev_trans_lt = lt - 1;
   transaction.now = 1'700'000'000;
-  transaction.outmsg_cnt = 0;
+  transaction.outmsg_cnt = static_cast<int>(out_messages.size());
   transaction.orig_status = block::gen::AccountStatus::acc_state_nonexist;
   transaction.end_status = block::gen::AccountStatus::acc_state_nonexist;
-  transaction.r1.in_msg = none();
-  transaction.r1.out_msgs = none();
+  vm::CellBuilder in_message_builder;
+  ASSERT_TRUE(in_message_builder.store_maybe_ref(std::move(in_message)));
+  transaction.r1.in_msg = in_message_builder.as_cellslice_ref();
+  vm::Dictionary out_dictionary{15};
+  for (unsigned i = 0; i < out_messages.size(); ++i) {
+    ASSERT_TRUE(out_dictionary.set_ref(td::BitArray<15>{i}, std::move(out_messages[i]), vm::Dictionary::SetMode::Add));
+  }
+  vm::CellBuilder out_dictionary_builder;
+  ASSERT_TRUE(std::move(out_dictionary).append_dict_to_bool(out_dictionary_builder));
+  transaction.r1.out_msgs = out_dictionary_builder.as_cellslice_ref();
   block::CurrencyCollection{static_cast<long long>(total_fees)}.pack_to(transaction.total_fees);
   transaction.state_update = std::move(state_update);
   transaction.description = skipped_ordinary_description();
@@ -129,9 +184,11 @@ td::Ref<vm::Cell> make_transaction(std::uint64_t account, std::uint64_t pre_stat
 }
 
 CanonicalTransactionPayload payload(std::uint64_t account, std::uint64_t pre_state, std::uint64_t lt,
-                                    std::uint64_t total_fees = 0) {
+                                    std::uint64_t total_fees = 0, td::Ref<vm::Cell> in_message = {},
+                                    std::vector<td::Ref<vm::Cell>> out_messages = {}) {
   auto post = account_none();
-  auto transaction = make_transaction(account, pre_state, post->get_hash().as_bits256(), lt, total_fees);
+  auto transaction = make_transaction(account, pre_state, post->get_hash().as_bits256(), lt, total_fees,
+                                      std::move(in_message), std::move(out_messages));
   return {.transaction_root = std::move(transaction), .post_account_state = std::move(post), .proof_journals = {}};
 }
 
@@ -168,6 +225,93 @@ TEST(ParallelTransactionPayload, CommitsCanonicalTotalFees) {
   ASSERT_TRUE(nonzero_fees.effects->total_fees == block::CurrencyCollection{123456});
   ASSERT_TRUE(zero_fees.effects->total_fees_hash != nonzero_fees.effects->total_fees_hash);
   ASSERT_TRUE(zero_fees.effects->effects_hash != nonzero_fees.effects->effects_hash);
+}
+
+TEST(ParallelTransactionPayload, ReconstructsCanonicalNewOutMsgRegistration) {
+  auto first_message = internal_message(10, 20, 100);
+  auto second_message = internal_message(10, 30, 101);
+  auto inspected = inspect_transaction_payload(payload(10, 100, 11, 0, {}, {first_message, second_message}));
+  ASSERT_TRUE(inspected);
+  ASSERT_EQ(inspected.effects->outbound_messages.size(), 2u);
+
+  block::MsgMetadata metadata{2, 0, bits(10), 9};
+  auto registered =
+      materialize_outbound_registrations(*inspected.effects, {.metadata_enabled = true, .metadata = metadata});
+  ASSERT_TRUE(registered);
+  ASSERT_TRUE(registered.batch);
+  ASSERT_EQ(registered.batch->messages.size(), 2u);
+  ASSERT_EQ(registered.batch->extra_out_msgs_delta, 2u);
+  ASSERT_EQ(registered.batch->min_message_lt, std::optional<ton::LogicalTime>{12});
+  ASSERT_EQ(registered.batch->messages[0].lt, 12u);
+  ASSERT_EQ(registered.batch->messages[1].lt, 13u);
+  ASSERT_EQ(registered.batch->messages[0].msg_idx, 0u);
+  ASSERT_EQ(registered.batch->messages[1].msg_idx, 1u);
+  ASSERT_EQ(registered.batch->messages[0].msg->get_hash(), first_message->get_hash());
+  ASSERT_EQ(registered.batch->messages[1].msg->get_hash(), second_message->get_hash());
+  ASSERT_EQ(registered.batch->messages[0].trans->get_hash(), inspected.effects->transaction_root->get_hash());
+  ASSERT_TRUE(registered.batch->messages[0].metadata);
+  ASSERT_TRUE(registered.batch->messages[0].metadata.value() == metadata);
+
+  auto without_metadata =
+      materialize_outbound_registrations(*inspected.effects, {.metadata_enabled = false, .metadata = metadata});
+  ASSERT_TRUE(without_metadata);
+  ASSERT_TRUE(!without_metadata.batch->messages[0].metadata);
+
+  auto tampered = *inspected.effects;
+  tampered.outbound_messages[0].message_hash = hash(999);
+  ASSERT_EQ(materialize_outbound_registrations(tampered, {}).error, OutboundRegistrationError::message_hash_mismatch);
+  tampered = *inspected.effects;
+  ++tampered.outbound_messages[1].logical_time;
+  ASSERT_EQ(materialize_outbound_registrations(tampered, {}).error, OutboundRegistrationError::logical_time_mismatch);
+}
+
+TEST(ParallelTransactionPayload, MaterializesExactInboundInternalDescriptorPair) {
+  auto message = internal_message(20, 10, 100);
+  auto inspected = inspect_transaction_payload(payload(10, 100, 11, 0, message));
+  ASSERT_TRUE(inspected);
+  ASSERT_EQ(inspected.effects->inbound_message_hash, std::optional<Hash256>{cell_hash(message)});
+  ASSERT_EQ(inspected.effects->inbound_message->get_hash(), message->get_hash());
+  auto bound_receipt =
+      build_worker_receipt({.lt = 1, .hash = cell_hash(message)}, 0, payload(10, 100, 11, 0, message)).move_as_ok();
+  ASSERT_TRUE(validate_worker_payload(payload(10, 100, 11, 0, message), bound_receipt));
+  bound_receipt.input.hash = hash(999);
+  ASSERT_EQ(validate_worker_payload(payload(10, 100, 11, 0, message), bound_receipt).error,
+            PayloadError::input_message_hash_mismatch);
+  auto envelope = message_envelope(message, 777);
+
+  auto descriptors = materialize_inbound_internal_descriptors(
+      *inspected.effects, {.message_envelope = envelope, .dequeued_from_current_shard = true});
+  ASSERT_TRUE(descriptors);
+  ASSERT_TRUE(descriptors.delta);
+  ASSERT_EQ(descriptors.delta->message_hash, cell_hash(message));
+  ASSERT_TRUE(descriptors.delta->in_msg_descriptor.not_null());
+  ASSERT_TRUE(descriptors.delta->out_msg_descriptor.not_null());
+
+  block::gen::InMsg::Record_msg_import_fin in_record;
+  ASSERT_TRUE(block::gen::t_InMsg.cell_unpack(descriptors.delta->in_msg_descriptor, in_record));
+  ASSERT_EQ(in_record.in_msg->get_hash(), envelope->get_hash());
+  ASSERT_EQ(in_record.transaction->get_hash(), inspected.effects->transaction_root->get_hash());
+  ASSERT_EQ(td::cmp(block::tlb::t_Grams.as_integer(in_record.fwd_fee), td::make_refint(777)), 0);
+
+  block::gen::OutMsg::Record_msg_export_deq_imm out_record;
+  ASSERT_TRUE(block::gen::t_OutMsg.cell_unpack(descriptors.delta->out_msg_descriptor, out_record));
+  ASSERT_EQ(out_record.out_msg->get_hash(), envelope->get_hash());
+  ASSERT_EQ(out_record.reimport->get_hash(), descriptors.delta->in_msg_descriptor->get_hash());
+
+  auto imported_only = materialize_inbound_internal_descriptors(
+      *inspected.effects, {.message_envelope = envelope, .dequeued_from_current_shard = false});
+  ASSERT_TRUE(imported_only);
+  ASSERT_TRUE(imported_only.delta->out_msg_descriptor.is_null());
+
+  auto other_message = internal_message(30, 10, 101);
+  ASSERT_EQ(materialize_inbound_internal_descriptors(*inspected.effects,
+                                                     {.message_envelope = message_envelope(other_message, 777)})
+                .error,
+            InboundDescriptorError::envelope_message_mismatch);
+  ASSERT_EQ(materialize_inbound_internal_descriptors(*inspect_transaction_payload(payload(10, 100, 11)).effects,
+                                                     {.message_envelope = envelope})
+                .error,
+            InboundDescriptorError::missing_inbound_message);
 }
 
 TEST(ParallelTransactionPayload, AppliesBasechainBlockLimitEffectsAtomically) {

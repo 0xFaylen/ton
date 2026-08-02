@@ -10,6 +10,7 @@
 #include <numeric>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace ton::validator::parallel_inbound {
@@ -139,6 +140,30 @@ struct PrefixDecision {
   }
 };
 
+// ProcessedUpto describes one continuous prefix of the canonical neighboring
+// queue, not independent per-account progress. A worker completion is never a
+// frontier update by itself.
+struct ProcessedUptoFrontier {
+  std::optional<MessageKey> last_processed;
+};
+
+enum class FrontierError {
+  none,
+  size_mismatch,
+  non_canonical_input,
+  input_not_after_frontier,
+};
+
+struct AtomicPrefixCommitResult {
+  FrontierError error{FrontierError::none};
+  PrefixDecision decision;
+  std::optional<std::size_t> item_index;
+
+  explicit operator bool() const {
+    return error == FrontierError::none;
+  }
+};
+
 struct LaneCeiling {
   double serial_work{0.0};
   double critical_path{0.0};
@@ -231,8 +256,47 @@ PrefixDecision commit_ready_prefix(const std::vector<CompletionStatus>& completi
   return result;
 }
 
+// Validates the complete queue slice before any callback is invoked, commits
+// only its ready canonical prefix, and publishes ProcessedUpto once for the
+// successfully committed prefix. A pending/failed/limited/commit-failed item
+// and every completed suffix after it remain strictly beyond the frontier.
+//
+// This deliberately preserves a useful committed prefix. "Atomic" refers to
+// coupling frontier publication to successful prefix commits; it is not an
+// all-or-nothing rollback of already applied serial coordinator mutations.
+template <class CanStart, class Commit>
+AtomicPrefixCommitResult commit_ready_prefix_and_publish_frontier(const std::vector<WorkItem>& items,
+                                                                  const std::vector<CompletionStatus>& completions,
+                                                                  ProcessedUptoFrontier& published_frontier,
+                                                                  CanStart&& can_start, Commit&& commit) {
+  AtomicPrefixCommitResult result;
+  if (items.size() != completions.size()) {
+    result.error = FrontierError::size_mismatch;
+    return result;
+  }
+  for (std::size_t i = 0; i < items.size(); ++i) {
+    if (i > 0 && !(items[i - 1].key < items[i].key)) {
+      result.error = FrontierError::non_canonical_input;
+      result.item_index = i;
+      return result;
+    }
+    if (published_frontier.last_processed && !(published_frontier.last_processed.value() < items[i].key)) {
+      result.error = FrontierError::input_not_after_frontier;
+      result.item_index = i;
+      return result;
+    }
+  }
+
+  result.decision = commit_ready_prefix(completions, std::forward<CanStart>(can_start), std::forward<Commit>(commit));
+  if (result.decision.committed_count != 0) {
+    published_frontier.last_processed = items[result.decision.committed_count - 1].key;
+  }
+  return result;
+}
+
 const char* to_string(PlanError error);
 const char* to_string(PrefixStopReason reason);
 const char* to_string(ReceiptError error);
+const char* to_string(FrontierError error);
 
 }  // namespace ton::validator::parallel_inbound

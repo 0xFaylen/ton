@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "block/block.h"
+#include "block/transaction.h"
 #include "td/utils/Status.h"
 #include "vm/cells/Cell.h"
 
@@ -48,6 +49,8 @@ struct CanonicalTransactionEffects {
   block::CurrencyCollection total_fees;
   td::Ref<vm::Cell> transaction_root;
   td::Ref<vm::Cell> post_account_state;
+  std::optional<Hash256> inbound_message_hash;
+  td::Ref<vm::Cell> inbound_message;
   std::vector<OutboundMessageEffect> outbound_messages;
 };
 
@@ -62,6 +65,7 @@ enum class PayloadError {
   invalid_post_account_state,
   post_state_hash_mismatch,
   malformed_description,
+  invalid_in_message,
   invalid_out_message_dictionary,
   logical_time_overflow,
   invalid_proof_journal,
@@ -72,6 +76,7 @@ enum class PayloadError {
   post_state_mismatch,
   effects_hash_mismatch,
   proof_journal_hash_mismatch,
+  input_message_hash_mismatch,
   transaction_start_lt_mismatch,
   transaction_end_lt_mismatch,
   gas_used_mismatch,
@@ -162,8 +167,85 @@ BasechainLimitApplyResult apply_basechain_block_limits_atomic(block::BlockLimitS
                                                               const std::vector<CanonicalTransactionEffects>& effects,
                                                               const std::vector<BasechainLimitContext>& contexts);
 
+struct OutboundRegistrationContext {
+  bool metadata_enabled{false};
+  td::optional<block::MsgMetadata> metadata;
+};
+
+struct CanonicalOutboundRegistrationBatch {
+  std::vector<block::NewOutMsg> messages;
+  std::optional<ton::LogicalTime> min_message_lt;
+  std::size_t extra_out_msgs_delta{0};
+};
+
+enum class OutboundRegistrationError {
+  none,
+  missing_transaction,
+  missing_message,
+  invalid_message,
+  message_hash_mismatch,
+  logical_time_mismatch,
+};
+
+struct OutboundRegistrationResult {
+  OutboundRegistrationError error{OutboundRegistrationError::none};
+  std::optional<std::size_t> message_index;
+  std::optional<CanonicalOutboundRegistrationBatch> batch;
+
+  explicit operator bool() const {
+    return error == OutboundRegistrationError::none;
+  }
+};
+
+// Reconstructs exactly the NewOutMsg objects created by
+// Collator::register_new_msgs(). Metadata is coordinator-owned routing context
+// and is never accepted from the worker payload.
+OutboundRegistrationResult materialize_outbound_registrations(const CanonicalTransactionEffects& effects,
+                                                              const OutboundRegistrationContext& context);
+
+struct InboundDescriptorContext {
+  td::Ref<vm::Cell> message_envelope;
+  bool dequeued_from_current_shard{false};
+};
+
+struct CanonicalInboundDescriptorDelta {
+  Hash256 message_hash{};
+  td::Ref<vm::Cell> in_msg_descriptor;
+  td::Ref<vm::Cell> out_msg_descriptor;
+};
+
+enum class InboundDescriptorError {
+  none,
+  missing_transaction,
+  missing_inbound_message,
+  missing_message_envelope,
+  invalid_inbound_message,
+  non_internal_inbound_message,
+  malformed_message_envelope,
+  envelope_message_mismatch,
+  cannot_serialize_in_msg,
+  cannot_serialize_out_msg,
+};
+
+struct InboundDescriptorResult {
+  InboundDescriptorError error{InboundDescriptorError::none};
+  std::optional<CanonicalInboundDescriptorDelta> delta;
+
+  explicit operator bool() const {
+    return error == InboundDescriptorError::none;
+  }
+};
+
+// Materializes the exact msg_import_fin descriptor and, when the message is
+// dequeued from this shard's own queue, its paired msg_export_deq_imm record.
+// Queue deletion and dictionary insertion stay serialized coordinator work.
+InboundDescriptorResult materialize_inbound_internal_descriptors(const CanonicalTransactionEffects& effects,
+                                                                 const InboundDescriptorContext& context);
+
 const char* to_string(PayloadError error);
 const char* to_string(PrecommitError error);
 const char* to_string(BasechainLimitError error);
+const char* to_string(OutboundRegistrationError error);
+const char* to_string(InboundDescriptorError error);
 
 }  // namespace ton::validator::parallel_inbound

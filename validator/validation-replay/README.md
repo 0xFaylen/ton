@@ -1,12 +1,10 @@
 # Validation replay
 
-The large single-shard execution track is documented in
-[`PARALLEL_SINGLE_SHARD_EXECUTOR.ru.md`](PARALLEL_SINGLE_SHARD_EXECUTOR.ru.md).
-Its first artifact is a pure prefix-safe account-lane scheduler with regression
-tests. It is not wired into the live collator yet. The bounded source review is
-kept in [`PARALLEL_EXECUTION_RESEARCH.md`](PARALLEL_EXECUTION_RESEARCH.md). The
-current worker/coordinator commitment contract and its remaining safety gates
-are specified in [`PSAE_RECEIPT_ABI.ru.md`](PSAE_RECEIPT_ABI.ru.md).
+The bounded source review for the single-shard execution track is kept in
+[`PARALLEL_EXECUTION_RESEARCH.md`](PARALLEL_EXECUTION_RESEARCH.md). Executable
+worker/coordinator contracts live in `validator/impl/parallel-*` and their
+regression tests live in `test/validator/test-parallel-*`. The implementation is
+not wired into the live collator yet.
 
 `ValidationReplayer` reruns collation, validation, or both against blocks and
 states already present in a C++ validator database. It is intended for
@@ -124,9 +122,14 @@ This field is an ABI/equivalence check, not parallel execution. Transaction
 replay supplies no proof journals or collator `CellUsageTree`, so it makes no
 block-size claim. It also does not reconstruct the special mint/recover routing
 context, so reported limit gas is the billed-gas sum rather than a claim about
-the historical block-limit counter. Descriptors, queues, `ProcessedUpto`,
-account dictionary proofs, storage-dictionary updates, and state merge are not
-applied.
+the historical block-limit counter. Descriptor dictionaries, queues,
+`ProcessedUpto`, account dictionary proofs, storage-dictionary updates, and
+state merge are not applied. `NewOutMsg` registrations are nevertheless
+materialized with coordinator-derived metadata, and every ordinary
+`msg_import_fin` in the replay scope is rebuilt byte-for-byte together with its
+optional `msg_export_deq_imm` pair. The pure scheduler gate separately proves
+that `ProcessedUpto` can advance only to the last successfully committed item
+of a continuous canonical prefix; it is not wired into live collation.
 
 The replay JSON also contains `account_lane_ceiling`. It groups measured
 transaction and TVM wall time by account and reports greedy ideal makespans for
