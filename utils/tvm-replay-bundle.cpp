@@ -109,6 +109,13 @@ struct BlockContext {
   Ref<vm::Cell> out_msg_descr;
   Ref<vm::Cell> account_blocks;
   Ref<vm::Cell> state_update;
+  std::size_t file_bytes = 0;
+};
+
+struct LoadedBlock {
+  BlockIdExt id;
+  Ref<vm::Cell> root;
+  std::size_t file_bytes = 0;
 };
 
 struct LoadedState {
@@ -186,6 +193,18 @@ struct ReplayResult {
   std::size_t out_msg_queue_deletions_bound = 0;
   std::string out_msg_queue_transition_status = "not_run";
   std::size_t augmented_dictionary_roots_validated = 0;
+  td::uint32 consensus_max_block_bytes = 0;
+  td::uint32 consensus_max_collated_bytes = 0;
+  td::uint32 consensus_protocol_version = 0;
+  td::uint32 consensus_slots_per_leader_window = 0;
+  td::uint64 consensus_target_rate_ms = 0;
+  td::uint64 consensus_min_block_interval_ms = 0;
+  double phase_setup_seconds = 0.0;
+  double phase_account_replay_seconds = 0.0;
+  double phase_block_limits_seconds = 0.0;
+  double phase_coordinator_seconds = 0.0;
+  double phase_augmented_roots_seconds = 0.0;
+  double replay_total_seconds = 0.0;
   TvmHotpathStats hotpaths;
   std::map<StdSmcAddress, AccountWork> account_work;
 
@@ -210,11 +229,9 @@ struct ParallelAccountReplayProbe {
   }
 };
 
-td::Result<std::pair<BlockIdExt, Ref<vm::Cell>>> load_block_from_archive(const std::string& archive,
-                                                                         const BlockId& requested_id) {
+td::Result<LoadedBlock> load_block_from_archive(const std::string& archive, const BlockId& requested_id) {
   TRY_RESULT(package, ton::Package::open(archive, true, false));
-  BlockIdExt found_id;
-  Ref<vm::Cell> found_root;
+  LoadedBlock found;
   td::Status scan_status = td::Status::OK();
   std::size_t matches = 0;
 
@@ -243,29 +260,31 @@ td::Result<std::pair<BlockIdExt, Ref<vm::Cell>>> load_block_from_archive(const s
             scan_status = root.move_as_error_prefix("cannot deserialize requested block: ");
             return;
           }
-          found_root = root.move_as_ok();
-          if (td::Bits256(found_root->get_hash().bits()) != block_ref.block_id.root_hash) {
+          found.root = root.move_as_ok();
+          if (td::Bits256(found.root->get_hash().bits()) != block_ref.block_id.root_hash) {
             scan_status = td::Status::Error("requested block root hash does not match its archive filename");
-            found_root.clear();
+            found.root.clear();
             return;
           }
-          found_id = block_ref.block_id;
+          found.id = block_ref.block_id;
+          found.file_bytes = data.size();
         },
         [&](const auto&) {}));
     return scan_status.is_ok();
   }));
 
   TRY_STATUS(std::move(scan_status));
-  if (found_root.is_null()) {
+  if (found.root.is_null()) {
     return td::Status::Error(PSTRING() << "block " << requested_id.to_str() << " was not found in archive");
   }
-  return std::make_pair(found_id, found_root);
+  return found;
 }
 
-td::Result<BlockContext> unpack_block_context(std::pair<BlockIdExt, Ref<vm::Cell>> block_data) {
+td::Result<BlockContext> unpack_block_context(LoadedBlock block_data) {
   BlockContext result;
-  result.id = block_data.first;
-  result.root = std::move(block_data.second);
+  result.id = block_data.id;
+  result.root = std::move(block_data.root);
+  result.file_bytes = block_data.file_bytes;
   TRY_STATUS(block::unpack_block_prev_blk_try(result.root, result.id, result.prev, result.mc_id, result.after_split));
 
   block::gen::Block::Record block_record;
@@ -869,6 +888,8 @@ td::Result<ReplayResult> replay_transactions(const std::string& archive, const B
                                              const std::vector<LoadedAccountProof>& account_proofs,
                                              const LoadedLibraryBodies* library_bodies, bool profile_ed25519,
                                              bool validate_augmented_roots) {
+  td::Timer replay_timer;
+  ReplayResult result;
   TRY_STATUS(verify_replay_scope(target));
   if ((prev_state != nullptr && prev_state->record.global_id != target.global_id) ||
       mc_state.record.global_id != target.global_id) {
@@ -898,6 +919,14 @@ td::Result<ReplayResult> replay_transactions(const std::string& archive, const B
   if (config->get_global_blockchain_id() != target.global_id) {
     return td::Status::Error("masterchain configuration global id does not match the target block");
   }
+  const auto consensus_config = config->get_new_consensus_config(target.id.id.workchain);
+  result.consensus_max_block_bytes = consensus_config.max_block_size;
+  result.consensus_max_collated_bytes = consensus_config.max_collated_data_size;
+  result.consensus_protocol_version = consensus_config.protocol_version;
+  result.consensus_slots_per_leader_window = consensus_config.slots_per_leader_window;
+  result.consensus_target_rate_ms = static_cast<td::uint64>(consensus_config.noncritical_params.target_rate.count());
+  result.consensus_min_block_interval_ms =
+      static_cast<td::uint64>(consensus_config.noncritical_params.min_block_interval.count());
   TRY_RESULT(prev_blocks_info, config->get_prev_blocks_info());
 
   block::tlb::Aug_InMsgDescr in_msg_augmentation{config->get_global_version()};
@@ -924,7 +953,8 @@ td::Result<ReplayResult> replay_transactions(const std::string& archive, const B
   vm::AugmentedDictionary account_blocks{vm::load_cell_slice_ref(target.account_blocks), 256,
                                          block::tlb::aug_ShardAccountBlocks};
 
-  ReplayResult result;
+  result.phase_setup_seconds = replay_timer.elapsed();
+  double phase_checkpoint = result.phase_setup_seconds;
   std::vector<CanonicalTransactionEffects> canonical_limit_effects;
   std::vector<ton::validator::parallel_inbound::BasechainLimitContext> canonical_limit_contexts;
   std::vector<ShadowCoordinatorCandidate> shadow_coordinator_candidates;
@@ -1240,6 +1270,9 @@ td::Result<ReplayResult> replay_transactions(const std::string& archive, const B
     return td::Status::Error(PSTRING() << "replay requires public library bodies absent from --library-bodies: "
                                        << join_library_hashes(missing_libraries));
   }
+  auto phase_elapsed = replay_timer.elapsed();
+  result.phase_account_replay_seconds = phase_elapsed - phase_checkpoint;
+  phase_checkpoint = phase_elapsed;
   block::BlockLimits shadow_limits;
   auto synthetic_usage_tree = std::make_shared<vm::CellUsageTree>();
   shadow_limits.usage_tree = synthetic_usage_tree.get();
@@ -1257,6 +1290,9 @@ td::Result<ReplayResult> replay_transactions(const std::string& archive, const B
   result.basechain_limit_accounts = shadow_limit_status.accounts;
   result.basechain_limit_gas = shadow_limit_status.gas_used;
   result.basechain_limit_max_end_lt = shadow_limit_status.cur_lt;
+  phase_elapsed = replay_timer.elapsed();
+  result.phase_block_limits_seconds = phase_elapsed - phase_checkpoint;
+  phase_checkpoint = phase_elapsed;
 
   std::sort(shadow_coordinator_candidates.begin(), shadow_coordinator_candidates.end(),
             [](const auto& left, const auto& right) { return left.work.key < right.work.key; });
@@ -1333,6 +1369,9 @@ td::Result<ReplayResult> replay_transactions(const std::string& archive, const B
   result.shadow_coordinator_out_descriptors = coordinator_state.out_msg_descriptors.size();
   result.shadow_coordinator_queue_deletions = expected_queue_deletions;
   result.shadow_coordinator_new_messages = coordinator_state.new_messages.size();
+  phase_elapsed = replay_timer.elapsed();
+  result.phase_coordinator_seconds = phase_elapsed - phase_checkpoint;
+  phase_checkpoint = phase_elapsed;
 
   if (validate_augmented_roots && result.skipped_accounts == 0 && !account_proofs.empty()) {
     std::string root_stage = "extract_update_views";
@@ -1586,6 +1625,9 @@ td::Result<ReplayResult> replay_transactions(const std::string& archive, const B
     return td::Status::Error(
         "--collated-data requires complete account-proof replay scope and an exact four-root transition");
   }
+  phase_elapsed = replay_timer.elapsed();
+  result.phase_augmented_roots_seconds = phase_elapsed - phase_checkpoint;
+  result.replay_total_seconds = phase_elapsed;
   return result;
 }
 
@@ -1635,7 +1677,10 @@ td::Status validate_account_replay_batch(const ReplayResult& reference,
   std::map<StdSmcAddress, std::size_t> account_transactions;
   for (const auto& lane : lanes) {
     const auto& replay = lane->ok();
-    if (replay.target_accounts != reference.target_accounts || replay.augmented_dictionary_roots_validated != 0) {
+    if (replay.target_accounts != reference.target_accounts || replay.augmented_dictionary_roots_validated != 0 ||
+        replay.consensus_max_block_bytes != reference.consensus_max_block_bytes ||
+        replay.consensus_max_collated_bytes != reference.consensus_max_collated_bytes ||
+        replay.consensus_target_rate_ms != reference.consensus_target_rate_ms) {
       return td::Status::Error("parallel account replay lane escaped its isolated-account scope");
     }
     for (const auto& [address, work] : replay.account_work) {
@@ -1864,6 +1909,76 @@ std::string account_lane_ceiling_json(const ReplayResult& replay) {
   return out.as_cslice().str();
 }
 
+std::string single_shard_capacity_json(const BlockContext& target, const ReplayResult& replay,
+                                       const ParallelAccountReplayProbe* parallel_probe) {
+  const double target_rate_seconds = static_cast<double>(replay.consensus_target_rate_ms) / 1000.0;
+  const double bytes_per_raw_transaction =
+      replay.transactions > 0
+          ? static_cast<double>(target.file_bytes) / static_cast<double>(replay.transactions)
+          : 0.0;
+  const bool byte_projection_available = target_rate_seconds > 0.0 && target.file_bytes > 0 &&
+                                         replay.transactions > 0 && replay.consensus_max_block_bytes > 0;
+  const double byte_ceiling_raw_tps =
+      byte_projection_available
+          ? static_cast<double>(replay.transactions) * static_cast<double>(replay.consensus_max_block_bytes) /
+                static_cast<double>(target.file_bytes) / target_rate_seconds
+          : 0.0;
+
+  td::StringBuilder out;
+  out << "{\"status\":\"incomplete_requires_collator_validate_query_and_saturated_workload\""
+      << ",\"metric\":\"raw_transactions_per_second\""
+      << ",\"operation_tps\":null"
+      << ",\"config_source_masterchain_id\":\"" << target.mc_id.to_str() << "\""
+      << ",\"config29\":{\"max_block_bytes\":" << replay.consensus_max_block_bytes
+      << ",\"max_collated_bytes\":" << replay.consensus_max_collated_bytes << "}"
+      << ",\"config30\":{\"protocol_version\":" << replay.consensus_protocol_version
+      << ",\"slots_per_leader_window\":" << replay.consensus_slots_per_leader_window
+      << ",\"target_rate_ms\":" << replay.consensus_target_rate_ms
+      << ",\"min_block_interval_ms\":" << replay.consensus_min_block_interval_ms << "}"
+      << ",\"sample\":{\"block_file_bytes\":" << target.file_bytes
+      << ",\"raw_transactions\":" << replay.transactions << ",\"distinct_accounts\":" << replay.accounts
+      << ",\"bytes_per_raw_transaction\":" << bytes_per_raw_transaction
+      << ",\"max_block_fill_ratio\":"
+      << (replay.consensus_max_block_bytes > 0
+              ? static_cast<double>(target.file_bytes) / replay.consensus_max_block_bytes
+              : 0.0)
+      << "}"
+      << ",\"workload_byte_projection_raw_tps\":";
+  if (byte_projection_available) {
+    out << byte_ceiling_raw_tps;
+  } else {
+    out << "null";
+  }
+  out << ",\"three_raw_transactions_per_operation_byte_projection_tps\":";
+  if (byte_projection_available) {
+    out << byte_ceiling_raw_tps / 3.0;
+  } else {
+    out << "null";
+  }
+  out << ",\"serial_replay_raw_tps\":";
+  if (parallel_probe != nullptr && parallel_probe->serial_wall_seconds > 0.0) {
+    out << static_cast<double>(replay.transactions) / parallel_probe->serial_wall_seconds;
+  } else {
+    out << "null";
+  }
+  out << ",\"parallel_replay_raw_tps\":";
+  if (parallel_probe != nullptr && parallel_probe->parallel_wall_seconds > 0.0) {
+    out << static_cast<double>(replay.transactions) / parallel_probe->parallel_wall_seconds;
+  } else {
+    out << "null";
+  }
+  out << ",\"mainnet_sustainable_raw_tps\":null"
+      << ",\"missing_gates\":[\"live_collator_integration\",\"validate_query_wall\","
+         "\"four_root_commit_wall\",\"multi_block_saturated_workload\","
+         "\"network_candidate_delivery\"]"
+      << ",\"warnings\":[\"linear_block_boc_density_projection\",\"mixed_raw_transaction_workload\","
+         "\"isolated_replay_is_not_collation\",\"offline_root_probe_is_not_live_collator_commit\","
+         "\"three_transaction_operation_is_not_workload_classification\","
+         "\"target_rate_is_not_observed_block_interval\",\"max_block_bytes_may_not_be_active_limit\","
+         "\"collated_bytes_are_not_block_bytes\"]}";
+  return out.as_cslice().str();
+}
+
 std::string replay_json(const BlockContext& target, const LoadedState* account_state,
                         const std::vector<LoadedAccountProof>& account_proofs, const LoadedState& mc_state,
                         const LoadedLibraryBodies* library_bodies, const ReplayResult& replay, bool profile_ed25519,
@@ -1953,6 +2068,13 @@ std::string replay_json(const BlockContext& target, const LoadedState* account_s
       << ",\"proof_journals\":\"empty_in_transaction_replay\""
       << ",\"processed_upto\":\"atomic_shadow_prefix_applied_for_inbound_fin_subset\""
       << ",\"global_effects\":\"atomic_shadow_applied_not_live_collator_dictionaries\"}"
+      << ",\"replay_phases_wall\":{\"setup_seconds\":" << replay.phase_setup_seconds
+      << ",\"account_replay_seconds\":" << replay.phase_account_replay_seconds
+      << ",\"block_limits_seconds\":" << replay.phase_block_limits_seconds
+      << ",\"coordinator_seconds\":" << replay.phase_coordinator_seconds
+      << ",\"augmented_roots_seconds\":" << replay.phase_augmented_roots_seconds
+      << ",\"augmented_roots_validated\":" << replay.augmented_dictionary_roots_validated
+      << ",\"total_seconds\":" << replay.replay_total_seconds << "}"
       << ",\"hotpaths_wall\":" << replay.hotpaths.to_json(false, 0, replay.hotpaths.size());
 #if TD_WINDOWS
   out << ",\"hotpaths_cpu\":null,\"cpu_metric_status\":\"unsupported_windows_timer_resolution\"";
@@ -1999,7 +2121,7 @@ std::string replay_json(const BlockContext& target, const LoadedState* account_s
         << ",\"excludes\":[\"augmented_root_commit\",\"collator_integration\",\"worker_pool_reuse\","
            "\"network\",\"consensus\"]}";
   }
-  out << "}";
+  out << ",\"single_shard_capacity\":" << single_shard_capacity_json(target, replay, parallel_probe) << "}";
   return out.as_cslice().str();
 }
 

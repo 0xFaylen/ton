@@ -209,12 +209,32 @@ runs are required.
 It excludes the augmented-root commit, a reusable actor/worker pool, live
 collator integration, network, and consensus. Its `wall_speedup` is therefore a
 measured isolated-account replay result, not shard TPS. On the copied 51-tx,
-29-account block, ten independent Debug processes at each width passed the
-equivalence gate. Median speedups were 1.75x at two workers, 2.74x at four, and
-2.97x at eight; interquartile ranges were 1.65-1.94x, 2.48-3.09x, and
-2.60-3.19x respectively.
-Release throughput remains unpublished because the existing Release build is
-blocked before this target by a missing `absl/hash/hash.h` include path.
+29-account block, ten independent `-O3` Release processes at each width passed
+the equivalence gate. Median speedups were 1.57x at two workers, 2.15x at four,
+and 2.45x at eight; interquartile ranges were 1.49-1.95x, 1.99-2.41x, and
+2.20-2.73x respectively. Median isolated replay rates were about 3.1k raw tx/s
+for the serial baseline, 6.6k at four workers, and 8.0k at eight workers. The
+Release target builds after supplying the repository's vendored Abseil include
+path to the local CMake cache; no dependency source was changed.
+
+The output also contains `single_shard_capacity`. It reads Config 29/30 from
+the state-bound masterchain proof and reports the exact archive block-file size.
+For the copied basechain block `87341675`, Config 29 at masterchain seqno
+`82773023` sets `max_block_bytes=2097152` and
+`max_collated_bytes=10485760`. These are separate limits: the latter bounds
+collated witness data and is not additional block payload. The 113,736-byte
+sample contains 51 raw transactions, or 2,230 bytes/tx. A linear projection of
+that exact density into 2 MiB at the Config 30 target rate of 400 ms is 2,351
+raw tx/s. Dividing it by three gives a conditional 784 operations/s only for a
+workload that actually consumes three raw transactions per operation at the
+same byte density.
+
+Those two values are byte projections, not sustainable mainnet throughput. The
+sample block is only 5.42% of `max_block_bytes`; it is neither saturated nor a
+classified jetton or DEX workload. The JSON therefore keeps
+`mainnet_sustainable_raw_tps=null` until live collator integration,
+`ValidateQuery` wall time, exact four-root commit time, candidate delivery, and
+a representative saturated multi-block corpus have all passed.
 
 The shard archive anchors the predecessor state through the intervening block
 chain. The masterchain archive anchors the configuration state by requiring its

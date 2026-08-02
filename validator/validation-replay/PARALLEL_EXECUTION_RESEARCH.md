@@ -1,6 +1,6 @@
 # Parallel single-shard execution research log
 
-Cutoff: 2026-07-31. This file records the bounded three-round source pass used
+Cutoff: 2026-08-02. This file records the bounded three-round source pass used
 to choose the implementation direction. Primary sources are preferred; project
 marketing numbers are not treated as TON performance forecasts.
 
@@ -103,11 +103,12 @@ its proof subset. The batch fails unless the lane union exactly matches all
 historical transaction hashes, resulting account-state hashes, account-chain
 lengths, and canonical effect counters.
 
-Ten independent Debug processes for each width on copied basechain block
+Ten independent `-O3` Release processes for each width on copied basechain block
 `87341675` all passed for 51 transactions and 29 accounts. Median measured wall
-speedup was 1.75x at two workers, 2.74x at four, and 2.97x at eight;
-interquartile ranges were 1.65-1.94x, 2.48-3.09x, and 2.60-3.19x respectively.
-The corresponding single-worker probe wall was approximately 0.10 seconds.
+speedup was 1.57x at two workers, 2.15x at four, and 2.45x at eight;
+interquartile ranges were 1.49-1.95x, 1.99-2.41x, and 2.20-2.73x respectively.
+The median isolated serial replay rate was about 3.1k raw tx/s; the four- and
+eight-worker medians were 6.6k and 8.0k raw tx/s.
 These timings include thread creation/join and intentionally duplicate config
 extraction, the full account dictionary scan, and shadow effect checking per
 lane.
@@ -119,8 +120,52 @@ scale across independent account chains on this input. It does not establish a
 single-shard TPS gain: augmented-root commit, collator scheduling, reusable
 workers, CellUsageTree/proof merge, network, consensus, block bytes, and a
 representative multi-block workload remain outside the measurement. The Release
-build still fails before this target on the known missing
-`absl/hash/hash.h` include path, so no production-rate number is reported.
+target now builds after supplying the checked-in Abseil include path to the local
+CMake cache. This fixes the measurement environment, not any TON source or
+dependency.
+
+## Single-shard capacity boundary — 2026-08-02
+
+The replay now reports protocol limits, exact block-file density, phase wall
+times, and deliberately incomplete capacity projections in one JSON object.
+The copied masterchain config proof at seqno `82773023` establishes:
+
+- `max_block_bytes = 2,097,152`;
+- `max_collated_bytes = 10,485,760`;
+- target block rate `400 ms` and minimum block interval `300 ms`.
+
+The 10 MiB collated-data limit is a separate witness budget and cannot be added
+to the 2 MiB block budget. The target block file is 113,736 bytes for 51 raw
+transactions across 29 accounts. Its measured density is 2,230.12 bytes per raw
+transaction and its file is 5.42% of the configured block-byte limit.
+
+At unchanged density, the linear block-byte projection is:
+
+`51 * 2,097,152 / 113,736 / 0.4 = 2,350.94 raw tx/s`.
+
+If, and only if, one workload operation consumes three raw transactions at that
+same density, the corresponding conditional projection is 783.65 operations/s.
+This is not jetton workload classification and is not a measured operation rate.
+
+The Release account replay is faster than that byte projection even before
+parallelism: approximately 3.1k raw tx/s serial, 6.6k at four workers and 8.0k
+at eight. On this sample, isolated TVM/account compute is therefore not the
+first projected ceiling. The executor still creates useful headroom for denser
+or more expensive workloads, but it cannot by itself turn that headroom into
+single-shard TPS.
+
+The actual sustainable mainnet value remains unknown and is encoded as `null`.
+It is bounded by the minimum of block bytes, collator wall time, validator
+`ValidateQuery` wall time, exact state-root commit, and candidate delivery. A
+single low-fill block cannot establish any of those saturated limits. The
+previously discussed 476 jTPS number is excluded because the refreshed public
+benchmark refs did not provide a reproducible primary artifact for it.
+
+The 2026-08-02 overlap refresh found no public intra-block executor in current
+`origin/master` or `origin/testnet`. PR #2485 remains the dedicated-collator
+deployment boundary, while the testnet changes after merged PR #2505 remain in
+the networking/Plumtree path. This is only a public-code overlap result; it does
+not establish the absence of private work.
 
 The next shadow instrumentation is now implemented but not yet measured. Exact
 offline collation records only successful ordinary-transaction creation wall by
