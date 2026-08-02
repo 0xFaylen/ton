@@ -14,6 +14,7 @@ class TransactionEmulator {
   int vm_log_verbosity_;
   ton::UnixTime unixtime_;
   ton::LogicalTime lt_;
+  ton::LogicalTime block_lt_;
   td::BitArray<256> rand_seed_;
   bool ignore_chksig_;
   bool profile_ed25519_;
@@ -27,6 +28,7 @@ class TransactionEmulator {
       , vm_log_verbosity_(vm_log_verbosity)
       , unixtime_(0)
       , lt_(0)
+      , block_lt_(0)
       , rand_seed_(td::BitArray<256>::zero())
       , ignore_chksig_(false)
       , profile_ed25519_(false)
@@ -100,6 +102,7 @@ class TransactionEmulator {
 
   void set_unixtime(ton::UnixTime unixtime);
   void set_lt(ton::LogicalTime lt);
+  void set_block_lt(ton::LogicalTime block_lt);
   void set_rand_seed(td::BitArray<256>& rand_seed);
   void set_ignore_chksig(bool ignore_chksig);
   void set_profile_ed25519(bool profile_ed25519);

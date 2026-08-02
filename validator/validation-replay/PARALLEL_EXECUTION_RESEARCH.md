@@ -338,12 +338,10 @@ number from either block is retained.
 Inspection now prints the exact predecessor shard block as the recommended
 account-proof reference, and the loader accepts proofs directly bound to that
 block in addition to the existing masterchain-bound form. This removes the
-intermediate-history ambiguity for newly collected linear-block fixtures. The
-direct predecessor path is source-validated and compiled, but a positive copied
-fixture has not yet been collected. The existing 51-transaction fixture still
-passes full replay and the executable four-worker equivalence gate. A copied
-validator database remains necessary for real Collator and ValidateQuery wall
-measurements; archive packages and account proofs are not a substitute.
+intermediate-history ambiguity for newly collected linear-block fixtures. A
+fresh positive fixture is recorded below. A copied validator database remains
+necessary for real Collator and ValidateQuery wall measurements; archive
+packages and account proofs are not a substitute.
 
 ## Verified raw-block input gate - 2026-08-02
 
@@ -373,8 +371,50 @@ and output overwrite were rejected.
 This gate makes small, immutable fixtures collectable from a lite server. It
 does not measure live-node capacity, run Collator or ValidateQuery, retain
 historical candidate collated data, or establish sustainable single-shard TPS.
-The network `saveblock` request path compiled but was not exercised against the
-latency-sensitive production node in this checkpoint.
+The network path is now exercised under the bounded collection described below.
+
+## Fresh exact-predecessor mainnet gate - 2026-08-02
+
+A bounded read-only lite-server pass collected and verified 32 consecutive
+basechain block BOCs at seqnos `88028060..88028091`. The files contain 696 raw
+transactions in total, 20 blocks are non-empty, and their serialized size is
+1,850,656 bytes. Collection used block/proof/library queries only: no validator
+restart, configuration change, database scan, consensus participation, or
+validation workload was performed. The node service remained active with zero
+restarts, `/var` remained at 37%, block-sync queues remained empty, and the
+observed I/O pressure stayed below the collection stop threshold.
+
+Block `88028077` was selected before timing because it is the largest member of
+the slice: 374,873 bytes, 138 transactions, 108 touched accounts and at most 11
+transactions on one account. Every account proof is bound to exact predecessor
+`88028076`; the config proof is bound to masterchain block `83522569`.
+
+The first strict replay failed on transaction LT `94139016000005`. It was not a
+Config 45/precompiled-gas issue: the failing code hash differed from the active
+precompiled entry. The direct library scan had found 11 public-library refs, but
+those bodies contained three additional library refs. Running with the partial
+set changed VM exit code from the historical 0 to 9 and produced two messages
+instead of four. The loader now rejects any non-transitively-closed combined
+library body set and reports the missing hashes. Supplying the three verified
+transitive bodies restored exact execution.
+
+The complete Release replay then matched all 138 historical transaction hashes
+and all 138 resulting account-state hashes across 108/108 accounts. It validated
+134 TVM executions, 19,226 VM steps, 791,308 billed gas and 30 Ed25519 checks.
+The isolated account probe measured 166.568 ms serial and 46.424 ms with four
+workers, a 3.588x wall speedup, with the 108 accounts distributed 26/28/27/27.
+This is one process sample and includes thread creation plus deliberately
+duplicated per-lane setup; it excludes live Collator integration, reusable actor
+workers, augmented-root commit, ValidateQuery, network and consensus.
+
+The target is only 17.88% of the 2 MiB serialized candidate cap. Its linear
+byte-envelope projection is 1,930 raw tx/s at the 400 ms configured target rate;
+this is lower than the older sparse-corpus fits and remains an extrapolation of
+a mixed, unsaturated workload. `mainnet_sustainable_raw_tps` therefore remains
+`null`. The exact-predecessor proof set binds the old ShardAccounts root and the
+replay reconstructs the two descriptor roots. Matching historical collated data
+is still required for the ShardAccounts and OutMsgQueue transition roots; the
+result correctly reports two validated roots rather than four.
 
 ## Dead ends and cautions
 

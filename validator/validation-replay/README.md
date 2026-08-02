@@ -121,9 +121,10 @@ reproducible without replay state. The output also contains explicitly labelled
 ordinary-least-squares diagnostics for all blocks, non-empty blocks, and blocks
 with at least 40 transactions. These values describe finalized block BOCs; they
 are not `BlockLimitStatus` estimates or a sustainable-TPS measurement. The
-inspection output also reports `recommended_account_proof_reference`. For a
-linear block this is the exact predecessor shard block, which avoids advancing
-older account proofs through intermediate blocks.
+inspection output reports the block file size, LT interval, account/transaction
+counts and `recommended_account_proof_reference`. For a linear block the latter
+is the exact predecessor shard block, which avoids advancing older account
+proofs through intermediate blocks.
 
 For every account covered by the supplied state, the tool re-executes the
 historical transaction chain and requires both the serialized transaction hash
@@ -264,6 +265,17 @@ classified jetton or DEX workload. The JSON therefore keeps
 `ValidateQuery` wall time, exact four-root commit time, candidate delivery, and
 a representative saturated multi-block corpus have all passed.
 
+A fresh exact-predecessor raw-BOC replay of basechain block `88028077` covers
+138 transactions across all 108 touched accounts. Its 374,873-byte BOC occupies
+17.88% of the 2 MiB candidate cap. All historical transaction and resulting
+account-state hashes match. One Release process measured 166.6 ms for the
+isolated serial account replay and 46.4 ms with four workers, or 3.59x. This is
+an isolated-account replay result, not block collation or shard TPS. The same
+sample gives a 1,930 raw tx/s linear byte-envelope projection, but remains far
+from saturation and keeps `mainnet_sustainable_raw_tps=null`. Without matching
+historical collated data it validates the two descriptor roots, not the complete
+four-root state transition.
+
 The shard archive anchors the predecessor state through the intervening block
 chain. The masterchain archive anchors the configuration state by requiring its
 root hash to equal the producing block's Merkle update. Both archive block files
@@ -325,9 +337,13 @@ rejects it if an intervening shard block changed that account. Repeat
 `--account-proof` for all touched accounts to obtain `scope=full_block`.
 
 Public-library cells are content addressed. `savelibraries` verifies each body
-against its requested hash, and the replay tool repeats that check. A body
-bundle does not prove that the library was registered in the historical
-masterchain state, so output explicitly sets
+against its requested hash, and the replay tool repeats that check. Library
+bodies may themselves contain library-reference cells, so the loader scans the
+combined body set and fails with the missing hashes until the supplied repeated
+`--library-bodies` inputs are transitively closed. This prevents a partial
+library set from producing a misleading VM mismatch. A body bundle does not
+prove that the library was registered in the historical masterchain state, so
+output explicitly sets
 `library_membership_at_target_proven=false`. A complete historical masterchain
 state is the stronger input and sets it to true. `savelibrariesproof` can save a
 state-bound `getLibrariesWithProof` response when the server still retains the

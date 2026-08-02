@@ -43,7 +43,7 @@ td::Result<std::unique_ptr<TransactionEmulator::EmulationResult>> TransactionEmu
     lt = (account.last_trans_lt_ / block::ConfigInfo::get_lt_align() + 1) *
          block::ConfigInfo::get_lt_align();  // next block after account_.last_trans_lt_
   }
-  account.block_lt = lt - lt % block::ConfigInfo::get_lt_align();
+  account.block_lt = block_lt_ ? block_lt_ : lt - lt % block::ConfigInfo::get_lt_align();
 
   compute_phase_cfg.libraries = std::make_unique<vm::Dictionary>(libraries_);
   compute_phase_cfg.ignore_chksig = ignore_chksig_;
@@ -103,7 +103,7 @@ td::Result<TransactionEmulator::EmulationSuccess> TransactionEmulator::emulate_t
   ton::LogicalTime lt = record_trans.lt;
   ton::UnixTime utime = record_trans.now;
   account.now_ = utime;
-  account.block_lt = record_trans.lt - record_trans.lt % block::ConfigInfo::get_lt_align();
+  account.block_lt = block_lt_ ? block_lt_ : record_trans.lt - record_trans.lt % block::ConfigInfo::get_lt_align();
   td::Ref<vm::Cell> msg_root = record_trans.r1.in_msg->prefetch_ref();
   int tag = block::gen::t_TransactionDescr.get_tag(vm::load_cell_slice(record_trans.description));
 
@@ -151,7 +151,21 @@ td::Result<TransactionEmulator::EmulationSuccess> TransactionEmulator::emulate_t
 
     if (td::Bits256(emulation_result.transaction->get_hash().bits()) !=
         td::Bits256(original_trans->get_hash().bits())) {
-      return td::Status::Error("transaction hash mismatch");
+      block::gen::Transaction::Record generated_trans;
+      td::StringBuilder error;
+      error << "transaction hash mismatch: expected " << original_trans->get_hash().bits().to_hex(256) << ", found "
+            << emulation_result.transaction->get_hash().bits().to_hex(256)
+            << ", code_hash=" << emulation_result.vm.code_hash.to_hex();
+      if (tlb::unpack_cell(emulation_result.transaction, generated_trans)) {
+        error << ", expected_description=" << record_trans.description->get_hash().bits().to_hex(256)
+              << ", found_description=" << generated_trans.description->get_hash().bits().to_hex(256)
+              << ", expected_state_update=" << record_trans.state_update->get_hash().bits().to_hex(256)
+              << ", found_state_update=" << generated_trans.state_update->get_hash().bits().to_hex(256);
+      }
+      if (!emulation_result.vm_log.empty()) {
+        error << ", vm_log=" << emulation_result.vm_log;
+      }
+      return td::Status::Error(error.as_cslice().str());
     }
 
     if (!check_state_update(emulation_result.account, record_trans)) {
@@ -274,6 +288,10 @@ void TransactionEmulator::set_unixtime(ton::UnixTime unixtime) {
 
 void TransactionEmulator::set_lt(ton::LogicalTime lt) {
   lt_ = lt;
+}
+
+void TransactionEmulator::set_block_lt(ton::LogicalTime block_lt) {
+  block_lt_ = block_lt;
 }
 
 void TransactionEmulator::set_rand_seed(td::BitArray<256>& rand_seed) {

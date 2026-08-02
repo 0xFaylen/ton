@@ -102,6 +102,8 @@ struct BlockContext {
   BlockIdExt mc_id;
   td::Bits256 rand_seed = td::Bits256::zero();
   ton::UnixTime gen_utime = 0;
+  ton::LogicalTime start_lt = 0;
+  ton::LogicalTime end_lt = 0;
   int global_id = 0;
   bool after_split = false;
   bool after_merge = false;
@@ -245,6 +247,10 @@ struct ParallelAccountReplayProbe {
 };
 
 td::Result<BlockContext> unpack_block_context(LoadedBlock block_data);
+
+td::Status collect_library_refs(Ref<vm::Cell> cell, std::set<vm::Cell::Hash>& visited, std::set<td::Bits256>& libraries,
+                                int depth = 1024);
+std::string join_library_hashes(const std::set<td::Bits256>& libraries);
 
 struct BlockWorkloadSummary {
   std::size_t distinct_accounts{0};
@@ -534,6 +540,8 @@ td::Result<BlockContext> unpack_block_context(LoadedBlock block_data) {
   }
   result.global_id = block_record.global_id;
   result.gen_utime = info.gen_utime;
+  result.start_lt = info.start_lt;
+  result.end_lt = info.end_lt;
   result.after_merge = info.after_merge;
   result.before_split = info.before_split;
   result.rand_seed = extra.rand_seed;
@@ -816,6 +824,31 @@ td::Result<LoadedLibraryBodies> load_library_bodies(const std::vector<std::strin
         return td::Status::Error(PSLICE() << "cannot register library body " << entry->hash_.to_hex());
       }
     }
+  }
+  std::set<vm::Cell::Hash> visited;
+  std::set<td::Bits256> referenced;
+  td::Status scan_status = td::Status::OK();
+  const bool valid = dictionary.check_for_each([&](Ref<vm::CellSlice> value, td::ConstBitPtr, int key_len) {
+    if (key_len != 256 || value.is_null() || !value->have_refs()) {
+      scan_status = td::Status::Error("invalid library body dictionary entry");
+      return false;
+    }
+    scan_status = collect_library_refs(value->prefetch_ref(), visited, referenced);
+    return scan_status.is_ok();
+  });
+  if (!valid) {
+    TRY_STATUS(std::move(scan_status));
+    return td::Status::Error("cannot scan library body dictionary");
+  }
+  std::set<td::Bits256> missing;
+  for (const auto& hash : referenced) {
+    if (hashes.count(hash) == 0) {
+      missing.insert(hash);
+    }
+  }
+  if (!missing.empty()) {
+    return td::Status::Error(PSLICE() << "library body bundle is missing transitive references: "
+                                      << join_library_hashes(missing));
   }
   return LoadedLibraryBodies{dictionary.get_root_cell(), std::move(hashes)};
 }
@@ -1156,7 +1189,7 @@ td::Result<Ref<vm::Cell>> build_predecessor_accounts_proof(const std::string& ar
 }
 
 td::Status collect_library_refs(Ref<vm::Cell> cell, std::set<vm::Cell::Hash>& visited, std::set<td::Bits256>& libraries,
-                                int depth = 1024) {
+                                int depth) {
   if (cell.is_null()) {
     return td::Status::OK();
   }
@@ -1274,6 +1307,7 @@ td::Result<ReplayResult> replay_transactions(
 
   emulator::TransactionEmulator emulator(config);
   emulator.set_profile_ed25519(profile_ed25519);
+  emulator.set_block_lt(target.start_lt);
   auto rand_seed = target.rand_seed;
   emulator.set_rand_seed(rand_seed);
   emulator.set_prev_blocks_info(std::move(prev_blocks_info));
@@ -1712,12 +1746,14 @@ td::Result<ReplayResult> replay_transactions(
     std::string root_stage = "extract_update_views";
     try {
       TRY_RESULT(update_views, extract_state_update_views(target));
-      root_stage = "extract_state_dictionaries";
-      Ref<vm::Cell> predecessor_state_view =
-          collated_predecessor_witness.not_null() ? collated_predecessor_witness : update_views.first;
-      TRY_RESULT(old_state_dictionaries, extract_partial_state_dictionaries(predecessor_state_view));
-      TRY_RESULT(new_state_dictionaries, extract_partial_state_dictionaries(update_views.second));
       result.collated_predecessor_witness_loaded = collated_predecessor_witness.not_null();
+      PartialStateDictionaries old_state_dictionaries;
+      PartialStateDictionaries new_state_dictionaries;
+      if (collated_predecessor_witness.not_null()) {
+        root_stage = "extract_state_dictionaries";
+        TRY_RESULT_ASSIGN(old_state_dictionaries, extract_partial_state_dictionaries(collated_predecessor_witness));
+        TRY_RESULT_ASSIGN(new_state_dictionaries, extract_partial_state_dictionaries(update_views.second));
+      }
       root_stage = "extract_predecessor_accounts_root";
       TRY_RESULT(target_predecessor_accounts_root, extract_partial_shard_accounts_root(update_views.first));
       root_stage = "build_predecessor_accounts_proof";
@@ -2167,11 +2203,16 @@ td::Result<ParallelAccountReplayProbe> run_parallel_account_replay_probe(
 td::Result<std::string> inspect_json(const BlockContext& target, int split_depth) {
   TRY_RESULT(prefixes, collect_account_prefixes(target, split_depth));
   TRY_RESULT(accounts, collect_accounts(target));
+  TRY_RESULT(workload, summarize_account_blocks(target));
   td::StringBuilder out;
   out << "{\"schema_version\":1,\"mode\":\"inspect\",\"block_id\":\"" << target.id.to_str()
       << "\",\"global_id\":" << target.global_id << ",\"gen_utime\":" << target.gen_utime
+      << ",\"start_lt\":" << target.start_lt << ",\"end_lt\":" << target.end_lt
       << ",\"after_split\":" << target.after_split << ",\"after_merge\":" << target.after_merge
-      << ",\"before_split\":" << target.before_split << ",\"predecessors\":[";
+      << ",\"before_split\":" << target.before_split << ",\"file_bytes\":" << target.file_bytes
+      << ",\"distinct_accounts\":" << workload.distinct_accounts
+      << ",\"raw_transactions\":" << workload.raw_transactions
+      << ",\"max_account_transactions\":" << workload.max_account_transactions << ",\"predecessors\":[";
   for (std::size_t i = 0; i < target.prev.size(); ++i) {
     if (i != 0) {
       out << ",";
@@ -2253,12 +2294,13 @@ std::string account_lane_ceiling_json(const ReplayResult& replay) {
 
 std::string single_shard_capacity_json(const BlockContext& target, const ReplayResult& replay,
                                        const ParallelAccountReplayProbe* parallel_probe) {
+  const bool full_block = replay.skipped_accounts == 0 && replay.accounts == replay.target_accounts;
   const double target_rate_seconds = static_cast<double>(replay.consensus_target_rate_ms) / 1000.0;
   const double bytes_per_raw_transaction =
-      replay.transactions > 0
+      full_block && replay.transactions > 0
           ? static_cast<double>(target.file_bytes) / static_cast<double>(replay.transactions)
           : 0.0;
-  const bool byte_projection_available = target_rate_seconds > 0.0 && target.file_bytes > 0 &&
+  const bool byte_projection_available = full_block && target_rate_seconds > 0.0 && target.file_bytes > 0 &&
                                          replay.transactions > 0 && replay.consensus_max_block_bytes > 0;
   const double byte_ceiling_raw_tps =
       byte_projection_available
@@ -2272,27 +2314,31 @@ std::string single_shard_capacity_json(const BlockContext& target, const ReplayR
       << ",\"operation_tps\":null"
       << ",\"config_source_masterchain_id\":\"" << target.mc_id.to_str() << "\""
       << ",\"config29\":{\"measurement_domain\":\"serialized_candidate_data\",\"max_block_bytes\":"
-      << replay.consensus_max_block_bytes
-      << ",\"max_collated_bytes\":" << replay.consensus_max_collated_bytes << "}"
+      << replay.consensus_max_block_bytes << ",\"max_collated_bytes\":" << replay.consensus_max_collated_bytes << "}"
       << ",\"config30\":{\"protocol_version\":" << replay.consensus_protocol_version
       << ",\"slots_per_leader_window\":" << replay.consensus_slots_per_leader_window
       << ",\"target_rate_ms\":" << replay.consensus_target_rate_ms
       << ",\"min_block_interval_ms\":" << replay.consensus_min_block_interval_ms << "}"
       << ",\"config23\":{\"measurement_domain\":\"block_limit_status_estimates\",\"bytes\":{\"underload\":"
-      << replay.block_limit_bytes.underload
-      << ",\"soft\":" << replay.block_limit_bytes.soft << ",\"hard\":" << replay.block_limit_bytes.hard
-      << "},\"gas\":{\"underload\":" << replay.block_limit_gas.underload
-      << ",\"soft\":" << replay.block_limit_gas.soft << ",\"hard\":" << replay.block_limit_gas.hard
+      << replay.block_limit_bytes.underload << ",\"soft\":" << replay.block_limit_bytes.soft
+      << ",\"hard\":" << replay.block_limit_bytes.hard
+      << "},\"gas\":{\"underload\":" << replay.block_limit_gas.underload << ",\"soft\":" << replay.block_limit_gas.soft
+      << ",\"hard\":" << replay.block_limit_gas.hard
       << "},\"lt_delta\":{\"underload\":" << replay.block_limit_lt_delta.underload
       << ",\"soft\":" << replay.block_limit_lt_delta.soft << ",\"hard\":" << replay.block_limit_lt_delta.hard
       << "},\"collated_bytes\":{\"underload\":" << replay.block_limit_collated_bytes.underload
       << ",\"soft\":" << replay.block_limit_collated_bytes.soft
       << ",\"hard\":" << replay.block_limit_collated_bytes.hard << "}}"
-      << ",\"sample\":{\"block_file_bytes\":" << target.file_bytes
-      << ",\"raw_transactions\":" << replay.transactions << ",\"distinct_accounts\":" << replay.accounts
-      << ",\"billed_gas_sum\":" << replay.basechain_limit_gas
-      << ",\"bytes_per_raw_transaction\":" << bytes_per_raw_transaction
-      << ",\"max_block_fill_ratio\":"
+      << ",\"sample\":{\"scope\":\"" << (full_block ? "full_block" : "account_subset")
+      << "\",\"block_file_bytes\":" << target.file_bytes << ",\"raw_transactions\":" << replay.transactions
+      << ",\"distinct_accounts\":" << replay.accounts << ",\"billed_gas_sum\":" << replay.basechain_limit_gas
+      << ",\"bytes_per_raw_transaction\":";
+  if (full_block && replay.transactions > 0) {
+    out << bytes_per_raw_transaction;
+  } else {
+    out << "null";
+  }
+  out << ",\"max_block_fill_ratio\":"
       << (replay.consensus_max_block_bytes > 0
               ? static_cast<double>(target.file_bytes) / replay.consensus_max_block_bytes
               : 0.0)
