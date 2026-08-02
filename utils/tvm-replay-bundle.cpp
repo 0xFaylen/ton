@@ -58,6 +58,7 @@
 #include "vm/cells/CellUsageTree.h"
 #include "vm/cells/DataCell.h"
 #include "vm/cells/MerkleProof.h"
+#include "vm/cells/MerkleUpdate.h"
 #include "vm/db/StaticBagOfCellsDb.h"
 
 namespace {
@@ -82,6 +83,12 @@ Hash256 as_hash256(const td::Bits256& value) {
   return result;
 }
 
+td::BitArray<256> as_dictionary_key(const Hash256& value) {
+  td::BitArray<256> result;
+  std::memcpy(result.data(), value.data(), value.size());
+  return result;
+}
+
 // Core's persistent-state serializer requires split_depth <= 63. This CLI uses
 // whole hexadecimal digits, so 60 is the largest representable supported depth.
 constexpr int kMaxHexSplitDepth = 60;
@@ -100,6 +107,7 @@ struct BlockContext {
   Ref<vm::Cell> in_msg_descr;
   Ref<vm::Cell> out_msg_descr;
   Ref<vm::Cell> account_blocks;
+  Ref<vm::Cell> state_update;
 };
 
 struct LoadedState {
@@ -123,6 +131,7 @@ struct LoadedAccountProof {
   StdSmcAddress address;
   BlockIdExt shard_block;
   Ref<vm::Cell> shard_account;
+  Ref<vm::Cell> state_proof;
 };
 
 struct LoadedLibraryBodies {
@@ -165,6 +174,9 @@ struct ReplayResult {
   std::size_t shadow_coordinator_out_descriptors = 0;
   std::size_t shadow_coordinator_queue_deletions = 0;
   std::size_t shadow_coordinator_new_messages = 0;
+  std::size_t shard_account_proof_values_bound = 0;
+  bool shard_accounts_predecessor_root_bound = false;
+  std::size_t augmented_dictionary_roots_validated = 0;
   TvmHotpathStats hotpaths;
   std::map<StdSmcAddress, AccountWork> account_work;
 
@@ -246,6 +258,7 @@ td::Result<BlockContext> unpack_block_context(std::pair<BlockIdExt, Ref<vm::Cell
   result.in_msg_descr = std::move(extra.in_msg_descr);
   result.out_msg_descr = std::move(extra.out_msg_descr);
   result.account_blocks = std::move(extra.account_blocks);
+  result.state_update = std::move(block_record.state_update);
   return result;
 }
 
@@ -384,6 +397,10 @@ td::Result<LoadedAccountProof> load_account_proof(const std::string& spec, const
   proof.proof = std::move(response->proof_);
   proof.state = std::move(response->state_);
   TRY_RESULT(info, proof.validate(mc_id, block::StdAddress(ton::basechainId, address)));
+  TRY_RESULT(proof_roots, vm::std_boc_deserialize_multi(proof.proof.as_slice()));
+  if (proof_roots.size() != 2 || proof_roots[1].is_null()) {
+    return td::Status::Error("verified account proof has no shard-state proof root");
+  }
 
   Ref<vm::Cell> shard_account;
   if (info.root.not_null()) {
@@ -395,7 +412,7 @@ td::Result<LoadedAccountProof> load_account_proof(const std::string& spec, const
       return td::Status::Error("cannot reconstruct ShardAccount from verified account proof");
     }
   }
-  return LoadedAccountProof{address, proof.shard_blk, std::move(shard_account)};
+  return LoadedAccountProof{address, proof.shard_blk, std::move(shard_account), std::move(proof_roots[1])};
 }
 
 td::Result<LoadedLibraryBodies> load_library_bodies(const std::vector<std::string>& paths) {
@@ -484,13 +501,14 @@ td::Result<std::set<StdSmcAddress>> collect_accounts(const BlockContext& block_c
 }
 
 td::Result<td::Bits256> get_new_state_hash(const BlockContext& block_context) {
-  block::gen::Block::Record block_record;
-  block::gen::MERKLE_UPDATE::Record update;
-  if (!tlb::unpack_cell(block_context.root, block_record) ||
-      !tlb::type_unpack_cell(block_record.state_update, block::gen::t_MERKLE_UPDATE_ShardState, update)) {
+  if (block_context.state_update.is_null()) {
     return td::Status::Error("cannot unpack block state update");
   }
-  return td::Bits256(update.new_hash);
+  vm::CellSlice update{vm::NoVm(), block_context.state_update};
+  if (update.special_type() != vm::Cell::SpecialType::MerkleUpdate || update.size_refs() != 2) {
+    return td::Status::Error("cannot unpack block state update");
+  }
+  return td::Bits256(update.prefetch_ref(1)->get_hash(0).bits());
 }
 
 td::Status verify_masterchain_state(const std::string& mc_archive, const BlockIdExt& expected_id,
@@ -577,6 +595,122 @@ td::Status verify_account_proof_base(const std::string& archive, const BlockCont
   return td::Status::OK();
 }
 
+td::Result<Ref<vm::Cell>> extract_partial_shard_accounts_root(const Ref<vm::Cell>& state_root) {
+  if (state_root.is_null()) {
+    return td::Status::Error("cannot unpack partial ShardAccounts root");
+  }
+  vm::CellSlice state{vm::NoVm(), state_root};
+  if (state.fetch_ulong(32) != 0x9023afe2U || !state.advance(328) || !state.advance_refs(1) ||
+      !state.advance(1)) {
+    return td::Status::Error("partial state is not ShardStateUnsplit");
+  }
+  auto accounts = state.fetch_ref();
+  if (accounts.is_null()) {
+    return td::Status::Error("partial ShardState has no ShardAccounts");
+  }
+  auto accounts_root = vm::load_cell_slice(accounts).prefetch_ref();
+  if (accounts_root.is_null()) {
+    return td::Status::Error("partial ShardAccounts root is empty");
+  }
+  return accounts_root;
+}
+
+td::Result<Ref<vm::Cell>> serialize_slice(Ref<vm::CellSlice> slice) {
+  if (slice.is_null()) {
+    return td::Status::Error("cannot serialize a null cell slice");
+  }
+  vm::CellBuilder builder;
+  if (!builder.append_cellslice_bool(slice->clone())) {
+    return td::Status::Error("cannot serialize cell slice");
+  }
+  return builder.finalize_novm();
+}
+
+td::Result<std::pair<Ref<vm::Cell>, Ref<vm::Cell>>> extract_state_update_raw_views(
+    const BlockContext& block_context) {
+  if (block_context.state_update.is_null()) {
+    return td::Status::Error("cannot unpack block Merkle-update views");
+  }
+  vm::CellSlice update_slice{vm::NoVm(), block_context.state_update};
+  if (!update_slice.is_special() || update_slice.prefetch_long(8) != 4 || update_slice.size_ext() != 0x20228) {
+    return td::Status::Error("cannot unpack block Merkle-update views");
+  }
+  auto old_raw = update_slice.prefetch_ref(0);
+  auto new_raw = update_slice.prefetch_ref(1);
+  return std::make_pair(std::move(old_raw), std::move(new_raw));
+}
+
+td::Result<std::pair<Ref<vm::Cell>, Ref<vm::Cell>>> extract_state_update_views(const BlockContext& block_context) {
+  TRY_RESULT(raw_views, extract_state_update_raw_views(block_context));
+  auto& [old_raw, new_raw] = raw_views;
+  auto old_state = vm::MerkleProof::virtualize_raw(old_raw, 0);
+  auto new_state = vm::MerkleProof::virtualize_raw(new_raw, 0);
+  if (old_state.is_null() || new_state.is_null() || old_state->get_hash() != old_raw->get_hash(0) ||
+      new_state->get_hash() != new_raw->get_hash(0)) {
+    return td::Status::Error("block Merkle-update view hash mismatch");
+  }
+  return std::make_pair(std::move(old_state), std::move(new_state));
+}
+
+td::Result<Ref<vm::Cell>> build_predecessor_accounts_proof(const std::string& archive,
+                                                           const BlockContext& target,
+                                                           const std::vector<LoadedAccountProof>& proofs) {
+  if (proofs.empty()) {
+    return td::Status::Error("cannot build ShardAccounts proof without account proofs");
+  }
+  const auto base_block = proofs.front().shard_block;
+  Ref<vm::Cell> combined;
+  for (const auto& proof : proofs) {
+    if (proof.shard_block != base_block || proof.state_proof.is_null()) {
+      return td::Status::Error("account proofs do not share one shard-state root");
+    }
+    if (combined.is_null()) {
+      combined = proof.state_proof;
+    } else {
+      TRY_RESULT(next, vm::MerkleProof::combine(std::move(combined), proof.state_proof));
+      combined = std::move(next);
+    }
+  }
+
+  vm::CellSlice combined_proof{vm::NoVm(), combined};
+  if (combined_proof.special_type() != vm::Cell::SpecialType::MerkleProof || combined_proof.size_refs() != 1) {
+    return td::Status::Error("combined account proof is not a Merkle proof");
+  }
+  auto base_state_raw = combined_proof.prefetch_ref();
+  TRY_RESULT(base_accounts_raw, extract_partial_shard_accounts_root(base_state_raw));
+  Ref<vm::Cell> accounts_root = vm::MerkleProof::virtualize_raw(std::move(base_accounts_raw), 0);
+  if (accounts_root.is_null()) {
+    return td::Status::Error("cannot virtualize combined ShardAccounts proof");
+  }
+
+  BlockIdExt current = base_block;
+  for (ton::BlockSeqno seqno = base_block.seqno() + 1; seqno <= target.prev[0].seqno(); ++seqno) {
+    BlockId intermediate_id{target.id.shard_full(), seqno};
+    TRY_RESULT(intermediate_data, load_block_from_archive(archive, intermediate_id));
+    TRY_RESULT(intermediate, unpack_block_context(std::move(intermediate_data)));
+    if (intermediate.prev.size() != 1 || intermediate.prev[0] != current) {
+      return td::Status::Error(PSLICE() << "non-linear account-proof history at " << intermediate.id.to_str());
+    }
+    TRY_RESULT(raw_views, extract_state_update_raw_views(intermediate));
+    TRY_RESULT(old_accounts, extract_partial_shard_accounts_root(raw_views.first));
+    TRY_RESULT(new_accounts, extract_partial_shard_accounts_root(raw_views.second));
+    if (accounts_root->get_hash(0) != old_accounts->get_hash(0)) {
+      return td::Status::Error("combined account proof does not match an intermediate ShardAccounts root");
+    }
+    TRY_RESULT(next_accounts,
+               vm::MerkleUpdate::apply_raw(accounts_root, old_accounts, new_accounts, 0, 0));
+    if (next_accounts->get_hash(0) != new_accounts->get_hash(0)) {
+      return td::Status::Error("advanced ShardAccounts proof hash mismatch");
+    }
+    accounts_root = std::move(next_accounts);
+    current = intermediate.id;
+  }
+  if (current != target.prev[0]) {
+    return td::Status::Error("account-proof history does not reach target predecessor");
+  }
+  return accounts_root;
+}
+
 td::Status collect_library_refs(Ref<vm::Cell> cell, std::set<vm::Cell::Hash>& visited, std::set<td::Bits256>& libraries,
                                 int depth = 1024) {
   if (cell.is_null()) {
@@ -631,7 +765,8 @@ std::string join_library_hashes(const std::set<td::Bits256>& libraries) {
   return out.as_cslice().str();
 }
 
-td::Result<ReplayResult> replay_transactions(const BlockContext& target, const LoadedState* prev_state,
+td::Result<ReplayResult> replay_transactions(const std::string& archive, const BlockContext& target,
+                                             const LoadedState* prev_state,
                                              const LoadedState& mc_state,
                                              const std::vector<LoadedAccountPart>& account_parts,
                                              const std::vector<LoadedAccountProof>& account_proofs,
@@ -695,6 +830,7 @@ td::Result<ReplayResult> replay_transactions(const BlockContext& target, const L
   std::vector<CanonicalTransactionEffects> canonical_limit_effects;
   std::vector<ton::validator::parallel_inbound::BasechainLimitContext> canonical_limit_contexts;
   std::vector<ShadowCoordinatorCandidate> shadow_coordinator_candidates;
+  std::vector<ton::validator::parallel_inbound::AccountDictionaryDelta> account_dictionary_deltas;
   td::Status replay_status = td::Status::OK();
   std::set<td::Bits256> missing_libraries;
   bool accounts_ok = account_blocks.check_for_each_extra([&](Ref<vm::CellSlice> account_block_slice, Ref<vm::CellSlice>,
@@ -748,6 +884,7 @@ td::Result<ReplayResult> replay_transactions(const BlockContext& target, const L
     } else if (prev_state != nullptr) {
       old_account = accounts->lookup_extra(key, 256).first;
     }
+    const bool account_existed_before = old_account.not_null();
     if (old_account.is_null()) {
       if (!account.init_new(target.gen_utime)) {
         replay_status = td::Status::Error(PSTRING() << "cannot initialize missing account " << address.to_hex());
@@ -988,6 +1125,13 @@ td::Result<ReplayResult> replay_transactions(const BlockContext& target, const L
     }
     if (transactions_ok) {
       ++result.canonical_fee_augmentations_validated;
+      account_dictionary_deltas.push_back(
+          {.account = as_hash256(address),
+           .post_account_state = account.total_state,
+           .last_transaction_hash = as_hash256(account.last_trans_hash_),
+           .last_transaction_lt = account.last_trans_lt_,
+           .existed_before = account_existed_before,
+           .exists_after = account.status != block::Account::acc_nonexist});
     }
     return transactions_ok;
   });
@@ -1098,6 +1242,103 @@ td::Result<ReplayResult> replay_transactions(const BlockContext& target, const L
   result.shadow_coordinator_out_descriptors = coordinator_state.out_msg_descriptors.size();
   result.shadow_coordinator_queue_deletions = expected_queue_deletions;
   result.shadow_coordinator_new_messages = coordinator_state.new_messages.size();
+
+  if (result.skipped_accounts == 0 && !account_proofs.empty()) {
+    std::string root_stage = "extract_update_views";
+    try {
+      TRY_RESULT(update_views, extract_state_update_views(target));
+      root_stage = "extract_predecessor_accounts_root";
+      TRY_RESULT(target_predecessor_accounts_root, extract_partial_shard_accounts_root(update_views.first));
+      root_stage = "build_predecessor_accounts_proof";
+      TRY_RESULT(predecessor_accounts_root, build_predecessor_accounts_proof(archive, target, account_proofs));
+      if (predecessor_accounts_root->get_hash() != target_predecessor_accounts_root->get_hash()) {
+        return td::Status::Error("combined account proof disagrees with target Merkle-update predecessor root");
+      }
+      result.shard_accounts_predecessor_root_bound = true;
+
+      root_stage = "strip_target_descriptors";
+      block::tlb::Aug_InMsgDescr in_augmentation{config->get_global_version()};
+      block::tlb::Aug_OutMsgDescr out_augmentation{config->get_global_version()};
+      vm::AugmentedDictionary in_baseline{vm::load_cell_slice_ref(target.in_msg_descr), 256, in_augmentation};
+      vm::AugmentedDictionary out_baseline{vm::load_cell_slice_ref(target.out_msg_descr), 256, out_augmentation};
+      for (const auto& [hash, descriptor] : coordinator_state.in_msg_descriptors) {
+        auto removed = in_baseline.lookup_delete(as_dictionary_key(hash));
+        if (removed.is_null()) {
+          return td::Status::Error("canonical InMsg descriptor is absent from target root");
+        }
+        TRY_RESULT(removed_cell, serialize_slice(std::move(removed)));
+        if (removed_cell->get_hash() != descriptor->get_hash()) {
+          return td::Status::Error("canonical InMsg descriptor value disagrees with target root");
+        }
+      }
+      for (const auto& [hash, descriptor] : coordinator_state.out_msg_descriptors) {
+        auto removed = out_baseline.lookup_delete(as_dictionary_key(hash));
+        if (removed.is_null()) {
+          return td::Status::Error("canonical OutMsg descriptor is absent from target root");
+        }
+        TRY_RESULT(removed_cell, serialize_slice(std::move(removed)));
+        if (removed_cell->get_hash() != descriptor->get_hash()) {
+          return td::Status::Error("canonical OutMsg descriptor value disagrees with target root");
+        }
+      }
+
+      std::vector<ton::validator::parallel_inbound::QueueDictionaryDeletion> queue_deletions;
+
+      root_stage = "bind_account_proofs";
+      vm::AugmentedDictionary predecessor_accounts{
+          vm::DictNonEmpty(), vm::load_cell_slice_ref(predecessor_accounts_root), 256, block::tlb::aug_ShardAccounts};
+      for (const auto& proof : account_proofs) {
+        auto value = predecessor_accounts.lookup(proof.address);
+        if (proof.shard_account.is_null() != value.is_null()) {
+          return td::Status::Error("account proof existence disagrees with target Merkle-update old root");
+        }
+        ++result.shard_account_proof_values_bound;
+        if (proof.shard_account.not_null()) {
+          TRY_RESULT(value_cell, serialize_slice(std::move(value)));
+          if (value_cell->get_hash() != proof.shard_account->get_hash()) {
+            return td::Status::Error("account proof value disagrees with target Merkle-update old root");
+          }
+        }
+      }
+      for (const auto& delta : account_dictionary_deltas) {
+        const bool root_contains_account = predecessor_accounts.lookup(as_dictionary_key(delta.account)).not_null();
+        if (root_contains_account != delta.existed_before) {
+          return td::Status::Error("replayed account existence disagrees with predecessor ShardAccounts root");
+        }
+      }
+
+      root_stage = "apply_augmented_deltas";
+      vm::AugmentedDictionary queue_out_of_scope{352, block::tlb::aug_OutMsgQueue};
+      ton::validator::parallel_inbound::AugmentedDictionarySeed seed{
+          .global_version = config->get_global_version(),
+          .shard_accounts_root = predecessor_accounts.get_wrapped_dict_root(),
+          .in_msg_descr_root = in_baseline.get_wrapped_dict_root(),
+          .out_msg_descr_root = out_baseline.get_wrapped_dict_root(),
+          .out_msg_queue_root = queue_out_of_scope.get_wrapped_dict_root()};
+      const std::vector<ton::validator::parallel_inbound::AccountDictionaryDelta> account_deltas_out_of_scope;
+      auto root_result = ton::validator::parallel_inbound::apply_augmented_dictionary_deltas_atomic(
+          seed, account_deltas_out_of_scope, coordinator_state.in_msg_descriptors,
+          coordinator_state.out_msg_descriptors, queue_deletions);
+      if (!root_result) {
+        return td::Status::Error(
+            PSTRING() << "canonical augmented dictionary commit failed at item "
+                      << (root_result.item_index ? td::to_string(root_result.item_index.value()) : std::string("none"))
+                      << ": " << ton::validator::parallel_inbound::to_string(root_result.error));
+      }
+      const auto& roots = root_result.roots.value();
+      if (roots.in_msg_descr_root->get_hash() != target.in_msg_descr->get_hash() ||
+          roots.out_msg_descr_root->get_hash() != target.out_msg_descr->get_hash()) {
+        return td::Status::Error("canonical augmented dictionary roots disagree with copied block artifacts");
+      }
+      result.augmented_dictionary_roots_validated = 2;
+    } catch (vm::VmVirtError& error) {
+      return td::Status::Error(PSTRING() << "augmented root gate virtualization error at " << root_stage << ": "
+                                         << error.get_msg());
+    } catch (vm::VmError& error) {
+      return td::Status::Error(PSTRING() << "augmented root gate VM error at " << root_stage << ": "
+                                         << error.get_msg());
+    }
+  }
   return result;
 }
 
@@ -1240,6 +1481,15 @@ std::string replay_json(const BlockContext& target, const LoadedState* account_s
       << ",\"shadow_coordinator_queue_deletions\":" << replay.shadow_coordinator_queue_deletions
       << ",\"shadow_coordinator_new_messages\":" << replay.shadow_coordinator_new_messages
       << ",\"shadow_coordinator_queue_scope\":\"descriptor_derived_deletion_subset\""
+      << ",\"shard_account_proof_values_bound\":" << replay.shard_account_proof_values_bound
+      << ",\"shard_accounts_predecessor_root_bound\":"
+      << (replay.shard_accounts_predecessor_root_bound ? "true" : "false")
+      << ",\"augmented_dictionary_roots_validated\":" << replay.augmented_dictionary_roots_validated
+      << ",\"augmented_dictionary_root_scope\":\"InMsgDescr_OutMsgDescr\""
+      << ",\"augmented_dictionary_baseline_source\":\"target_minus_validated_deltas\""
+      << ",\"augmented_dictionary_historical_transition_proven\":false"
+      << ",\"shard_accounts_root_status\":\"requires_full_predecessor_or_proof_aware_augmentation_merge\""
+      << ",\"out_msg_queue_root_status\":\"requires_predecessor_queue_value_proof\""
       << ",\"block_size_status\":\"not_claimed_without_collator_usage_tree\""
       << ",\"proof_journals\":\"empty_in_transaction_replay\""
       << ",\"processed_upto\":\"atomic_shadow_prefix_applied_for_inbound_fin_subset\""
@@ -1323,7 +1573,7 @@ td::Result<std::string> run(const std::string& archive, const std::string& mc_ar
     TRY_RESULT(loaded, load_library_bodies(library_body_paths));
     library_bodies = std::make_unique<LoadedLibraryBodies>(std::move(loaded));
   }
-  TRY_RESULT(replay, replay_transactions(target, prev_state.get(), *mc_state, account_parts, account_proofs,
+  TRY_RESULT(replay, replay_transactions(archive, target, prev_state.get(), *mc_state, account_parts, account_proofs,
                                          library_bodies.get(), profile_ed25519));
   return replay_json(target, prev_state.get(), account_proofs, *mc_state, library_bodies.get(), replay,
                      profile_ed25519);

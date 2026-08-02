@@ -4,6 +4,7 @@
 #include <limits>
 #include <utility>
 
+#include "block/block-parse.h"
 #include "parallel-coordinator-shadow.h"
 
 namespace ton::validator::parallel_inbound {
@@ -28,6 +29,23 @@ Hash256 cell_hash(const td::Ref<vm::Cell>& cell) {
   Hash256 result{};
   std::memcpy(result.data(), cell->get_hash().as_slice().data(), result.size());
   return result;
+}
+
+td::BitArray<256> dictionary_key(const Hash256& hash) {
+  td::BitArray<256> result;
+  std::memcpy(result.data(), hash.data(), hash.size());
+  return result;
+}
+
+td::Ref<vm::Cell> serialize_value(const td::Ref<vm::CellSlice>& value) {
+  if (value.is_null()) {
+    return {};
+  }
+  vm::CellBuilder builder;
+  if (!builder.append_cellslice_bool(value->clone())) {
+    return {};
+  }
+  return builder.finalize_novm();
 }
 
 CoordinatorCommitResult commit_error(CoordinatorCommitError error, std::size_t item_index) {
@@ -226,6 +244,130 @@ CoordinatorCommitResult apply_ready_coordinator_prefix_atomic(
   return result;
 }
 
+AugmentedDictionaryCommitResult apply_augmented_dictionary_deltas_atomic(
+    const AugmentedDictionarySeed& seed, const std::vector<AccountDictionaryDelta>& account_deltas,
+    const std::map<Hash256, td::Ref<vm::Cell>>& in_msg_descriptors,
+    const std::map<Hash256, td::Ref<vm::Cell>>& out_msg_descriptors,
+    const std::vector<QueueDictionaryDeletion>& queue_deletions) {
+  AugmentedDictionaryCommitResult result;
+  if (seed.shard_accounts_root.is_null() || seed.in_msg_descr_root.is_null() || seed.out_msg_descr_root.is_null() ||
+      seed.out_msg_queue_root.is_null()) {
+    result.error = AugmentedDictionaryCommitError::missing_seed_root;
+    return result;
+  }
+
+  try {
+    block::tlb::Aug_InMsgDescr in_augmentation{seed.global_version};
+    block::tlb::Aug_OutMsgDescr out_augmentation{seed.global_version};
+    vm::AugmentedDictionary accounts{vm::load_cell_slice_ref(seed.shard_accounts_root), 256,
+                                     block::tlb::aug_ShardAccounts};
+    vm::AugmentedDictionary in_descriptors{vm::load_cell_slice_ref(seed.in_msg_descr_root), 256, in_augmentation};
+    vm::AugmentedDictionary out_descriptors{vm::load_cell_slice_ref(seed.out_msg_descr_root), 256, out_augmentation};
+    vm::AugmentedDictionary out_queue{vm::load_cell_slice_ref(seed.out_msg_queue_root), 352,
+                                      block::tlb::aug_OutMsgQueue};
+    if (!accounts.is_valid() || !in_descriptors.is_valid() || !out_descriptors.is_valid() || !out_queue.is_valid()) {
+      result.error = AugmentedDictionaryCommitError::invalid_seed_dictionary;
+      return result;
+    }
+
+    for (std::size_t i = 0; i < account_deltas.size(); ++i) {
+      const auto& delta = account_deltas[i];
+      const auto key = dictionary_key(delta.account);
+      if (!delta.exists_after) {
+        if (!delta.existed_before || accounts.lookup_delete(key).is_null()) {
+          result.error = AugmentedDictionaryCommitError::account_delete_failed;
+          result.item_index = i;
+          return result;
+        }
+        continue;
+      }
+      if (delta.post_account_state.is_null()) {
+        result.error = AugmentedDictionaryCommitError::missing_post_account_state;
+        result.item_index = i;
+        return result;
+      }
+      vm::CellBuilder builder;
+      if (!(builder.store_ref_bool(delta.post_account_state) &&
+            builder.store_bytes_bool(delta.last_transaction_hash.data(), delta.last_transaction_hash.size()) &&
+            builder.store_long_bool(delta.last_transaction_lt, 64))) {
+        result.error = delta.existed_before ? AugmentedDictionaryCommitError::account_replace_failed
+                                            : AugmentedDictionaryCommitError::account_add_failed;
+        result.item_index = i;
+        return result;
+      }
+      const auto mode = delta.existed_before ? vm::Dictionary::SetMode::Replace : vm::Dictionary::SetMode::Add;
+      if (!accounts.set_builder(key, builder, mode)) {
+        result.error = delta.existed_before ? AugmentedDictionaryCommitError::account_replace_failed
+                                            : AugmentedDictionaryCommitError::account_add_failed;
+        result.item_index = i;
+        return result;
+      }
+    }
+
+    std::size_t index = 0;
+    for (const auto& [hash, descriptor] : in_msg_descriptors) {
+      const auto key = dictionary_key(hash);
+      if (descriptor.is_null() ||
+          !in_descriptors.set(key, vm::load_cell_slice(descriptor), vm::Dictionary::SetMode::Add)) {
+        result.error = AugmentedDictionaryCommitError::in_descriptor_add_failed;
+        result.item_index = index;
+        return result;
+      }
+      ++index;
+    }
+    index = 0;
+    for (const auto& [hash, descriptor] : out_msg_descriptors) {
+      const auto key = dictionary_key(hash);
+      if (descriptor.is_null() ||
+          !out_descriptors.set(key, vm::load_cell_slice(descriptor), vm::Dictionary::SetMode::Add)) {
+        result.error = AugmentedDictionaryCommitError::out_descriptor_add_failed;
+        result.item_index = index;
+        return result;
+      }
+      ++index;
+    }
+    for (std::size_t i = 0; i < queue_deletions.size(); ++i) {
+      const auto& deletion = queue_deletions[i];
+      if (deletion.expected_value.is_null()) {
+        result.error = AugmentedDictionaryCommitError::missing_expected_queue_value;
+        result.item_index = i;
+        return result;
+      }
+      auto removed = out_queue.lookup_delete(deletion.key);
+      if (removed.is_null()) {
+        result.error = AugmentedDictionaryCommitError::queue_entry_not_found;
+        result.item_index = i;
+        return result;
+      }
+      auto removed_cell = serialize_value(removed);
+      if (removed_cell.is_null()) {
+        result.error = AugmentedDictionaryCommitError::cannot_serialize_queue_value;
+        result.item_index = i;
+        return result;
+      }
+      if (removed_cell->get_hash() != deletion.expected_value->get_hash()) {
+        result.error = AugmentedDictionaryCommitError::queue_value_mismatch;
+        result.item_index = i;
+        return result;
+      }
+    }
+
+    result.roots = AugmentedDictionaryRoots{.shard_accounts_root = accounts.get_wrapped_dict_root(),
+                                            .in_msg_descr_root = in_descriptors.get_wrapped_dict_root(),
+                                            .out_msg_descr_root = out_descriptors.get_wrapped_dict_root(),
+                                            .out_msg_queue_root = out_queue.get_wrapped_dict_root()};
+    return result;
+  } catch (vm::VmVirtError&) {
+    result.error = AugmentedDictionaryCommitError::vm_error;
+    result.roots.reset();
+    return result;
+  } catch (vm::VmError&) {
+    result.error = AugmentedDictionaryCommitError::vm_error;
+    result.roots.reset();
+    return result;
+  }
+}
+
 const char* to_string(CoordinatorCommitError error) {
   switch (error) {
     case CoordinatorCommitError::none:
@@ -274,6 +416,40 @@ const char* to_string(CoordinatorCommitError error) {
       return "block_limit_error";
     case CoordinatorCommitError::extra_out_msgs_overflow:
       return "extra_out_msgs_overflow";
+  }
+  return "unknown";
+}
+
+const char* to_string(AugmentedDictionaryCommitError error) {
+  switch (error) {
+    case AugmentedDictionaryCommitError::none:
+      return "none";
+    case AugmentedDictionaryCommitError::missing_seed_root:
+      return "missing_seed_root";
+    case AugmentedDictionaryCommitError::invalid_seed_dictionary:
+      return "invalid_seed_dictionary";
+    case AugmentedDictionaryCommitError::missing_post_account_state:
+      return "missing_post_account_state";
+    case AugmentedDictionaryCommitError::account_add_failed:
+      return "account_add_failed";
+    case AugmentedDictionaryCommitError::account_replace_failed:
+      return "account_replace_failed";
+    case AugmentedDictionaryCommitError::account_delete_failed:
+      return "account_delete_failed";
+    case AugmentedDictionaryCommitError::in_descriptor_add_failed:
+      return "in_descriptor_add_failed";
+    case AugmentedDictionaryCommitError::out_descriptor_add_failed:
+      return "out_descriptor_add_failed";
+    case AugmentedDictionaryCommitError::missing_expected_queue_value:
+      return "missing_expected_queue_value";
+    case AugmentedDictionaryCommitError::queue_entry_not_found:
+      return "queue_entry_not_found";
+    case AugmentedDictionaryCommitError::queue_value_mismatch:
+      return "queue_value_mismatch";
+    case AugmentedDictionaryCommitError::cannot_serialize_queue_value:
+      return "cannot_serialize_queue_value";
+    case AugmentedDictionaryCommitError::vm_error:
+      return "vm_error";
   }
   return "unknown";
 }

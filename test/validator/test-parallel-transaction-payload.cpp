@@ -70,6 +70,22 @@ td::Ref<vm::CellSlice> std_address(std::uint64_t value) {
   return builder.as_cellslice_ref();
 }
 
+td::Ref<vm::Cell> simple_account(std::uint64_t address, std::uint64_t last_transaction_lt) {
+  vm::CellBuilder builder;
+  ASSERT_TRUE(builder.store_ones_bool(1));                              // account$1
+  ASSERT_TRUE(builder.append_cellslice_bool(std_address(address)));     // addr:MsgAddressInt
+  ASSERT_TRUE(builder.store_zeroes_bool(6));                            // used:StorageUsed
+  ASSERT_TRUE(builder.store_zeroes_bool(3));                            // storage_extra_none$000
+  ASSERT_TRUE(builder.store_zeroes_bool(32));                           // last_paid:uint32
+  ASSERT_TRUE(builder.store_zeroes_bool(1));                            // due_payment:(Maybe Grams)
+  ASSERT_TRUE(builder.store_long_bool(last_transaction_lt, 64));
+  ASSERT_TRUE(builder.store_zeroes_bool(5));                            // balance:CurrencyCollection
+  ASSERT_TRUE(builder.store_zeroes_bool(2));                            // account_uninit$00
+  auto result = builder.finalize_novm();
+  ASSERT_TRUE(block::gen::t_Account.validate_ref(result));
+  return result;
+}
+
 td::Ref<vm::Cell> internal_message(std::uint64_t source, std::uint64_t destination, std::uint64_t created_lt) {
   block::gen::CommonMsgInfo::Record_int_msg_info info;
   info.ihr_disabled = true;
@@ -213,6 +229,22 @@ CanonicalTransactionPayload payload_from_state(std::uint64_t account, const td::
 
 MessageKey input(std::uint64_t lt, std::uint64_t message_hash) {
   return {.lt = lt, .hash = hash(message_hash)};
+}
+
+td::Ref<vm::Cell> shard_account_value(const td::Ref<vm::Cell>& account, std::uint64_t transaction_hash,
+                                      std::uint64_t transaction_lt) {
+  vm::CellBuilder builder;
+  ASSERT_TRUE(builder.store_ref_bool(account));
+  ASSERT_TRUE(builder.store_bits_bool(bits(transaction_hash).cbits(), 256));
+  ASSERT_TRUE(builder.store_long_bool(transaction_lt, 64));
+  return builder.finalize_novm();
+}
+
+td::Ref<vm::Cell> enqueued_message_value(std::uint64_t enqueued_lt, const td::Ref<vm::Cell>& envelope) {
+  vm::CellBuilder builder;
+  ASSERT_TRUE(builder.store_long_bool(enqueued_lt, 64));
+  ASSERT_TRUE(builder.store_ref_bool(envelope));
+  return builder.finalize_novm();
 }
 
 TEST(ParallelTransactionPayload, DerivesCanonicalReceiptFieldsFromCells) {
@@ -720,6 +752,139 @@ TEST(ParallelTransactionPayload, BatchPrecommitIsAtomicOnPayloadOrChainFailure) 
   rejected = validate_precommit_set(items, receipts, missing_payload, initial);
   ASSERT_EQ(rejected.error, PrecommitError::receipt_without_payload);
   ASSERT_TRUE(checkpoints_equal(rejected.checkpoints, initial));
+}
+
+TEST(ParallelCoordinatorShadow, AppliesAugmentedDictionaryDeltasAtomically) {
+  constexpr int global_version = 15;
+  auto first_account = simple_account(1, 10);
+  auto second_account = simple_account(2, 20);
+  auto post_account = simple_account(1, 11);
+  auto first_value = shard_account_value(first_account, 100, 10);
+  auto second_value = shard_account_value(second_account, 200, 20);
+  vm::AugmentedDictionary accounts{256, block::tlb::aug_ShardAccounts};
+  ASSERT_TRUE(accounts.set(bits(1), vm::load_cell_slice(first_value), vm::Dictionary::SetMode::Add));
+  ASSERT_TRUE(accounts.set(bits(2), vm::load_cell_slice(second_value), vm::Dictionary::SetMode::Add));
+
+  block::tlb::Aug_InMsgDescr in_augmentation{global_version};
+  block::tlb::Aug_OutMsgDescr out_augmentation{global_version};
+  vm::AugmentedDictionary in_descriptors{256, in_augmentation};
+  vm::AugmentedDictionary out_descriptors{256, out_augmentation};
+
+  auto message = internal_message(1, 2, 30);
+  auto envelope = message_envelope(message, 7);
+  OutboundQueueKey queue_key;
+  ASSERT_TRUE(block::compute_out_msg_queue_key(envelope, queue_key));
+  auto queue_value = enqueued_message_value(30, envelope);
+  vm::AugmentedDictionary queue{352, block::tlb::aug_OutMsgQueue};
+  ASSERT_TRUE(queue.set(queue_key, vm::load_cell_slice(queue_value), vm::Dictionary::SetMode::Add));
+
+  AugmentedDictionarySeed seed{.global_version = global_version,
+                               .shard_accounts_root = accounts.get_wrapped_dict_root(),
+                               .in_msg_descr_root = in_descriptors.get_wrapped_dict_root(),
+                               .out_msg_descr_root = out_descriptors.get_wrapped_dict_root(),
+                               .out_msg_queue_root = queue.get_wrapped_dict_root()};
+  AccountDictionaryDelta account_delta{.account = hash(1),
+                                       .post_account_state = post_account,
+                                       .last_transaction_hash = hash(101),
+                                       .last_transaction_lt = 11,
+                                       .existed_before = true,
+                                       .exists_after = true};
+  QueueDictionaryDeletion queue_deletion{.key = queue_key, .expected_value = queue_value};
+
+  auto expected_accounts = accounts;
+  auto expected_first_value = shard_account_value(post_account, 101, 11);
+  ASSERT_TRUE(
+      expected_accounts.set(bits(1), vm::load_cell_slice(expected_first_value), vm::Dictionary::SetMode::Replace));
+  auto expected_queue = queue;
+  ASSERT_TRUE(expected_queue.lookup_delete(queue_key).not_null());
+
+  const auto applied = apply_augmented_dictionary_deltas_atomic(seed, {account_delta}, {}, {}, {queue_deletion});
+  ASSERT_TRUE(applied);
+  ASSERT_TRUE(applied.roots.has_value());
+  ASSERT_EQ(applied.roots->shard_accounts_root->get_hash(), expected_accounts.get_wrapped_dict_root()->get_hash());
+  ASSERT_EQ(applied.roots->in_msg_descr_root->get_hash(), seed.in_msg_descr_root->get_hash());
+  ASSERT_EQ(applied.roots->out_msg_descr_root->get_hash(), seed.out_msg_descr_root->get_hash());
+  ASSERT_EQ(applied.roots->out_msg_queue_root->get_hash(), expected_queue.get_wrapped_dict_root()->get_hash());
+}
+
+TEST(ParallelCoordinatorShadow, RejectsQueueValueMismatchWithoutPublishingDictionaryRoots) {
+  constexpr int global_version = 15;
+  auto original_account = simple_account(1, 10);
+  auto post_account = simple_account(1, 11);
+  vm::AugmentedDictionary accounts{256, block::tlb::aug_ShardAccounts};
+  auto account_value = shard_account_value(original_account, 100, 10);
+  ASSERT_TRUE(accounts.set(bits(1), vm::load_cell_slice(account_value), vm::Dictionary::SetMode::Add));
+  block::tlb::Aug_InMsgDescr in_augmentation{global_version};
+  block::tlb::Aug_OutMsgDescr out_augmentation{global_version};
+  vm::AugmentedDictionary in_descriptors{256, in_augmentation};
+  vm::AugmentedDictionary out_descriptors{256, out_augmentation};
+
+  auto message = internal_message(1, 2, 30);
+  auto envelope = message_envelope(message, 7);
+  OutboundQueueKey queue_key;
+  ASSERT_TRUE(block::compute_out_msg_queue_key(envelope, queue_key));
+  auto queue_value = enqueued_message_value(30, envelope);
+  vm::AugmentedDictionary queue{352, block::tlb::aug_OutMsgQueue};
+  ASSERT_TRUE(queue.set(queue_key, vm::load_cell_slice(queue_value), vm::Dictionary::SetMode::Add));
+
+  AugmentedDictionarySeed seed{.global_version = global_version,
+                               .shard_accounts_root = accounts.get_wrapped_dict_root(),
+                               .in_msg_descr_root = in_descriptors.get_wrapped_dict_root(),
+                               .out_msg_descr_root = out_descriptors.get_wrapped_dict_root(),
+                               .out_msg_queue_root = queue.get_wrapped_dict_root()};
+  const auto account_root_before = seed.shard_accounts_root->get_hash();
+  const auto queue_root_before = seed.out_msg_queue_root->get_hash();
+  AccountDictionaryDelta account_delta{.account = hash(1),
+                                       .post_account_state = post_account,
+                                       .last_transaction_hash = hash(101),
+                                       .last_transaction_lt = 11,
+                                       .existed_before = true,
+                                       .exists_after = true};
+  QueueDictionaryDeletion bad_deletion{.key = queue_key, .expected_value = enqueued_message_value(31, envelope)};
+
+  const auto rejected = apply_augmented_dictionary_deltas_atomic(seed, {account_delta}, {}, {}, {bad_deletion});
+  ASSERT_EQ(rejected.error, AugmentedDictionaryCommitError::queue_value_mismatch);
+  ASSERT_TRUE(!rejected.roots.has_value());
+  ASSERT_EQ(seed.shard_accounts_root->get_hash(), account_root_before);
+  ASSERT_EQ(seed.out_msg_queue_root->get_hash(), queue_root_before);
+  vm::AugmentedDictionary unchanged_accounts{vm::load_cell_slice_ref(seed.shard_accounts_root), 256,
+                                             block::tlb::aug_ShardAccounts};
+  ASSERT_EQ(unchanged_accounts.lookup(bits(1))->prefetch_ref()->get_hash(), original_account->get_hash());
+  vm::AugmentedDictionary unchanged_queue{vm::load_cell_slice_ref(seed.out_msg_queue_root), 352,
+                                          block::tlb::aug_OutMsgQueue};
+  ASSERT_TRUE(unchanged_queue.lookup(queue_key).not_null());
+}
+
+TEST(ParallelCoordinatorShadow, PreservesEmptyShardAccountsRepresentation) {
+  constexpr int global_version = 15;
+  auto original_account = simple_account(1, 10);
+  vm::AugmentedDictionary accounts{256, block::tlb::aug_ShardAccounts};
+  auto account_value = shard_account_value(original_account, 100, 10);
+  ASSERT_TRUE(accounts.set(bits(1), vm::load_cell_slice(account_value), vm::Dictionary::SetMode::Add));
+  block::tlb::Aug_InMsgDescr in_augmentation{global_version};
+  block::tlb::Aug_OutMsgDescr out_augmentation{global_version};
+  vm::AugmentedDictionary in_descriptors{256, in_augmentation};
+  vm::AugmentedDictionary out_descriptors{256, out_augmentation};
+  vm::AugmentedDictionary queue{352, block::tlb::aug_OutMsgQueue};
+  AugmentedDictionarySeed seed{.global_version = global_version,
+                               .shard_accounts_root = accounts.get_wrapped_dict_root(),
+                               .in_msg_descr_root = in_descriptors.get_wrapped_dict_root(),
+                               .out_msg_descr_root = out_descriptors.get_wrapped_dict_root(),
+                               .out_msg_queue_root = queue.get_wrapped_dict_root()};
+  AccountDictionaryDelta deletion{.account = hash(1),
+                                  .post_account_state = {},
+                                  .last_transaction_hash = {},
+                                  .last_transaction_lt = 0,
+                                  .existed_before = true,
+                                  .exists_after = false};
+
+  const auto applied = apply_augmented_dictionary_deltas_atomic(seed, {deletion}, {}, {}, {});
+  ASSERT_TRUE(applied);
+  ASSERT_TRUE(applied.roots.has_value());
+  vm::AugmentedDictionary empty_accounts{vm::load_cell_slice_ref(applied.roots->shard_accounts_root), 256,
+                                         block::tlb::aug_ShardAccounts};
+  ASSERT_TRUE(empty_accounts.is_valid());
+  ASSERT_TRUE(empty_accounts.get_root_cell().is_null());
 }
 
 }  // namespace

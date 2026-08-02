@@ -136,6 +136,28 @@ candidate publish. These maps do not reproduce augmented dictionary roots, so
 the result remains an offline consistency gate and is not wired into live
 collation.
 
+The same offline path now has a fail-closed augmented-dictionary commit gate.
+It applies account, descriptor, and queue deltas to private `ShardAccounts`,
+`InMsgDescr`, `OutMsgDescr`, and `OutMsgQueue` copies and returns roots only if
+every mutation succeeds. A queue deletion must match the exact predecessor
+value cell; a mismatch returns no roots. On the copied full-block fixture, all
+29 account values were bound to a combined predecessor proof and the 10
+`msg_import_fin` plus 10 `msg_export_deq_imm` insertions reproduced the target
+`InMsgDescr` and `OutMsgDescr` roots exactly. The combined account-proof root is
+also required to equal the target block Merkle update's predecessor
+`ShardAccounts` root.
+
+This is a two-root gate, not full shard-state equivalence. The available
+account proofs prune sibling augmentation values needed to recompute the
+`ShardAccounts` root after mutations, and they do not contain predecessor
+`OutMsgQueue` values. The JSON therefore reports
+`augmented_dictionary_roots_validated=2`, names the exact scope, and keeps
+explicit status fields for the two unresolved roots. It also reports
+`augmented_dictionary_baseline_source=target_minus_validated_deltas` and
+`augmented_dictionary_historical_transition_proven=false`: the descriptor
+check is an exact delta round-trip, not a complete historical state transition.
+The result remains offline-only and is not wired into live collation.
+
 The replay JSON also contains `account_lane_ceiling`. It groups measured
 transaction and TVM wall time by account and reports greedy ideal makespans for
 1/2/4/8/16 workers. This is an execution-only ceiling: it excludes worker
@@ -185,10 +207,10 @@ has a finite input and retains every observed hash; it does not impose the
 64-entry limit.
 
 This path is not a replacement for `ValidationReplayer`, `tontester`, the TPS
-benchmark, or `ValidateQuery`. It does not rebuild the shard-state root, the
-Merkle update, the block root, routing, limits, or consensus behavior. Its sole
-purpose is a small transaction-equivalence and workload-attribution gate before
-investing in an executor optimization.
+benchmark, or `ValidateQuery`. It does not rebuild the complete shard-state
+root, the Merkle update, the block root, routing, all limits, or consensus
+behavior. Its sole purpose is a transaction-equivalence, bounded coordinator,
+and partial dictionary-root gate before investing in executor integration.
 
 ## Operational boundary
 

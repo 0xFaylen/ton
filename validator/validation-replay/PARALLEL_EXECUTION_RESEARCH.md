@@ -163,10 +163,34 @@ historical transaction and account-state hashes remained exact. This verifies
 the coordinator contract for that bounded input; it does not construct
 augmented dictionary roots or measure parallel speedup.
 
-Masterchain public-library deltas, collator usage-tree proof size,
-account-dictionary proof merge, augmented descriptor/queue roots,
-storage-dictionary updates, live `ProcessedUpto` wiring, value flow and state
-merge remain outside this gate.
+An additional fail-closed commit gate now operates on real TON
+`AugmentedDictionary` instances. It mutates private copies of `ShardAccounts`,
+`InMsgDescr`, `OutMsgDescr`, and `OutMsgQueue`, verifies an exact predecessor
+queue value before deletion, and publishes no roots unless the entire batch
+succeeds. The copied replay combined and advanced the 29 account proofs to the
+target predecessor, required that proof root to match the target block Merkle
+update's old `ShardAccounts` root, bound all 29 account values, then removed the
+coordinator's derived descriptors from the target dictionaries and replayed the
+inserts. The result reproduced the target `InMsgDescr` and `OutMsgDescr` roots
+exactly.
+
+This validates two of four dictionary roots. It does not validate the
+`ShardAccounts` root because the account proofs prune sibling augmentation
+values required for an update, and it does not validate `OutMsgQueue` because
+the fixture lacks predecessor queue-value proofs. Fabricating either value from
+the target state would make the check circular. Full predecessor state or a
+proof-aware augmentation merge is required for accounts; exact predecessor
+queue value proofs are required for the queue.
+
+The descriptor baseline is `target minus validated deltas`; it is an exact
+delta round-trip through the real augmented dictionaries, not proof of the
+historical predecessor-to-target transition. Replay output encodes this as
+`augmented_dictionary_historical_transition_proven=false`.
+
+Masterchain public-library deltas, collator usage-tree proof size, the remaining
+two augmented roots, storage-dictionary updates, live `ProcessedUpto` wiring,
+value flow and full state merge remain outside this gate. No TPS or parallel
+speedup follows from this correctness result.
 
 ## Dead ends and cautions
 

@@ -90,6 +90,64 @@ struct CoordinatorCommitResult {
   }
 };
 
+struct AccountDictionaryDelta {
+  Hash256 account{};
+  td::Ref<vm::Cell> post_account_state;
+  Hash256 last_transaction_hash{};
+  std::uint64_t last_transaction_lt{0};
+  bool existed_before{false};
+  bool exists_after{false};
+};
+
+struct QueueDictionaryDeletion {
+  OutboundQueueKey key;
+  td::Ref<vm::Cell> expected_value;
+};
+
+// Every root is a wrapped HashmapAugE cell, matching the corresponding TL-B
+// owner and preserving the valid empty-dictionary representation.
+struct AugmentedDictionarySeed {
+  int global_version{0};
+  td::Ref<vm::Cell> shard_accounts_root;
+  td::Ref<vm::Cell> in_msg_descr_root;
+  td::Ref<vm::Cell> out_msg_descr_root;
+  td::Ref<vm::Cell> out_msg_queue_root;
+};
+
+struct AugmentedDictionaryRoots {
+  td::Ref<vm::Cell> shard_accounts_root;
+  td::Ref<vm::Cell> in_msg_descr_root;
+  td::Ref<vm::Cell> out_msg_descr_root;
+  td::Ref<vm::Cell> out_msg_queue_root;
+};
+
+enum class AugmentedDictionaryCommitError {
+  none,
+  missing_seed_root,
+  invalid_seed_dictionary,
+  missing_post_account_state,
+  account_add_failed,
+  account_replace_failed,
+  account_delete_failed,
+  in_descriptor_add_failed,
+  out_descriptor_add_failed,
+  missing_expected_queue_value,
+  queue_entry_not_found,
+  queue_value_mismatch,
+  cannot_serialize_queue_value,
+  vm_error,
+};
+
+struct AugmentedDictionaryCommitResult {
+  AugmentedDictionaryCommitError error{AugmentedDictionaryCommitError::none};
+  std::optional<std::size_t> item_index;
+  std::optional<AugmentedDictionaryRoots> roots;
+
+  explicit operator bool() const {
+    return error == AugmentedDictionaryCommitError::none;
+  }
+};
+
 using ShadowCanStart = std::function<bool(const block::BlockLimitStatus&, std::size_t)>;
 
 // Applies only a ready continuous prefix to a private copy and publishes that
@@ -102,6 +160,16 @@ CoordinatorCommitResult apply_ready_coordinator_prefix_atomic(
     const std::vector<std::optional<CanonicalTransactionEffects>>& effects,
     const std::vector<CoordinatorCommitContext>& contexts, const ShadowCanStart& can_start = {});
 
+// Applies consensus dictionary deltas to private AugmentedDictionary copies.
+// Input roots are immutable and output roots are returned only after every
+// mutation succeeds, so callers cannot publish a partial dictionary set.
+AugmentedDictionaryCommitResult apply_augmented_dictionary_deltas_atomic(
+    const AugmentedDictionarySeed& seed, const std::vector<AccountDictionaryDelta>& account_deltas,
+    const std::map<Hash256, td::Ref<vm::Cell>>& in_msg_descriptors,
+    const std::map<Hash256, td::Ref<vm::Cell>>& out_msg_descriptors,
+    const std::vector<QueueDictionaryDeletion>& queue_deletions);
+
 const char* to_string(CoordinatorCommitError error);
+const char* to_string(AugmentedDictionaryCommitError error);
 
 }  // namespace ton::validator::parallel_inbound
