@@ -93,6 +93,35 @@ The Release build was not used because its existing CMake environment currently
 fails to find `absl/hash/hash.h`; that build problem is independent of replay
 equivalence and must be fixed before performance publication.
 
+## Executable account replay checkpoint — 2026-08-02
+
+The sparse replay tool now executes the account decomposition instead of only
+projecting it. A complete account-proof replay establishes the canonical work
+map, one-worker baseline, and historical result. Deterministic greedy LPT assigns
+whole account chains to bounded threads; each thread runs the normal emulator on
+its proof subset. The batch fails unless the lane union exactly matches all
+historical transaction hashes, resulting account-state hashes, account-chain
+lengths, and canonical effect counters.
+
+Ten independent Debug processes for each width on copied basechain block
+`87341675` all passed for 51 transactions and 29 accounts. Median measured wall
+speedup was 1.75x at two workers, 2.74x at four, and 2.97x at eight;
+interquartile ranges were 1.65-1.94x, 2.48-3.09x, and 2.60-3.19x respectively.
+The corresponding single-worker probe wall was approximately 0.10 seconds.
+These timings include thread creation/join and intentionally duplicate config
+extraction, the full account dictionary scan, and shadow effect checking per
+lane.
+The in-process serial sample precedes the parallel sample; the JSON records this
+cache/order caveat and the reported medians come from repeated processes.
+
+This result invalidates the stronger concern that real TON emulator work cannot
+scale across independent account chains on this input. It does not establish a
+single-shard TPS gain: augmented-root commit, collator scheduling, reusable
+workers, CellUsageTree/proof merge, network, consensus, block bytes, and a
+representative multi-block workload remain outside the measurement. The Release
+build still fails before this target on the known missing
+`absl/hash/hash.h` include path, so no production-rate number is reported.
+
 The next shadow instrumentation is now implemented but not yet measured. Exact
 offline collation records only successful ordinary-transaction creation wall by
 destination account and phase. The ValidationReplayer reports separate

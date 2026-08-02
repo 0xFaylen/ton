@@ -191,6 +191,31 @@ contention, serial commit, block limits, cell-proof/state merge, network, and
 consensus. It must not be reported as a TPS prediction or a measured parallel
 speedup.
 
+`--account-workers N` adds an executable offline probe for complete
+account-proof replays. It first repeats the full account set with one worker,
+then partitions whole account chains with deterministic greedy LPT and replays
+the lanes concurrently. Every lane uses the normal TVM emulator and historical
+proof cells. The result is accepted only when the union preserves all historical
+transaction hashes, resulting account-state hashes, canonical payload/effect
+counters, and account-chain lengths. The requested worker count is capped at 64
+as a local process-safety guard and is reduced to the number of touched accounts;
+neither value is a TON protocol limit.
+
+The probe includes thread creation/join and deliberately duplicates config
+extraction, the full AccountBlocks scan, and shadow effect checks in every lane.
+The reported sample always runs the serial baseline before the parallel sample,
+so cache/order bias remains explicit in `known_biases` and repeated external
+runs are required.
+It excludes the augmented-root commit, a reusable actor/worker pool, live
+collator integration, network, and consensus. Its `wall_speedup` is therefore a
+measured isolated-account replay result, not shard TPS. On the copied 51-tx,
+29-account block, ten independent Debug processes at each width passed the
+equivalence gate. Median speedups were 1.75x at two workers, 2.74x at four, and
+2.97x at eight; interquartile ranges were 1.65-1.94x, 2.48-3.09x, and
+2.60-3.19x respectively.
+Release throughput remains unpublished because the existing Release build is
+blocked before this target by a missing `absl/hash/hash.h` include path.
+
 The shard archive anchors the predecessor state through the intervening block
 chain. The masterchain archive anchors the configuration state by requiring its
 root hash to equal the producing block's Merkle update. Both archive block files
@@ -210,7 +235,8 @@ tvm-replay-bundle \
   --mc-proof mc-config.tl \
   --collated-data candidate-collated-data.boc \
   --account-proof <account>=account.tl \
-  --library-bodies libraries.tl
+  --library-bodies libraries.tl \
+  --account-workers 4
 ```
 
 `--collated-data` is optional for transaction replay and the two descriptor
