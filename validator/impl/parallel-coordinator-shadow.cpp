@@ -5,6 +5,7 @@
 #include <utility>
 
 #include "block/block-parse.h"
+
 #include "parallel-coordinator-shadow.h"
 
 namespace ton::validator::parallel_inbound {
@@ -63,14 +64,14 @@ ShadowCoordinatorState::ShadowCoordinatorState(const block::BlockLimits& limits,
 }
 
 ShadowCoordinatorState::ShadowCoordinatorState(const ShadowCoordinatorState& other)
-    : block_limits(other.block_limits.limits),
-      accounts(other.accounts),
-      in_msg_descriptors(other.in_msg_descriptors),
-      out_msg_descriptors(other.out_msg_descriptors),
-      outbound_queue_entries(other.outbound_queue_entries),
-      new_messages(other.new_messages),
-      min_new_message_lt(other.min_new_message_lt),
-      processed_upto(other.processed_upto) {
+    : block_limits(other.block_limits.limits)
+    , accounts(other.accounts)
+    , in_msg_descriptors(other.in_msg_descriptors)
+    , out_msg_descriptors(other.out_msg_descriptors)
+    , outbound_queue_entries(other.outbound_queue_entries)
+    , new_messages(other.new_messages)
+    , min_new_message_lt(other.min_new_message_lt)
+    , processed_upto(other.processed_upto) {
   copy_block_limit_status(block_limits, other.block_limits);
 }
 
@@ -102,8 +103,7 @@ CoordinatorCommitResult apply_ready_coordinator_prefix_atomic(
       result.item_index = i;
       return result;
     }
-    if (target.processed_upto.last_processed &&
-        !(target.processed_upto.last_processed.value() < items[i].key)) {
+    if (target.processed_upto.last_processed && !(target.processed_upto.last_processed.value() < items[i].key)) {
       result.error = CoordinatorCommitError::input_not_after_frontier;
       result.item_index = i;
       return result;
@@ -248,7 +248,7 @@ AugmentedDictionaryCommitResult apply_augmented_dictionary_deltas_atomic(
     const AugmentedDictionarySeed& seed, const std::vector<AccountDictionaryDelta>& account_deltas,
     const std::map<Hash256, td::Ref<vm::Cell>>& in_msg_descriptors,
     const std::map<Hash256, td::Ref<vm::Cell>>& out_msg_descriptors,
-    const std::vector<QueueDictionaryDeletion>& queue_deletions) {
+    const std::vector<QueueDictionaryDelta>& queue_deltas) {
   AugmentedDictionaryCommitResult result;
   if (seed.shard_accounts_root.is_null() || seed.in_msg_descr_root.is_null() || seed.out_msg_descr_root.is_null() ||
       seed.out_msg_queue_root.is_null()) {
@@ -326,29 +326,49 @@ AugmentedDictionaryCommitResult apply_augmented_dictionary_deltas_atomic(
       }
       ++index;
     }
-    for (std::size_t i = 0; i < queue_deletions.size(); ++i) {
-      const auto& deletion = queue_deletions[i];
-      if (deletion.expected_value.is_null()) {
-        result.error = AugmentedDictionaryCommitError::missing_expected_queue_value;
+    for (std::size_t i = 0; i < queue_deltas.size(); ++i) {
+      const auto& delta = queue_deltas[i];
+      if (!delta.existed_before && !delta.exists_after) {
+        result.error = AugmentedDictionaryCommitError::invalid_queue_delta;
         result.item_index = i;
         return result;
       }
-      auto removed = out_queue.lookup_delete(deletion.key);
-      if (removed.is_null()) {
-        result.error = AugmentedDictionaryCommitError::queue_entry_not_found;
-        result.item_index = i;
-        return result;
+      if (delta.existed_before) {
+        if (delta.expected_value.is_null()) {
+          result.error = AugmentedDictionaryCommitError::missing_expected_queue_value;
+          result.item_index = i;
+          return result;
+        }
+        auto removed = out_queue.lookup_delete(delta.key);
+        if (removed.is_null()) {
+          result.error = AugmentedDictionaryCommitError::queue_entry_not_found;
+          result.item_index = i;
+          return result;
+        }
+        auto removed_cell = serialize_value(removed);
+        if (removed_cell.is_null()) {
+          result.error = AugmentedDictionaryCommitError::cannot_serialize_queue_value;
+          result.item_index = i;
+          return result;
+        }
+        if (removed_cell->get_hash() != delta.expected_value->get_hash()) {
+          result.error = AugmentedDictionaryCommitError::queue_value_mismatch;
+          result.item_index = i;
+          return result;
+        }
       }
-      auto removed_cell = serialize_value(removed);
-      if (removed_cell.is_null()) {
-        result.error = AugmentedDictionaryCommitError::cannot_serialize_queue_value;
-        result.item_index = i;
-        return result;
-      }
-      if (removed_cell->get_hash() != deletion.expected_value->get_hash()) {
-        result.error = AugmentedDictionaryCommitError::queue_value_mismatch;
-        result.item_index = i;
-        return result;
+      if (delta.exists_after) {
+        if (delta.post_value.is_null()) {
+          result.error = AugmentedDictionaryCommitError::missing_post_queue_value;
+          result.item_index = i;
+          return result;
+        }
+        if (!out_queue.set(delta.key, vm::load_cell_slice(delta.post_value), vm::Dictionary::SetMode::Add)) {
+          result.error = delta.existed_before ? AugmentedDictionaryCommitError::queue_replace_failed
+                                              : AugmentedDictionaryCommitError::queue_add_failed;
+          result.item_index = i;
+          return result;
+        }
       }
     }
 
@@ -357,12 +377,14 @@ AugmentedDictionaryCommitResult apply_augmented_dictionary_deltas_atomic(
                                             .out_msg_descr_root = out_descriptors.get_wrapped_dict_root(),
                                             .out_msg_queue_root = out_queue.get_wrapped_dict_root()};
     return result;
-  } catch (vm::VmVirtError&) {
+  } catch (vm::VmVirtError& error) {
     result.error = AugmentedDictionaryCommitError::vm_error;
+    result.error_detail = error.get_msg();
     result.roots.reset();
     return result;
-  } catch (vm::VmError&) {
+  } catch (vm::VmError& error) {
     result.error = AugmentedDictionaryCommitError::vm_error;
+    result.error_detail = error.get_msg();
     result.roots.reset();
     return result;
   }
@@ -440,10 +462,18 @@ const char* to_string(AugmentedDictionaryCommitError error) {
       return "in_descriptor_add_failed";
     case AugmentedDictionaryCommitError::out_descriptor_add_failed:
       return "out_descriptor_add_failed";
+    case AugmentedDictionaryCommitError::invalid_queue_delta:
+      return "invalid_queue_delta";
     case AugmentedDictionaryCommitError::missing_expected_queue_value:
       return "missing_expected_queue_value";
+    case AugmentedDictionaryCommitError::missing_post_queue_value:
+      return "missing_post_queue_value";
     case AugmentedDictionaryCommitError::queue_entry_not_found:
       return "queue_entry_not_found";
+    case AugmentedDictionaryCommitError::queue_add_failed:
+      return "queue_add_failed";
+    case AugmentedDictionaryCommitError::queue_replace_failed:
+      return "queue_replace_failed";
     case AugmentedDictionaryCommitError::queue_value_mismatch:
       return "queue_value_mismatch";
     case AugmentedDictionaryCommitError::cannot_serialize_queue_value:

@@ -139,24 +139,38 @@ collation.
 The same offline path now has a fail-closed augmented-dictionary commit gate.
 It applies account, descriptor, and queue deltas to private `ShardAccounts`,
 `InMsgDescr`, `OutMsgDescr`, and `OutMsgQueue` copies and returns roots only if
-every mutation succeeds. A queue deletion must match the exact predecessor
-value cell; a mismatch returns no roots. On the copied full-block fixture, all
+every mutation succeeds. Queue additions, replacements, and deletions are
+handled by the same atomic batch. Every replacement or deletion must match the
+exact predecessor value cell; a mismatch returns no roots. On the copied
+full-block fixture, all
 29 account values were bound to a combined predecessor proof and the 10
 `msg_import_fin` plus 10 `msg_export_deq_imm` insertions reproduced the target
 `InMsgDescr` and `OutMsgDescr` roots exactly. The combined account-proof root is
 also required to equal the target block Merkle update's predecessor
 `ShardAccounts` root.
 
-This is a two-root gate, not full shard-state equivalence. The available
-account proofs prune sibling augmentation values needed to recompute the
-`ShardAccounts` root after mutations, and they do not contain predecessor
-`OutMsgQueue` values. The JSON therefore reports
+This is a two-root gate unless candidate collated data is supplied. The block
+Merkle update is hash-sufficient for applying the state transition, but it
+prunes sibling augmentation values needed to enumerate and recompute changed
+`ShardAccounts` and `OutMsgQueue` paths. Core creates the complete predecessor
+proof later, while building `candidate.collated_data`. The available copied
+fixture contains the block and account proofs, but not that candidate artifact.
+The JSON therefore reports
 `augmented_dictionary_roots_validated=2`, names the exact scope, and keeps
 explicit status fields for the two unresolved roots. It also reports
 `augmented_dictionary_baseline_source=target_minus_validated_deltas` and
 `augmented_dictionary_historical_transition_proven=false`: the descriptor
 check is an exact delta round-trip, not a complete historical state transition.
 The result remains offline-only and is not wired into live collation.
+
+`--collated-data <path>` accepts the raw candidate collated-data BOC. The tool
+selects exactly one Merkle proof whose virtual root equals the target block's
+predecessor state hash and rejects missing, duplicate, or unrelated witnesses.
+With that witness it enumerates the complete queue diff, applies all account
+and queue mutations through the atomic commit, and requires all four dictionary
+roots to match. Supplying the flag makes this fail-closed: the replay cannot
+succeed with fewer than four validated roots. A normal block BOC, archive
+package, config proof, or target state is not an acceptable substitute.
 
 The replay JSON also contains `account_lane_ceiling`. It groups measured
 transaction and TVM wall time by account and reports greedy ideal makespans for
@@ -182,9 +196,13 @@ tvm-replay-bundle \
   --archive <closed-shard.pack> \
   --block-id '(0,8000000000000000,SEQNO)' \
   --mc-proof mc-config.tl \
+  --collated-data candidate-collated-data.boc \
   --account-proof <account>=account.tl \
   --library-bodies libraries.tl
 ```
+
+`--collated-data` is optional for transaction replay and the two descriptor
+roots, but required for the four-root state-transition gate.
 
 `saveconfigproof` and `saveaccountproof` validate the returned Merkle proofs
 before writing them. The replay tool validates them again and rejects stale

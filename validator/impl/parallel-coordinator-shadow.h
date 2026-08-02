@@ -6,6 +6,7 @@
 #include <optional>
 #include <queue>
 #include <set>
+#include <string>
 #include <vector>
 
 #include "parallel-transaction-payload.h"
@@ -99,9 +100,12 @@ struct AccountDictionaryDelta {
   bool exists_after{false};
 };
 
-struct QueueDictionaryDeletion {
+struct QueueDictionaryDelta {
   OutboundQueueKey key;
   td::Ref<vm::Cell> expected_value;
+  td::Ref<vm::Cell> post_value;
+  bool existed_before{false};
+  bool exists_after{false};
 };
 
 // Every root is a wrapped HashmapAugE cell, matching the corresponding TL-B
@@ -131,8 +135,12 @@ enum class AugmentedDictionaryCommitError {
   account_delete_failed,
   in_descriptor_add_failed,
   out_descriptor_add_failed,
+  invalid_queue_delta,
   missing_expected_queue_value,
+  missing_post_queue_value,
   queue_entry_not_found,
+  queue_add_failed,
+  queue_replace_failed,
   queue_value_mismatch,
   cannot_serialize_queue_value,
   vm_error,
@@ -140,6 +148,7 @@ enum class AugmentedDictionaryCommitError {
 
 struct AugmentedDictionaryCommitResult {
   AugmentedDictionaryCommitError error{AugmentedDictionaryCommitError::none};
+  std::string error_detail;
   std::optional<std::size_t> item_index;
   std::optional<AugmentedDictionaryRoots> roots;
 
@@ -167,7 +176,7 @@ AugmentedDictionaryCommitResult apply_augmented_dictionary_deltas_atomic(
     const AugmentedDictionarySeed& seed, const std::vector<AccountDictionaryDelta>& account_deltas,
     const std::map<Hash256, td::Ref<vm::Cell>>& in_msg_descriptors,
     const std::map<Hash256, td::Ref<vm::Cell>>& out_msg_descriptors,
-    const std::vector<QueueDictionaryDeletion>& queue_deletions);
+    const std::vector<QueueDictionaryDelta>& queue_deltas);
 
 const char* to_string(CoordinatorCommitError error);
 const char* to_string(AugmentedDictionaryCommitError error);

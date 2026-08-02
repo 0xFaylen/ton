@@ -165,8 +165,9 @@ augmented dictionary roots or measure parallel speedup.
 
 An additional fail-closed commit gate now operates on real TON
 `AugmentedDictionary` instances. It mutates private copies of `ShardAccounts`,
-`InMsgDescr`, `OutMsgDescr`, and `OutMsgQueue`, verifies an exact predecessor
-queue value before deletion, and publishes no roots unless the entire batch
+`InMsgDescr`, `OutMsgDescr`, and `OutMsgQueue`; queue additions, replacements,
+and deletions share one atomic batch. Replacements and deletions verify the
+exact predecessor value, and no roots are returned unless the entire batch
 succeeds. The copied replay combined and advanced the 29 account proofs to the
 target predecessor, required that proof root to match the target block Merkle
 update's old `ShardAccounts` root, bound all 29 account values, then removed the
@@ -174,23 +175,35 @@ coordinator's derived descriptors from the target dictionaries and replayed the
 inserts. The result reproduced the target `InMsgDescr` and `OutMsgDescr` roots
 exactly.
 
-This validates two of four dictionary roots. It does not validate the
-`ShardAccounts` root because the account proofs prune sibling augmentation
-values required for an update, and it does not validate `OutMsgQueue` because
-the fixture lacks predecessor queue-value proofs. Fabricating either value from
-the target state would make the check circular. Full predecessor state or a
-proof-aware augmentation merge is required for accounts; exact predecessor
-queue value proofs are required for the queue.
+This validates two of four dictionary roots on the available fixture. Directly
+applying the block Merkle update to an `AugmentedDictionary` fails on a pruned
+branch: the update proves the old and new state hashes but does not retain every
+sibling augmentation needed to enumerate changed dictionaries. Core resolves
+this in `Collator::prepare_proofs`, called by `create_collated_data` after the
+new shard state and block Merkle update have been built. `ValidateQuery` reads
+those Merkle proofs from `candidate.collated_data` before validating the state
+transition.
+
+The replay tool now accepts that artifact through `--collated-data`. It requires
+one predecessor-state Merkle proof with an exact virtual-root hash match,
+enumerates all `OutMsgQueue` additions/replacements/deletions, applies the full
+account and queue delta set atomically, and exposes four validated roots only
+after exact target-root comparison. The copied archive does not contain the
+historical candidate collated data, so the current mainnet-derived result
+correctly remains at two roots. A target state, block BOC, or fabricated queue
+baseline would make the check circular and is rejected as a substitute.
 
 The descriptor baseline is `target minus validated deltas`; it is an exact
 delta round-trip through the real augmented dictionaries, not proof of the
 historical predecessor-to-target transition. Replay output encodes this as
 `augmented_dictionary_historical_transition_proven=false`.
 
-Masterchain public-library deltas, collator usage-tree proof size, the remaining
-two augmented roots, storage-dictionary updates, live `ProcessedUpto` wiring,
-value flow and full state merge remain outside this gate. No TPS or parallel
-speedup follows from this correctness result.
+Masterchain public-library deltas, collator usage-tree proof size,
+storage-dictionary updates, live `ProcessedUpto` wiring, value flow and full
+state merge remain outside this gate. The remaining two roots are implemented
+but unproven on the copied mainnet fixture until its matching collated-data
+witness is available. No TPS or parallel speedup follows from this correctness
+result.
 
 ## Dead ends and cautions
 

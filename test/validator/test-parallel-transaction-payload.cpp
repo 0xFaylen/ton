@@ -5,8 +5,8 @@
 
 #include "block/block-auto.h"
 #include "block/block-parse.h"
-#include "impl/parallel-coordinator-shadow.h"
 #include "block/block.h"
+#include "impl/parallel-coordinator-shadow.h"
 #include "impl/parallel-transaction-payload.h"
 #include "td/utils/tests.h"
 #include "vm/cells/CellBuilder.h"
@@ -72,15 +72,15 @@ td::Ref<vm::CellSlice> std_address(std::uint64_t value) {
 
 td::Ref<vm::Cell> simple_account(std::uint64_t address, std::uint64_t last_transaction_lt) {
   vm::CellBuilder builder;
-  ASSERT_TRUE(builder.store_ones_bool(1));                              // account$1
-  ASSERT_TRUE(builder.append_cellslice_bool(std_address(address)));     // addr:MsgAddressInt
-  ASSERT_TRUE(builder.store_zeroes_bool(6));                            // used:StorageUsed
-  ASSERT_TRUE(builder.store_zeroes_bool(3));                            // storage_extra_none$000
-  ASSERT_TRUE(builder.store_zeroes_bool(32));                           // last_paid:uint32
-  ASSERT_TRUE(builder.store_zeroes_bool(1));                            // due_payment:(Maybe Grams)
+  ASSERT_TRUE(builder.store_ones_bool(1));                           // account$1
+  ASSERT_TRUE(builder.append_cellslice_bool(std_address(address)));  // addr:MsgAddressInt
+  ASSERT_TRUE(builder.store_zeroes_bool(6));                         // used:StorageUsed
+  ASSERT_TRUE(builder.store_zeroes_bool(3));                         // storage_extra_none$000
+  ASSERT_TRUE(builder.store_zeroes_bool(32));                        // last_paid:uint32
+  ASSERT_TRUE(builder.store_zeroes_bool(1));                         // due_payment:(Maybe Grams)
   ASSERT_TRUE(builder.store_long_bool(last_transaction_lt, 64));
-  ASSERT_TRUE(builder.store_zeroes_bool(5));                            // balance:CurrencyCollection
-  ASSERT_TRUE(builder.store_zeroes_bool(2));                            // account_uninit$00
+  ASSERT_TRUE(builder.store_zeroes_bool(5));  // balance:CurrencyCollection
+  ASSERT_TRUE(builder.store_zeroes_bool(2));  // account_uninit$00
   auto result = builder.finalize_novm();
   ASSERT_TRUE(block::gen::t_Account.validate_ref(result));
   return result;
@@ -221,9 +221,9 @@ CanonicalTransactionPayload payload_from_state(std::uint64_t account, const td::
                                                std::uint64_t lt, td::Ref<vm::Cell> in_message = {},
                                                std::vector<td::Ref<vm::Cell>> out_messages = {}) {
   auto post = account_none();
-  auto transaction = make_transaction_with_pre_hash(account, pre_state->get_hash().as_bits256(),
-                                                     post->get_hash().as_bits256(), lt, 0, std::move(in_message),
-                                                     std::move(out_messages));
+  auto transaction =
+      make_transaction_with_pre_hash(account, pre_state->get_hash().as_bits256(), post->get_hash().as_bits256(), lt, 0,
+                                     std::move(in_message), std::move(out_messages));
   return {.transaction_root = std::move(transaction), .post_account_state = std::move(post), .proof_journals = {}};
 }
 
@@ -387,11 +387,10 @@ TEST(ParallelCoordinatorShadow, AtomicallyPublishesAccountMessagesDescriptorsQue
   CoordinatorCommitContext context{
       .limit = {.account_is_first = true, .charge_gas = true},
       .outbound_registration = {},
-      .inbound_descriptor = InboundDescriptorContext{.message_envelope = envelope,
-                                                     .dequeued_from_current_shard = true},
+      .inbound_descriptor = InboundDescriptorContext{.message_envelope = envelope, .dequeued_from_current_shard = true},
       .outbound_queue_deletion = queue_key};
-  auto result = apply_ready_coordinator_prefix_atomic(
-      state, {work}, {CompletionStatus::succeeded}, {*inspected.effects}, {context});
+  auto result = apply_ready_coordinator_prefix_atomic(state, {work}, {CompletionStatus::succeeded},
+                                                      {*inspected.effects}, {context});
 
   ASSERT_TRUE(result);
   ASSERT_EQ(result.decision.committed_count, 1u);
@@ -442,8 +441,7 @@ TEST(ParallelCoordinatorShadow, NormalStopPublishesOnlyTheReadyPrefixAndCanResum
        .outbound_queue_deletion = std::nullopt}};
 
   auto partial = apply_ready_coordinator_prefix_atomic(
-      state, items, {CompletionStatus::succeeded, CompletionStatus::pending},
-      {*first.effects, std::nullopt}, contexts);
+      state, items, {CompletionStatus::succeeded, CompletionStatus::pending}, {*first.effects, std::nullopt}, contexts);
   ASSERT_TRUE(partial);
   ASSERT_EQ(partial.decision.committed_count, 1u);
   ASSERT_EQ(partial.decision.stop_reason, PrefixStopReason::pending);
@@ -452,8 +450,8 @@ TEST(ParallelCoordinatorShadow, NormalStopPublishesOnlyTheReadyPrefixAndCanResum
   ASSERT_EQ(state.in_msg_descriptors.size(), 1u);
   ASSERT_EQ(state.processed_upto.last_processed, std::optional<MessageKey>{items[0].key});
 
-  auto resumed = apply_ready_coordinator_prefix_atomic(
-      state, {items[1]}, {CompletionStatus::succeeded}, {*second.effects}, {contexts[1]});
+  auto resumed = apply_ready_coordinator_prefix_atomic(state, {items[1]}, {CompletionStatus::succeeded},
+                                                       {*second.effects}, {contexts[1]});
   ASSERT_TRUE(resumed);
   ASSERT_EQ(state.accounts.at(hash(11)).state_hash, second.effects->post_account_state_hash);
   ASSERT_EQ(state.in_msg_descriptors.size(), 2u);
@@ -489,9 +487,9 @@ TEST(ParallelCoordinatorShadow, CommitErrorDiscardsTheEntireCandidatePrefix) {
        .inbound_descriptor = InboundDescriptorContext{.message_envelope = message_envelope(second_inbound, 20)},
        .outbound_queue_deletion = std::nullopt}};
 
-  auto rejected = apply_ready_coordinator_prefix_atomic(
-      state, items, {CompletionStatus::succeeded, CompletionStatus::succeeded}, {*first.effects, *second.effects},
-      contexts);
+  auto rejected =
+      apply_ready_coordinator_prefix_atomic(state, items, {CompletionStatus::succeeded, CompletionStatus::succeeded},
+                                            {*first.effects, *second.effects}, contexts);
   ASSERT_EQ(rejected.error, CoordinatorCommitError::duplicate_in_descriptor);
   ASSERT_EQ(rejected.item_index, std::optional<std::size_t>{1});
   ASSERT_EQ(rejected.decision.stop_reason, PrefixStopReason::commit_failure);
@@ -521,12 +519,11 @@ TEST(ParallelCoordinatorShadow, RejectsMissingQueueEntryWithoutPublishing) {
   CoordinatorCommitContext context{
       .limit = {.account_is_first = true},
       .outbound_registration = {},
-      .inbound_descriptor = InboundDescriptorContext{.message_envelope = envelope,
-                                                     .dequeued_from_current_shard = true},
+      .inbound_descriptor = InboundDescriptorContext{.message_envelope = envelope, .dequeued_from_current_shard = true},
       .outbound_queue_deletion = queue_key};
 
-  auto rejected = apply_ready_coordinator_prefix_atomic(
-      state, {work}, {CompletionStatus::succeeded}, {*inspected.effects}, {context});
+  auto rejected = apply_ready_coordinator_prefix_atomic(state, {work}, {CompletionStatus::succeeded},
+                                                        {*inspected.effects}, {context});
   ASSERT_EQ(rejected.error, CoordinatorCommitError::queue_entry_not_found);
   ASSERT_EQ(state.accounts.at(hash(10)).state_hash, cell_hash(pre_state));
   ASSERT_TRUE(state.in_msg_descriptors.empty());
@@ -555,8 +552,8 @@ TEST(ParallelCoordinatorShadow, RejectsTamperedCanonicalCellWithoutPublishing) {
       .inbound_descriptor = InboundDescriptorContext{.message_envelope = message_envelope(inbound, 777)},
       .outbound_queue_deletion = std::nullopt};
 
-  auto rejected = apply_ready_coordinator_prefix_atomic(
-      state, {work}, {CompletionStatus::succeeded}, {tampered}, {context});
+  auto rejected =
+      apply_ready_coordinator_prefix_atomic(state, {work}, {CompletionStatus::succeeded}, {tampered}, {context});
   ASSERT_EQ(rejected.error, CoordinatorCommitError::post_state_cell_hash_mismatch);
   ASSERT_EQ(state.accounts.at(hash(10)).state_hash, cell_hash(pre_state));
   ASSERT_EQ(state.block_limits.transactions, 0u);
@@ -789,7 +786,8 @@ TEST(ParallelCoordinatorShadow, AppliesAugmentedDictionaryDeltasAtomically) {
                                        .last_transaction_lt = 11,
                                        .existed_before = true,
                                        .exists_after = true};
-  QueueDictionaryDeletion queue_deletion{.key = queue_key, .expected_value = queue_value};
+  QueueDictionaryDelta queue_deletion{
+      .key = queue_key, .expected_value = queue_value, .post_value = {}, .existed_before = true, .exists_after = false};
 
   auto expected_accounts = accounts;
   auto expected_first_value = shard_account_value(post_account, 101, 11);
@@ -840,7 +838,11 @@ TEST(ParallelCoordinatorShadow, RejectsQueueValueMismatchWithoutPublishingDictio
                                        .last_transaction_lt = 11,
                                        .existed_before = true,
                                        .exists_after = true};
-  QueueDictionaryDeletion bad_deletion{.key = queue_key, .expected_value = enqueued_message_value(31, envelope)};
+  QueueDictionaryDelta bad_deletion{.key = queue_key,
+                                    .expected_value = enqueued_message_value(31, envelope),
+                                    .post_value = {},
+                                    .existed_before = true,
+                                    .exists_after = false};
 
   const auto rejected = apply_augmented_dictionary_deltas_atomic(seed, {account_delta}, {}, {}, {bad_deletion});
   ASSERT_EQ(rejected.error, AugmentedDictionaryCommitError::queue_value_mismatch);
@@ -853,6 +855,53 @@ TEST(ParallelCoordinatorShadow, RejectsQueueValueMismatchWithoutPublishingDictio
   vm::AugmentedDictionary unchanged_queue{vm::load_cell_slice_ref(seed.out_msg_queue_root), 352,
                                           block::tlb::aug_OutMsgQueue};
   ASSERT_TRUE(unchanged_queue.lookup(queue_key).not_null());
+}
+
+TEST(ParallelCoordinatorShadow, AppliesQueueAddAndReplaceInTheAtomicDictionaryCommit) {
+  constexpr int global_version = 15;
+  vm::AugmentedDictionary accounts{256, block::tlb::aug_ShardAccounts};
+  block::tlb::Aug_InMsgDescr in_augmentation{global_version};
+  block::tlb::Aug_OutMsgDescr out_augmentation{global_version};
+  vm::AugmentedDictionary in_descriptors{256, in_augmentation};
+  vm::AugmentedDictionary out_descriptors{256, out_augmentation};
+
+  auto first_envelope = message_envelope(internal_message(1, 2, 30), 7);
+  auto second_envelope = message_envelope(internal_message(1, 3, 40), 8);
+  OutboundQueueKey first_key;
+  OutboundQueueKey second_key;
+  ASSERT_TRUE(block::compute_out_msg_queue_key(first_envelope, first_key));
+  ASSERT_TRUE(block::compute_out_msg_queue_key(second_envelope, second_key));
+  auto first_value = enqueued_message_value(30, first_envelope);
+  auto replaced_first_value = enqueued_message_value(31, first_envelope);
+  auto second_value = enqueued_message_value(40, second_envelope);
+  vm::AugmentedDictionary queue{352, block::tlb::aug_OutMsgQueue};
+  ASSERT_TRUE(queue.set(first_key, vm::load_cell_slice(first_value), vm::Dictionary::SetMode::Add));
+
+  AugmentedDictionarySeed seed{.global_version = global_version,
+                               .shard_accounts_root = accounts.get_wrapped_dict_root(),
+                               .in_msg_descr_root = in_descriptors.get_wrapped_dict_root(),
+                               .out_msg_descr_root = out_descriptors.get_wrapped_dict_root(),
+                               .out_msg_queue_root = queue.get_wrapped_dict_root()};
+  std::vector<QueueDictionaryDelta> queue_deltas{{.key = first_key,
+                                                  .expected_value = first_value,
+                                                  .post_value = replaced_first_value,
+                                                  .existed_before = true,
+                                                  .exists_after = true},
+                                                 {.key = second_key,
+                                                  .expected_value = {},
+                                                  .post_value = second_value,
+                                                  .existed_before = false,
+                                                  .exists_after = true}};
+
+  auto expected_queue = queue;
+  ASSERT_TRUE(
+      expected_queue.set(first_key, vm::load_cell_slice(replaced_first_value), vm::Dictionary::SetMode::Replace));
+  ASSERT_TRUE(expected_queue.set(second_key, vm::load_cell_slice(second_value), vm::Dictionary::SetMode::Add));
+
+  const auto applied = apply_augmented_dictionary_deltas_atomic(seed, {}, {}, {}, queue_deltas);
+  ASSERT_TRUE(applied);
+  ASSERT_TRUE(applied.roots.has_value());
+  ASSERT_EQ(applied.roots->out_msg_queue_root->get_hash(), expected_queue.get_wrapped_dict_root()->get_hash());
 }
 
 TEST(ParallelCoordinatorShadow, PreservesEmptyShardAccountsRepresentation) {
