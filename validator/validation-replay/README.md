@@ -276,6 +276,7 @@ can use lite-server proof bundles:
 lite-client -c 'saveconfigproof mc-config.tl <masterchain-block-id-ext>'
 lite-client -c 'saveaccountproof account.tl 0:<account> <predecessor-shard-block-id-ext>'
 lite-client -c 'savelibraries libraries.tl <library-hash>...'
+lite-client -c 'saveblock target-block.boc <target-shard-block-id-ext>'
 
 tvm-replay-bundle \
   --archive <closed-shard.pack> \
@@ -287,14 +288,40 @@ tvm-replay-bundle \
   --account-workers 4
 ```
 
+The target block can be replayed without a complete archive package by using
+its full id and the verified raw BOC:
+
+```text
+tvm-replay-bundle \
+  --block-boc target-block.boc \
+  --block-id <target-shard-block-id-ext> \
+  --mc-proof mc-config.tl \
+  --account-proof <account>=account.tl \
+  --library-bodies libraries.tl \
+  --account-workers 4
+```
+
+`saveblock` requires a full `BlockIdExt`, verifies the server's returned id,
+the SHA-256 file hash and the BOC root hash, and creates an owner-only output
+file without overwriting an existing path. `--block-boc` repeats both hash
+checks before parsing the block.
+
+An account proof may be older than the target predecessor. In raw-BOC mode,
+repeat `--history-block-boc <path>` for every intervening block. The replayer
+derives each intermediate full id from its header and BOC hashes, then requires
+an unbroken `prev` chain from the proof's shard block to the target predecessor.
+A missing, duplicate, wrong-shard, future, nonlinear, or account-changing
+intermediate block fails the replay. No history BOC is needed when every proof
+is already bound to the exact predecessor.
+
 `--collated-data` is optional for transaction replay and the two descriptor
 roots, but required for the four-root state-transition gate.
 
 `saveconfigproof` and `saveaccountproof` validate the returned Merkle proofs
-before writing them. For linear replay, bind every account proof to the exact
-predecessor shard block printed by `--inspect`. The replay tool also accepts a
-proof bound to the target block's masterchain reference, validates it again,
-and rejects it if an intervening shard block changed that account. Repeat
+before writing them. For linear replay, prefer binding every account proof to
+the exact predecessor shard block printed by `--inspect`. The replay tool also
+accepts an older proof, validates the supplied archive or raw-BOC history, and
+rejects it if an intervening shard block changed that account. Repeat
 `--account-proof` for all touched accounts to obtain `scope=full_block`.
 
 Public-library cells are content addressed. `savelibraries` verifies each body

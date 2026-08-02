@@ -345,6 +345,37 @@ passes full replay and the executable four-worker equivalence gate. A copied
 validator database remains necessary for real Collator and ValidateQuery wall
 measurements; archive packages and account proofs are not a substitute.
 
+## Verified raw-block input gate - 2026-08-02
+
+The fixture path no longer requires a complete shard archive package for the
+target block. `lite-client saveblock` requests one full `BlockIdExt`, rejects a
+different returned id, verifies both the serialized-file and BOC-root hashes,
+and writes a new owner-only file without overwriting. The replay tool repeats
+both checks before using `--block-boc`.
+
+Raw input remains fail closed for older account proofs. Optional repeated
+`--history-block-boc` inputs derive their own full ids from the block header and
+the two computed hashes. Replay then checks the complete predecessor linkage,
+shard, sequence, and per-account non-modification path from each proof base to
+the target predecessor. It neither trusts filenames nor silently advances a
+proof through a missing block.
+
+The copied block `87341675` exercised this path with a 113,736-byte target BOC,
+a 1,124-byte intermediate block `87341674`, the existing configuration proof,
+29 account proofs based at `87341673`, and the public-library body bundle. The
+raw-BOC and archive modes both replayed 51 transactions across 29 accounts.
+After excluding timing-derived ranks and rates, their block/config/proof ids,
+historical transaction and account-state equivalence, effect counters, gas,
+VM-step totals, and per-code-hash/account distributions were identical. Missing
+history, a wrong target root hash, a short target id, duplicate block sources,
+and output overwrite were rejected.
+
+This gate makes small, immutable fixtures collectable from a lite server. It
+does not measure live-node capacity, run Collator or ValidateQuery, retain
+historical candidate collated data, or establish sustainable single-shard TPS.
+The network `saveblock` request path compiled but was not exercised against the
+latency-sensitive production node in this checkpoint.
+
 ## Dead ends and cautions
 
 - Search results did not expose a public TON trace JIT or public intra-block

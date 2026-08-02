@@ -241,6 +241,8 @@ class TestNode : public td::actor::Actor {
   bool save_libraries_proof(ton::BlockIdExt blkid, std::vector<td::Bits256> libraries, std::string filename);
   bool get_block(ton::BlockIdExt blk, bool dump = false);
   void got_block(ton::BlockIdExt blkid, td::BufferSlice data, bool dump);
+  bool save_block(ton::BlockIdExt blkid, std::string filename);
+  void got_saved_block(ton::BlockIdExt blkid, td::BufferSlice data, std::string filename);
   bool get_state(ton::BlockIdExt blk, bool dump = false);
   void got_state(ton::BlockIdExt blkid, ton::RootHash root_hash, ton::FileHash file_hash, td::BufferSlice data,
                  bool dump);

@@ -70,6 +70,14 @@ int verbosity;
 
 namespace {
 constexpr int kSaveConfigProof = 1 << 20;
+
+td::Status write_new_file(td::CSlice path, td::Slice data) {
+  TRY_RESULT(file, td::FileFd::open(path, td::FileFd::Write | td::FileFd::CreateNew, 0600));
+  TRY_STATUS(file.write_all(data));
+  TRY_STATUS(file.sync());
+  file.close();
+  return td::Status::OK();
+}
 }
 
 void TestNode::run() {
@@ -1022,6 +1030,7 @@ bool TestNode::show_help(std::string command) {
          "masterchain proof (16 hashes maximum)\n"
          "gethead <block-id-ext>\tShows block header for <block-id-ext>\n"
          "getblock <block-id-ext>\tDownloads block\n"
+         "saveblock <filename> <block-id-ext>\tSaves a hash-verified raw block BOC without overwriting\n"
          "dumpblock <block-id-ext>\tDownloads and dumps specified block\n"
          "getstate <block-id-ext>\tDownloads state corresponding to specified block\n"
          "dumpstate <block-id-ext>\tDownloads and dumps state corresponding to specified block\n"
@@ -1193,6 +1202,9 @@ bool TestNode::do_parse_line() {
     return parse_block_id_ext(blkid) && parse_get_config_params(blkid, 0x8000);
   } else if (word == "getblock") {
     return parse_block_id_ext(blkid) && seekeoln() && get_block(blkid, false);
+  } else if (word == "saveblock") {
+    std::string filename;
+    return get_word_to(filename) && parse_block_id_ext(blkid) && seekeoln() && save_block(blkid, std::move(filename));
   } else if (word == "dumpblock") {
     return parse_block_id_ext(blkid) && seekeoln() && get_block(blkid, true);
   } else if (word == "getstate") {
@@ -3377,6 +3389,56 @@ bool TestNode::get_block(ton::BlockIdExt blkid, bool dump) {
           }
         }
       });
+}
+
+bool TestNode::save_block(ton::BlockIdExt blkid, std::string filename) {
+  LOG(INFO) << "got verified block save request for " << blkid;
+  auto query = ton::serialize_tl_object(
+      ton::create_tl_object<ton::lite_api::liteServer_getBlock>(ton::create_tl_lite_block_id(blkid)), true);
+  return envelope_send_query(std::move(query), [Self = actor_id(this), blkid, filename = std::move(filename)](
+                                                   td::Result<td::BufferSlice> result) mutable {
+    if (result.is_error()) {
+      LOG(ERROR) << "cannot obtain block " << blkid << " from server : " << result.move_as_error().to_string();
+      return;
+    }
+    auto response = ton::fetch_tl_object<ton::lite_api::liteServer_blockData>(result.move_as_ok(), true);
+    if (response.is_error()) {
+      LOG(ERROR) << "cannot parse answer to liteServer.getBlock";
+      return;
+    }
+    auto block = response.move_as_ok();
+    auto returned_id = ton::create_block_id(block->id_);
+    if (returned_id != blkid) {
+      LOG(ERROR) << "block id mismatch: expected data for block " << blkid << ", obtained for " << returned_id;
+      return;
+    }
+    td::actor::send_closure_later(Self, &TestNode::got_saved_block, returned_id, std::move(block->data_),
+                                  std::move(filename));
+  });
+}
+
+void TestNode::got_saved_block(ton::BlockIdExt blkid, td::BufferSlice data, std::string filename) {
+  if (td::sha256_bits256(data) != blkid.file_hash) {
+    LOG(ERROR) << "file hash mismatch while saving block " << blkid;
+    return;
+  }
+  auto root = vm::std_boc_deserialize(data.as_slice());
+  if (root.is_error()) {
+    LOG(ERROR) << "cannot deserialize block before saving: " << root.move_as_error().to_string();
+    return;
+  }
+  if (td::Bits256(root.ok()->get_hash().bits()) != blkid.root_hash) {
+    LOG(ERROR) << "root hash mismatch while saving block " << blkid;
+    return;
+  }
+  auto status = write_new_file(filename, data.as_slice());
+  if (status.is_error()) {
+    LOG(ERROR) << "cannot save verified block to `" << filename << "`: " << status.move_as_error();
+    return;
+  }
+  register_blkid(blkid);
+  td::TerminalIO::out() << "saved verified block BOC into file `" << filename << "` (" << data.size() << " bytes)"
+                        << std::endl;
 }
 
 bool TestNode::get_state(ton::BlockIdExt blkid, bool dump) {
