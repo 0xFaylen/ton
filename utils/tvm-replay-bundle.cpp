@@ -241,6 +241,8 @@ struct ParallelAccountReplayProbe {
   }
 };
 
+td::Result<BlockContext> unpack_block_context(LoadedBlock block_data);
+
 td::Result<LoadedBlock> load_block_from_archive(const std::string& archive, const BlockId& requested_id) {
   TRY_RESULT(package, ton::Package::open(archive, true, false));
   LoadedBlock found;
@@ -290,6 +292,69 @@ td::Result<LoadedBlock> load_block_from_archive(const std::string& archive, cons
     return td::Status::Error(PSTRING() << "block " << requested_id.to_str() << " was not found in archive");
   }
   return found;
+}
+
+td::Result<std::string> list_archive_blocks(const std::string& archive) {
+  TRY_RESULT(package, ton::Package::open(archive, true, false));
+  struct Summary {
+    BlockIdExt id;
+    std::size_t file_bytes;
+    BlockIdExt masterchain_ref;
+    td::uint32 gen_utime;
+  };
+  std::vector<Summary> blocks;
+  td::Status scan_status = td::Status::OK();
+
+  TRY_STATUS(package.iterate([&](std::string filename, td::BufferSlice data, td::uint64) {
+    auto file_ref = ton::validator::FileReference::create(std::move(filename));
+    if (file_ref.is_error()) {
+      return true;
+    }
+    auto parsed = file_ref.move_as_ok();
+    parsed.ref().visit(td::overloaded(
+        [&](const ton::validator::fileref::Block& block_ref) {
+          if (td::sha256_bits256(data) != block_ref.block_id.file_hash) {
+            scan_status = td::Status::Error("block file hash does not match its archive filename");
+            return;
+          }
+          auto root = vm::std_boc_deserialize(data.as_slice());
+          if (root.is_error()) {
+            scan_status = root.move_as_error_prefix("cannot deserialize archive block: ");
+            return;
+          }
+          auto block_root = root.move_as_ok();
+          if (td::Bits256(block_root->get_hash().bits()) != block_ref.block_id.root_hash) {
+            scan_status = td::Status::Error("block root hash does not match its archive filename");
+            return;
+          }
+          auto context = unpack_block_context(LoadedBlock{block_ref.block_id, std::move(block_root), data.size()});
+          if (context.is_error()) {
+            scan_status = context.move_as_error_prefix("cannot inspect archive block: ");
+            return;
+          }
+          auto loaded = context.move_as_ok();
+          blocks.push_back(Summary{loaded.id, loaded.file_bytes, loaded.mc_id, loaded.gen_utime});
+        },
+        [&](const auto&) {}));
+    return scan_status.is_ok();
+  }));
+  TRY_STATUS(std::move(scan_status));
+
+  std::sort(blocks.begin(), blocks.end(), [](const auto& left, const auto& right) {
+    return left.id.id < right.id.id;
+  });
+  td::StringBuilder out;
+  out << "{\"mode\":\"archive_block_list\",\"blocks\":[";
+  for (std::size_t i = 0; i < blocks.size(); ++i) {
+    if (i != 0) {
+      out << ",";
+    }
+    out << "{\"block_id\":\"" << blocks[i].id.to_str() << "\",\"file_bytes\":" << blocks[i].file_bytes
+        << ",\"masterchain_ref\":\"" << blocks[i].masterchain_ref.to_str() << "\",\"gen_utime\":"
+        << blocks[i].gen_utime << "}";
+  }
+  out << "]}";
+  return out.as_cslice().str();
 }
 
 td::Result<BlockContext> unpack_block_context(LoadedBlock block_data) {
@@ -432,7 +497,7 @@ td::Result<LoadedState> load_config_proof(const std::string& path, const BlockId
   return LoadedState{nullptr, std::move(root), std::move(state), state_id, false};
 }
 
-td::Result<LoadedAccountProof> load_account_proof(const std::string& spec, const BlockIdExt& mc_id) {
+td::Result<LoadedAccountProof> load_account_proof(const std::string& spec, const BlockContext& target) {
   auto separator = spec.find('=');
   if (separator == std::string::npos || separator == 0 || separator + 1 == spec.size()) {
     return td::Status::Error("account-proof must use ACCOUNT_HEX=PATH");
@@ -452,7 +517,15 @@ td::Result<LoadedAccountProof> load_account_proof(const std::string& spec, const
   proof.shard_proof = std::move(response->shard_proof_);
   proof.proof = std::move(response->proof_);
   proof.state = std::move(response->state_);
-  TRY_RESULT(info, proof.validate(mc_id, block::StdAddress(ton::basechainId, address)));
+  const bool masterchain_bound = proof.blk == target.mc_id;
+  const bool predecessor_bound =
+      target.prev.size() == 1 && proof.blk == target.prev[0] && proof.shard_blk == target.prev[0];
+  if (!masterchain_bound && !predecessor_bound) {
+    return td::Status::Error(PSLICE() << "account proof reference must equal the target masterchain reference or exact "
+                                        "predecessor shard block: "
+                                     << proof.blk.to_str());
+  }
+  TRY_RESULT(info, proof.validate(proof.blk, block::StdAddress(ton::basechainId, address)));
   TRY_RESULT(proof_roots, vm::std_boc_deserialize_multi(proof.proof.as_slice()));
   if (proof_roots.size() != 2 || proof_roots[1].is_null()) {
     return td::Status::Error("verified account proof has no shard-state proof root");
@@ -1864,6 +1937,8 @@ td::Result<std::string> inspect_json(const BlockContext& target, int split_depth
     out << "\"" << target.prev[i].to_str() << "\"";
   }
   out << "],\"masterchain_ref\":\"" << target.mc_id.to_str() << "\",\"split_depth\":" << split_depth
+      << ",\"recommended_account_proof_reference\":\""
+      << (target.prev.size() == 1 ? target.prev[0].to_str() : "unavailable_at_split_or_merge") << "\""
       << ",\"required_account_prefixes\":[";
   bool first_prefix = true;
   for (const auto& prefix : prefixes) {
@@ -2220,7 +2295,7 @@ td::Result<std::string> run(const std::string& archive, const std::string& mc_ar
     std::set<StdSmcAddress> seen;
     account_proofs.reserve(account_proof_specs.size());
     for (const auto& spec : account_proof_specs) {
-      TRY_RESULT(proof, load_account_proof(spec, target.mc_id));
+      TRY_RESULT(proof, load_account_proof(spec, target));
       if (!seen.insert(proof.address).second) {
         return td::Status::Error(PSLICE() << "duplicate account proof for " << proof.address.to_hex());
       }
@@ -2277,6 +2352,7 @@ int main(int argc, char** argv) {
   std::vector<std::string> account_proofs;
   int split_depth = 4;
   bool inspect = false;
+  bool list_blocks = false;
   bool profile_ed25519 = false;
   std::size_t account_workers = 0;
 
@@ -2312,6 +2388,8 @@ int main(int argc, char** argv) {
         return td::Status::OK();
       });
   options.add_option('i', "inspect", "print exact state ids required by the selected block", [&]() { inspect = true; });
+  options.add_option(0, "list-blocks", "list verified block files and their masterchain references in --archive",
+                     [&]() { list_blocks = true; });
   options.add_option(0, "inspect-state", "inspect a whole-state BOC or split-state Merkle header",
                      [&](td::Slice value) { inspect_state = value.str(); });
   options.add_option(0, "profile-ed25519", "time Ed25519 verification during offline transaction replay",
@@ -2337,8 +2415,21 @@ int main(int argc, char** argv) {
     std::cerr << "Error: " << parse_status.move_as_error().to_string() << '\n';
     return 1;
   }
-  if (inspect_state.empty() && (archive.empty() || block_id.empty())) {
-    std::cerr << "Error: --archive and --block-id are required\n";
+  if (inspect_state.empty() && archive.empty()) {
+    std::cerr << "Error: --archive is required\n";
+    return 1;
+  }
+  if (inspect_state.empty() && !list_blocks && block_id.empty()) {
+    std::cerr << "Error: --block-id is required unless --list-blocks is used\n";
+    return 1;
+  }
+  const bool has_non_list_option = !block_id.empty() || !mc_archive.empty() || !prev_state.empty() ||
+                                   !mc_state.empty() || !mc_proof.empty() || !collated_data.empty() ||
+                                   !library_bodies.empty() || !inspect_state.empty() || !account_parts.empty() ||
+                                   !account_proofs.empty() || split_depth != 4 || inspect || profile_ed25519 ||
+                                   account_workers != 0;
+  if (list_blocks && has_non_list_option) {
+    std::cerr << "Error: --list-blocks cannot be combined with block replay or inspection options\n";
     return 1;
   }
   if (!inspect_state.empty() && account_workers != 0) {
@@ -2348,7 +2439,9 @@ int main(int argc, char** argv) {
 
   try {
     td::Result<std::string> result = td::Status::Error("uninitialized mode");
-    if (!inspect_state.empty()) {
+    if (list_blocks) {
+      result = list_archive_blocks(archive);
+    } else if (!inspect_state.empty()) {
       auto state = load_state_boc_unchecked(inspect_state, "state");
       if (state.is_error()) {
         result = state.move_as_error();

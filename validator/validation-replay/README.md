@@ -106,9 +106,18 @@ Before copying state, inspect the block to obtain its exact predecessor,
 masterchain reference, touched accounts, and required split-state prefixes:
 
 ```text
+tvm-replay-bundle --archive <closed-shard.pack> --list-blocks
+
 tvm-replay-bundle --archive <closed-shard.pack> \
   --block-id '(0,8000000000000000,SEQNO)' --inspect --split-depth 4
 ```
+
+`--list-blocks` verifies every archived block file against the file and root
+hashes in its filename before reporting the full block id, referenced
+masterchain block, timestamp, and serialized size. The inspection output also
+reports `recommended_account_proof_reference`. For a linear block this is the
+exact predecessor shard block, which avoids advancing older account proofs
+through intermediate blocks.
 
 For every account covered by the supplied state, the tool re-executes the
 historical transaction chain and requires both the serialized transaction hash
@@ -259,7 +268,7 @@ can use lite-server proof bundles:
 
 ```text
 lite-client -c 'saveconfigproof mc-config.tl <masterchain-block-id-ext>'
-lite-client -c 'saveaccountproof account.tl 0:<account> <masterchain-block-id-ext>'
+lite-client -c 'saveaccountproof account.tl 0:<account> <predecessor-shard-block-id-ext>'
 lite-client -c 'savelibraries libraries.tl <library-hash>...'
 
 tvm-replay-bundle \
@@ -276,8 +285,10 @@ tvm-replay-bundle \
 roots, but required for the four-root state-transition gate.
 
 `saveconfigproof` and `saveaccountproof` validate the returned Merkle proofs
-before writing them. The replay tool validates them again and rejects stale
-account proofs when an intervening block changed that account. Repeat
+before writing them. For linear replay, bind every account proof to the exact
+predecessor shard block printed by `--inspect`. The replay tool also accepts a
+proof bound to the target block's masterchain reference, validates it again,
+and rejects it if an intervening shard block changed that account. Repeat
 `--account-proof` for all touched accounts to obtain `scope=full_block`.
 
 Public-library cells are content addressed. `savelibraries` verifies each body

@@ -300,6 +300,31 @@ but unproven on the copied mainnet fixture until its matching collated-data
 witness is available. No TPS or parallel speedup follows from this correctness
 result.
 
+## Copied-corpus expansion gate - 2026-08-02
+
+The sparse replay can now enumerate a closed shard archive without trusting a
+separate index. It checked the file and root hashes of 99 archived basechain
+blocks, covering seqnos `87341652..87341750`, and exposed each exact block id,
+masterchain reference, timestamp, and serialized size.
+
+Two additional proof sets appeared complete by address coverage: 29 accounts
+for block `87341683` and 77 accounts for block `87341719`. Both were rejected
+before timing. In the first set, a required account had changed in intermediate
+block `87341680`; in the second, a required account had changed in intermediate
+block `87341718`. The proof roots therefore described older shard states even
+though their account-address sets matched the target blocks. No performance
+number from either block is retained.
+
+Inspection now prints the exact predecessor shard block as the recommended
+account-proof reference, and the loader accepts proofs directly bound to that
+block in addition to the existing masterchain-bound form. This removes the
+intermediate-history ambiguity for newly collected linear-block fixtures. The
+direct predecessor path is source-validated and compiled, but a positive copied
+fixture has not yet been collected. The existing 51-transaction fixture still
+passes full replay and the executable four-worker equivalence gate. A copied
+validator database remains necessary for real Collator and ValidateQuery wall
+measurements; archive packages and account proofs are not a substitute.
+
 ## Dead ends and cautions
 
 - Search results did not expose a public TON trace JIT or public intra-block
