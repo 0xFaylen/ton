@@ -155,6 +155,14 @@ struct ShadowCoordinatorCandidate {
 };
 
 struct ReplayResult {
+  struct LimitTriplet {
+    td::uint32 underload = 0;
+    td::uint32 soft = 0;
+    td::uint32 hard = 0;
+
+    bool operator==(const LimitTriplet&) const = default;
+  };
+
   struct AccountWork {
     std::size_t transactions = 0;
     double transaction_seconds = 0.0;
@@ -199,6 +207,10 @@ struct ReplayResult {
   td::uint32 consensus_slots_per_leader_window = 0;
   td::uint64 consensus_target_rate_ms = 0;
   td::uint64 consensus_min_block_interval_ms = 0;
+  LimitTriplet block_limit_bytes;
+  LimitTriplet block_limit_gas;
+  LimitTriplet block_limit_lt_delta;
+  LimitTriplet block_limit_collated_bytes;
   double phase_setup_seconds = 0.0;
   double phase_account_replay_seconds = 0.0;
   double phase_block_limits_seconds = 0.0;
@@ -927,6 +939,15 @@ td::Result<ReplayResult> replay_transactions(const std::string& archive, const B
   result.consensus_target_rate_ms = static_cast<td::uint64>(consensus_config.noncritical_params.target_rate.count());
   result.consensus_min_block_interval_ms =
       static_cast<td::uint64>(consensus_config.noncritical_params.min_block_interval.count());
+  TRY_RESULT(configured_block_limits,
+             config->get_block_limits(target.id.id.workchain == ton::masterchainId));
+  const auto capture_limits = [](const block::ParamLimits& limits) {
+    return ReplayResult::LimitTriplet{limits.underload(), limits.soft(), limits.hard()};
+  };
+  result.block_limit_bytes = capture_limits(configured_block_limits->bytes);
+  result.block_limit_gas = capture_limits(configured_block_limits->gas);
+  result.block_limit_lt_delta = capture_limits(configured_block_limits->lt_delta);
+  result.block_limit_collated_bytes = capture_limits(configured_block_limits->collated_data);
   TRY_RESULT(prev_blocks_info, config->get_prev_blocks_info());
 
   block::tlb::Aug_InMsgDescr in_msg_augmentation{config->get_global_version()};
@@ -1273,7 +1294,7 @@ td::Result<ReplayResult> replay_transactions(const std::string& archive, const B
   auto phase_elapsed = replay_timer.elapsed();
   result.phase_account_replay_seconds = phase_elapsed - phase_checkpoint;
   phase_checkpoint = phase_elapsed;
-  block::BlockLimits shadow_limits;
+  block::BlockLimits shadow_limits = *configured_block_limits;
   auto synthetic_usage_tree = std::make_shared<vm::CellUsageTree>();
   shadow_limits.usage_tree = synthetic_usage_tree.get();
   block::BlockLimitStatus shadow_limit_status{shadow_limits};
@@ -1296,7 +1317,7 @@ td::Result<ReplayResult> replay_transactions(const std::string& archive, const B
 
   std::sort(shadow_coordinator_candidates.begin(), shadow_coordinator_candidates.end(),
             [](const auto& left, const auto& right) { return left.work.key < right.work.key; });
-  block::BlockLimits coordinator_limits;
+  block::BlockLimits coordinator_limits = *configured_block_limits;
   auto coordinator_usage_tree = std::make_shared<vm::CellUsageTree>();
   coordinator_limits.usage_tree = coordinator_usage_tree.get();
   ton::validator::parallel_inbound::ShadowCoordinatorState coordinator_state{coordinator_limits};
@@ -1680,7 +1701,11 @@ td::Status validate_account_replay_batch(const ReplayResult& reference,
     if (replay.target_accounts != reference.target_accounts || replay.augmented_dictionary_roots_validated != 0 ||
         replay.consensus_max_block_bytes != reference.consensus_max_block_bytes ||
         replay.consensus_max_collated_bytes != reference.consensus_max_collated_bytes ||
-        replay.consensus_target_rate_ms != reference.consensus_target_rate_ms) {
+        replay.consensus_target_rate_ms != reference.consensus_target_rate_ms ||
+        replay.block_limit_bytes != reference.block_limit_bytes ||
+        replay.block_limit_gas != reference.block_limit_gas ||
+        replay.block_limit_lt_delta != reference.block_limit_lt_delta ||
+        replay.block_limit_collated_bytes != reference.block_limit_collated_bytes) {
       return td::Status::Error("parallel account replay lane escaped its isolated-account scope");
     }
     for (const auto& [address, work] : replay.account_work) {
@@ -1929,14 +1954,26 @@ std::string single_shard_capacity_json(const BlockContext& target, const ReplayR
       << ",\"metric\":\"raw_transactions_per_second\""
       << ",\"operation_tps\":null"
       << ",\"config_source_masterchain_id\":\"" << target.mc_id.to_str() << "\""
-      << ",\"config29\":{\"max_block_bytes\":" << replay.consensus_max_block_bytes
+      << ",\"config29\":{\"measurement_domain\":\"serialized_candidate_data\",\"max_block_bytes\":"
+      << replay.consensus_max_block_bytes
       << ",\"max_collated_bytes\":" << replay.consensus_max_collated_bytes << "}"
       << ",\"config30\":{\"protocol_version\":" << replay.consensus_protocol_version
       << ",\"slots_per_leader_window\":" << replay.consensus_slots_per_leader_window
       << ",\"target_rate_ms\":" << replay.consensus_target_rate_ms
       << ",\"min_block_interval_ms\":" << replay.consensus_min_block_interval_ms << "}"
+      << ",\"config23\":{\"measurement_domain\":\"block_limit_status_estimates\",\"bytes\":{\"underload\":"
+      << replay.block_limit_bytes.underload
+      << ",\"soft\":" << replay.block_limit_bytes.soft << ",\"hard\":" << replay.block_limit_bytes.hard
+      << "},\"gas\":{\"underload\":" << replay.block_limit_gas.underload
+      << ",\"soft\":" << replay.block_limit_gas.soft << ",\"hard\":" << replay.block_limit_gas.hard
+      << "},\"lt_delta\":{\"underload\":" << replay.block_limit_lt_delta.underload
+      << ",\"soft\":" << replay.block_limit_lt_delta.soft << ",\"hard\":" << replay.block_limit_lt_delta.hard
+      << "},\"collated_bytes\":{\"underload\":" << replay.block_limit_collated_bytes.underload
+      << ",\"soft\":" << replay.block_limit_collated_bytes.soft
+      << ",\"hard\":" << replay.block_limit_collated_bytes.hard << "}}"
       << ",\"sample\":{\"block_file_bytes\":" << target.file_bytes
       << ",\"raw_transactions\":" << replay.transactions << ",\"distinct_accounts\":" << replay.accounts
+      << ",\"billed_gas_sum\":" << replay.basechain_limit_gas
       << ",\"bytes_per_raw_transaction\":" << bytes_per_raw_transaction
       << ",\"max_block_fill_ratio\":"
       << (replay.consensus_max_block_bytes > 0
@@ -1955,6 +1992,7 @@ std::string single_shard_capacity_json(const BlockContext& target, const ReplayR
   } else {
     out << "null";
   }
+  out << ",\"active_config23_limit_projection_raw_tps\":null";
   out << ",\"serial_replay_raw_tps\":";
   if (parallel_probe != nullptr && parallel_probe->serial_wall_seconds > 0.0) {
     out << static_cast<double>(replay.transactions) / parallel_probe->serial_wall_seconds;
@@ -1969,11 +2007,13 @@ std::string single_shard_capacity_json(const BlockContext& target, const ReplayR
   }
   out << ",\"mainnet_sustainable_raw_tps\":null"
       << ",\"missing_gates\":[\"live_collator_integration\",\"validate_query_wall\","
-         "\"four_root_commit_wall\",\"multi_block_saturated_workload\","
+         "\"four_root_commit_wall\",\"active_config23_dimension_under_saturation\","
+         "\"multi_block_saturated_workload\","
          "\"network_candidate_delivery\"]"
       << ",\"warnings\":[\"linear_block_boc_density_projection\",\"mixed_raw_transaction_workload\","
          "\"isolated_replay_is_not_collation\",\"offline_root_probe_is_not_live_collator_commit\","
          "\"three_transaction_operation_is_not_workload_classification\","
+         "\"billed_gas_sum_excludes_unreconstructed_special_context\","
          "\"target_rate_is_not_observed_block_interval\",\"max_block_bytes_may_not_be_active_limit\","
          "\"collated_bytes_are_not_block_bytes\"]}";
   return out.as_cslice().str();

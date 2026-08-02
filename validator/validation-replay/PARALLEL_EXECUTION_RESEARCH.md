@@ -134,18 +134,32 @@ The copied masterchain config proof at seqno `82773023` establishes:
 - `max_collated_bytes = 10,485,760`;
 - target block rate `400 ms` and minimum block interval `300 ms`.
 
+Config 23 establishes the active `BlockLimitStatus` thresholds for the
+basechain: bytes and collated-data underload/soft/hard are
+262,144/1,048,576/2,097,152; gas is 2,000,000/10,000,000/20,000,000; and
+logical-time delta is 1,000/5,000/10,000. The replay now copies these real
+limits into both shadow limit applications instead of constructing default
+`BlockLimits` objects.
+
 The 10 MiB collated-data limit is a separate witness budget and cannot be added
-to the 2 MiB block budget. The target block file is 113,736 bytes for 51 raw
+to the 2 MiB block budget. It is an outer serialized-candidate limit; Config 23
+still supplies tighter collator estimation thresholds. In particular, the
+often cited 1 MiB is the Config 23 soft threshold, not the hard candidate cap.
+The target block file is 113,736 bytes for 51 raw
 transactions across 29 accounts. Its measured density is 2,230.12 bytes per raw
 transaction and its file is 5.42% of the configured block-byte limit.
 
-At unchanged density, the linear block-byte projection is:
+At unchanged density, the linear hard candidate-byte projection is:
 
 `51 * 2,097,152 / 113,736 / 0.4 = 2,350.94 raw tx/s`.
 
 If, and only if, one workload operation consumes three raw transactions at that
 same density, the corresponding conditional projection is 783.65 operations/s.
 This is not jetton workload classification and is not a measured operation rate.
+Config 23 size limits operate on `BlockLimitStatus::estimate_block_size` rather
+than serialized candidate bytes. The current replay does not reconstruct the
+complete live collator usage tree, descriptors, or collated-data estimate, so it
+does not convert the 1 MiB soft threshold into TPS.
 
 The Release account replay is faster than that byte projection even before
 parallelism: approximately 3.1k raw tx/s serial, 6.6k at four workers and 8.0k

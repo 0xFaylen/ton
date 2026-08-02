@@ -217,7 +217,7 @@ for the serial baseline, 6.6k at four workers, and 8.0k at eight workers. The
 Release target builds after supplying the repository's vendored Abseil include
 path to the local CMake cache; no dependency source was changed.
 
-The output also contains `single_shard_capacity`. It reads Config 29/30 from
+The output also contains `single_shard_capacity`. It reads Config 23/29/30 from
 the state-bound masterchain proof and reports the exact archive block-file size.
 For the copied basechain block `87341675`, Config 29 at masterchain seqno
 `82773023` sets `max_block_bytes=2097152` and
@@ -229,8 +229,21 @@ raw tx/s. Dividing it by three gives a conditional 784 operations/s only for a
 workload that actually consumes three raw transactions per operation at the
 same byte density.
 
-Those two values are byte projections, not sustainable mainnet throughput. The
-sample block is only 5.42% of `max_block_bytes`; it is neither saturated nor a
+Config 23 supplies a second, different envelope used by `BlockLimitStatus`.
+For this proof its byte and collated-data thresholds are 256 KiB underload,
+1 MiB soft, and 2 MiB hard; gas thresholds are 2M/10M/20M and logical-time
+deltas are 1,000/5,000/10,000. This explains the apparent 1 MiB versus 2 MiB
+disagreement: 1 MiB is the normal soft threshold of the collator's estimated
+block-size domain, while 2 MiB is both its hard threshold and the serialized
+candidate cap. The 10 MiB Config 29 collated-data value is only the outer
+serialized candidate envelope; it does not replace the tighter Config 23
+collator thresholds.
+
+Those two values are hard candidate-byte projections, not sustainable mainnet
+throughput. Config 23 uses `BlockLimitStatus::estimate_block_size`, not the
+serialized file size, so the tool deliberately leaves
+`active_config23_limit_projection_raw_tps=null`. The sample block is only 5.42%
+of `max_block_bytes`; it is neither saturated nor a
 classified jetton or DEX workload. The JSON therefore keeps
 `mainnet_sustainable_raw_tps=null` until live collator integration,
 `ValidateQuery` wall time, exact four-root commit time, candidate delivery, and
