@@ -317,8 +317,7 @@ class ValidationReplayerImpl : public ValidationReplayer {
         block_ids.push_back(CO_TRY(BlockId::from_str(s)));
       }
       command_run(std::move(block_ids), mode, log_work_time, exact_tvm_hotpaths, parallel_account_workers,
-                  parallel_first,
-                  std::move(collated_data_output))
+                  parallel_first, std::move(collated_data_output))
           .start()
           .detach_silent();
       co_return "Started. `vrp show` to see results.";
@@ -487,8 +486,7 @@ class ValidationReplayerImpl : public ValidationReplayer {
   }
 
   td::actor::Task<> command_run(std::vector<BlockId> block_ids, ReplayMode mode, bool log_work_time,
-                                bool exact_tvm_hotpaths, td::uint32 parallel_account_workers,
-                                bool parallel_first,
+                                bool exact_tvm_hotpaths, td::uint32 parallel_account_workers, bool parallel_first,
                                 std::optional<std::string> collated_data_output) {
     std::string description;
     CHECK(!block_ids.empty());
@@ -509,8 +507,7 @@ class ValidationReplayerImpl : public ValidationReplayer {
     }
     co_await run_start(description);
     auto result = co_await command_run_inner(std::move(block_ids), mode, log_work_time, exact_tvm_hotpaths,
-                                             parallel_account_workers, parallel_first,
-                                             std::move(collated_data_output))
+                                             parallel_account_workers, parallel_first, std::move(collated_data_output))
                       .wrap();
     if (result.is_error()) {
       LOG(ERROR) << "ERROR run #" << current_run_.idx << ": " << result.error();
@@ -522,8 +519,7 @@ class ValidationReplayerImpl : public ValidationReplayer {
   }
 
   td::actor::Task<> command_run_inner(std::vector<BlockId> block_ids, ReplayMode mode, bool log_work_time,
-                                      bool exact_tvm_hotpaths, td::uint32 parallel_account_workers,
-                                      bool parallel_first,
+                                      bool exact_tvm_hotpaths, td::uint32 parallel_account_workers, bool parallel_first,
                                       std::optional<std::string> collated_data_output) {
     auto cancellation_token = cancellation_.get_cancellation_token();
     ProcessBlockResult total;
@@ -532,8 +528,8 @@ class ValidationReplayerImpl : public ValidationReplayer {
       BlockId block_id = block_ids[i];
       auto handle = co_await get_block_by_id(manager_, block_id);
       current_run_.status = "Processing block " + block_id.to_str();
-      auto R = co_await process_block(handle, mode, exact_tvm_hotpaths, collated_data_output,
-                                      parallel_account_workers, parallel_first)
+      auto R = co_await process_block(handle, mode, exact_tvm_hotpaths, collated_data_output, parallel_account_workers,
+                                      parallel_first)
                    .wrap();
       if (R.is_ok()) {
         total += R.ok();
@@ -723,6 +719,13 @@ class ValidationReplayerImpl : public ValidationReplayer {
       td::uint32 parallel_account_workers = 0;
       bool parallel_first = false;
       bool exact_candidate_match = false;
+      td::uint64 transactions = 0;
+      td::uint64 estimated_bytes = 0;
+      td::uint64 gas = 0;
+      td::uint64 lt_delta = 0;
+      double load_fraction_internals = 0.0;
+      int peak_block_limit_class = 0;
+      CollationStats::ReplayParallelAccountStats replay_parallel_accounts;
       CollationStats::WorkTimeStats work_time;
     };
     std::optional<Collate> collate;
@@ -741,12 +744,18 @@ class ValidationReplayerImpl : public ValidationReplayer {
         collate->new_collated_data_size += r.collate->new_collated_data_size;
         collate->time += r.collate->time;
         collate->serial_time += r.collate->serial_time;
-        collate->parallel_account_workers =
-            collate->parallel_account_workers == r.collate->parallel_account_workers
-                ? collate->parallel_account_workers
-                : 0;
+        collate->parallel_account_workers = collate->parallel_account_workers == r.collate->parallel_account_workers
+                                                ? collate->parallel_account_workers
+                                                : 0;
         collate->parallel_first = collate->parallel_first == r.collate->parallel_first && collate->parallel_first;
         collate->exact_candidate_match = collate->exact_candidate_match && r.collate->exact_candidate_match;
+        collate->transactions += r.collate->transactions;
+        collate->estimated_bytes += r.collate->estimated_bytes;
+        collate->gas += r.collate->gas;
+        collate->lt_delta += r.collate->lt_delta;
+        collate->load_fraction_internals += r.collate->load_fraction_internals;
+        collate->peak_block_limit_class = std::max(collate->peak_block_limit_class, r.collate->peak_block_limit_class);
+        collate->replay_parallel_accounts += r.collate->replay_parallel_accounts;
         collate->work_time += r.collate->work_time;
       }
       if (!validate) {
@@ -765,6 +774,11 @@ class ValidationReplayerImpl : public ValidationReplayer {
         sb << (n == 1.0 ? "" : "Avg ") << "Collate: size=" << Fixed(collate->new_block_size / n, 0) << "/"
            << Fixed(block_size / n, 0) << ", cdata_size=" << Fixed(collate->new_collated_data_size / n, 0)
            << ", time=" << Fixed(collate->time / n, 6);
+        sb << "\n  Block workload: transactions=" << Fixed((double)collate->transactions / n, 2)
+           << ", estimated_bytes=" << Fixed((double)collate->estimated_bytes / n, 2)
+           << ", gas=" << Fixed((double)collate->gas / n, 2) << ", lt_delta=" << Fixed((double)collate->lt_delta / n, 2)
+           << ", internal_load=" << Fixed(collate->load_fraction_internals / n, 6)
+           << ", peak_limit_class=" << collate->peak_block_limit_class;
         if (collate->parallel_account_workers != 0) {
           const auto serial_time = collate->serial_time / n;
           const auto parallel_time = collate->time / n;
@@ -773,6 +787,17 @@ class ValidationReplayerImpl : public ValidationReplayer {
              << ", serial_time=" << Fixed(serial_time, 6) << ", parallel_time=" << Fixed(parallel_time, 6)
              << ", speedup=" << Fixed(parallel_time > 0.0 ? serial_time / parallel_time : 0.0, 3)
              << ", exact_candidate_match=" << collate->exact_candidate_match;
+          const auto& actual = collate->replay_parallel_accounts;
+          sb << "\n  Parallel account actual: attempts=" << Fixed((double)actual.attempts / n, 2)
+             << ", batches=" << Fixed((double)actual.batches / n, 2)
+             << ", transactions=" << Fixed((double)actual.transactions / n, 2)
+             << ", serial_fallbacks=" << Fixed((double)actual.serial_fallbacks / n, 2)
+             << ", empty_root_fallbacks=" << Fixed((double)actual.empty_root_fallbacks / n, 2)
+             << ", boundary_stops=" << Fixed((double)actual.boundary_stops / n, 2)
+             << ", discarded_prepared=" << Fixed((double)actual.discarded_prepared / n, 2)
+             << ", prepare_time=" << Fixed(actual.prepare_time.real / n, 6)
+             << ", worker_time=" << Fixed(actual.worker_time.real / n, 6)
+             << ", commit_time=" << Fixed(actual.commit_time.real / n, 6);
         }
         if (log_work_time) {
           auto wt = collate->work_time;
@@ -877,8 +902,7 @@ class ValidationReplayerImpl : public ValidationReplayer {
         }
         serial_time = serial->elapsed;
         const bool id_match = serial->candidate.id == parallel->candidate.id;
-        const bool collated_hash_match =
-            serial->candidate.collated_file_hash == parallel->candidate.collated_file_hash;
+        const bool collated_hash_match = serial->candidate.collated_file_hash == parallel->candidate.collated_file_hash;
         const bool block_bytes_match = serial->candidate.data.as_slice() == parallel->candidate.data.as_slice();
         const bool collated_bytes_match =
             serial->candidate.collated_data.as_slice() == parallel->candidate.collated_data.as_slice();
@@ -894,30 +918,25 @@ class ValidationReplayerImpl : public ValidationReplayer {
           CHECK(block::gen::unpack_cell(serial_block.extra, serial_extra));
           CHECK(block::gen::unpack_cell(parallel_block.extra, parallel_extra));
           co_return td::Status::Error(
-              PSTRING() << "serial/parallel candidate mismatch for " << block_id.id << ": id=" << id_match
-                        << ", collated_hash=" << collated_hash_match << ", block_bytes=" << block_bytes_match
-                        << " (serial=" << serial->candidate.data.size() << "/"
-                        << td::sha256_bits256(serial->candidate.data.as_slice()).to_hex() << ", parallel="
-                        << parallel->candidate.data.size() << "/"
-                        << td::sha256_bits256(parallel->candidate.data.as_slice()).to_hex()
-                        << "), collated_bytes=" << collated_bytes_match << " (serial="
-                        << serial->candidate.collated_data.size() << "/"
-                        << td::sha256_bits256(serial->candidate.collated_data.as_slice()).to_hex() << ", parallel="
-                        << parallel->candidate.collated_data.size() << "/"
-                        << td::sha256_bits256(parallel->candidate.collated_data.as_slice()).to_hex()
-                        << "), component_match={info:"
-                        << (serial_block.info->get_hash() == parallel_block.info->get_hash()) << ", value_flow:"
-                        << (serial_block.value_flow->get_hash() == parallel_block.value_flow->get_hash())
-                        << ", state_update:"
-                        << (serial_block.state_update->get_hash() == parallel_block.state_update->get_hash())
-                        << ", extra:" << (serial_block.extra->get_hash() == parallel_block.extra->get_hash())
-                        << ", in_msg_descr:"
-                        << (serial_extra.in_msg_descr->get_hash() == parallel_extra.in_msg_descr->get_hash())
-                        << ", out_msg_descr:"
-                        << (serial_extra.out_msg_descr->get_hash() == parallel_extra.out_msg_descr->get_hash())
-                        << ", account_blocks:"
-                        << (serial_extra.account_blocks->get_hash() == parallel_extra.account_blocks->get_hash())
-                        << "}");
+              PSTRING()
+              << "serial/parallel candidate mismatch for " << block_id.id << ": id=" << id_match
+              << ", collated_hash=" << collated_hash_match << ", block_bytes=" << block_bytes_match << " (serial="
+              << serial->candidate.data.size() << "/" << td::sha256_bits256(serial->candidate.data.as_slice()).to_hex()
+              << ", parallel=" << parallel->candidate.data.size() << "/"
+              << td::sha256_bits256(parallel->candidate.data.as_slice()).to_hex()
+              << "), collated_bytes=" << collated_bytes_match << " (serial=" << serial->candidate.collated_data.size()
+              << "/" << td::sha256_bits256(serial->candidate.collated_data.as_slice()).to_hex()
+              << ", parallel=" << parallel->candidate.collated_data.size() << "/"
+              << td::sha256_bits256(parallel->candidate.collated_data.as_slice()).to_hex()
+              << "), component_match={info:" << (serial_block.info->get_hash() == parallel_block.info->get_hash())
+              << ", value_flow:" << (serial_block.value_flow->get_hash() == parallel_block.value_flow->get_hash())
+              << ", state_update:" << (serial_block.state_update->get_hash() == parallel_block.state_update->get_hash())
+              << ", extra:" << (serial_block.extra->get_hash() == parallel_block.extra->get_hash())
+              << ", in_msg_descr:" << (serial_extra.in_msg_descr->get_hash() == parallel_extra.in_msg_descr->get_hash())
+              << ", out_msg_descr:"
+              << (serial_extra.out_msg_descr->get_hash() == parallel_extra.out_msg_descr->get_hash())
+              << ", account_blocks:"
+              << (serial_extra.account_blocks->get_hash() == parallel_extra.account_blocks->get_hash()) << "}");
         }
         exact_candidate_match = true;
         selected = std::move(parallel);
@@ -936,6 +955,13 @@ class ValidationReplayerImpl : public ValidationReplayer {
           .parallel_account_workers = parallel_account_workers,
           .parallel_first = parallel_first,
           .exact_candidate_match = exact_candidate_match,
+          .transactions = selected->stats.transactions,
+          .estimated_bytes = selected->stats.estimated_bytes,
+          .gas = selected->stats.gas,
+          .lt_delta = selected->stats.lt_delta,
+          .load_fraction_internals = selected->stats.load_fraction_internals,
+          .peak_block_limit_class = selected->stats.peak_block_limit_class,
+          .replay_parallel_accounts = selected->stats.replay_parallel_accounts,
           .work_time = selected->stats.work_time,
       };
       if (collated_data_output) {

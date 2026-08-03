@@ -567,18 +567,20 @@ capacity.
 ## Replay-only Collator integration - implementation gate
 
 The Collator now contains a default-off, replay-only path for inbound internal
-messages to previously untouched, distinct destination accounts. Each worker
-gets private account, message, configuration, and cell-usage state. The
-coordinator replays the recorded account/message/storage load journals into the
-original proof anchors and commits successful transactions in canonical
-`(lt, message hash)` order. Existing tick/tock execution stays serial, and any
-account already touched by tick/tock, dispatch, or an earlier transaction is a
-serial barrier. The cell-usage context of an account first executed by a worker
-is retained until candidate serialization. A later serial transaction can keep
-using that account state; newly observed account and storage paths are replayed
-into the coordinator proof tree before limit checks and after serialization.
-This closes the proof-accounting gap without adding speculative execution or
-parallel scheduling within one account.
+messages with non-empty bodies to previously untouched, distinct destination
+accounts. Each worker gets private account, message, configuration, and
+cell-usage state. A fixed 64-message lookahead feeds a reusable worker pool, so
+the number of prepared tasks is independent of the worker count. The
+coordinator rebases worker `UsageCell` paths onto the original proof anchors,
+replays the recorded account/message/storage load journals, and commits
+successful transactions in canonical `(lt, message hash)` order. Existing
+tick/tock execution, empty-body transfers, and accounts already touched by
+tick/tock, dispatch, or an earlier transaction stay serial. If a block limit or
+internal timeout is reached after only part of a batch can commit, the
+continuous canonical prefix is retained and the prepared suffix is discarded;
+the queue tail and `ProcessedUpto` do not cross the missing suffix. This closes
+the partial-frontier and proof-accounting gaps without adding speculative
+execution or parallel scheduling within one account.
 
 The corresponding `vrp` option requires `--mode both`. It always produces a
 serial reference and a parallel candidate from the same replay inputs, rejects
@@ -587,13 +589,22 @@ any byte difference in block or collated data, and runs the ordinary
 worker option, so this code does not change consensus behavior, configuration,
 fees, TVM semantics, or validator voting.
 
-This is an implemented but unmeasured integration gate. The local smoke
-database contains only genesis, and the copied proof corpus used above is not a
-validator database. Therefore no candidate-equivalence result, end-to-end
-speedup, or sustainable single-shard TPS is claimed for this path yet. Matched
-serial-first and `--parallel-first` runs on a copied mainnet validator database
-remain required before the implementation can advance beyond experimental
-status.
+The local one-validator integration gate is now measured on bounded synthetic
+blocks. A 268-transaction compute block reached 10,019,448 gas and executed all
+268 destination accounts through the replay-only path. Nine paired samples
+produced byte-identical candidates and passed normal `ValidateQuery`; median
+Collator speedups were 1.365x, 1.193x, and 1.741x for 2, 4, and 8 workers. A
+separate exact-candidate boundary gate committed 100 transactions at 10,000,000
+gas and discarded 28 prepared suffix results without advancing the queue
+frontier. Cheap empty-body transfers remain serial by design and provide no
+parallel speedup claim.
+
+These are synthetic replay diagnostics, not sustainable shard TPS. The harness
+records `mainnet_sustainable_raw_tps=null`; it does not exercise production
+candidate delivery, Plumtree, multi-validator deadlines, database growth, or a
+representative jetton/DEX workload. Matched runs on copied mainnet validator
+state remain required before the implementation can advance beyond
+experimental status.
 
 ## Dead ends and cautions
 

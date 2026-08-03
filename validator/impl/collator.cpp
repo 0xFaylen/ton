@@ -128,6 +128,58 @@ td::Status replay_parallel_cell_usage_context(const std::unique_ptr<ParallelCell
   return journal->replay_into(context->pure_root, context->coordinator_anchor);
 }
 
+td::Result<td::Ref<vm::Cell>> rebase_parallel_usage_cells(td::Ref<vm::Cell> root,
+                                                          const std::unique_ptr<ParallelCellUsageContext>& context) {
+  if (root.is_null() || !context || !context->worker_tree || context->coordinator_anchor.empty()) {
+    return root;
+  }
+  auto* worker_tree = context->worker_tree.get();
+  std::function<td::Result<td::Ref<vm::Cell>>(td::Ref<vm::Cell>)> rebase =
+      [&](td::Ref<vm::Cell> cell) -> td::Result<td::Ref<vm::Cell>> {
+    if (cell.is_null()) {
+      return cell;
+    }
+    auto tree_node = cell->get_tree_node();
+    if (!tree_node.empty() && tree_node.is_from_tree(worker_tree)) {
+      auto path = tree_node.path();
+      if (!path) {
+        return td::Status::Error("parallel usage cell has no worker-tree path");
+      }
+      auto coordinator_node = context->coordinator_anchor;
+      for (auto ref_id : *path) {
+        coordinator_node = coordinator_node.create_child(ref_id);
+      }
+      context->worker_tree->set_ignore_loads(true);
+      auto loaded_result = cell->load_cell();
+      context->worker_tree->set_ignore_loads(false);
+      TRY_RESULT(loaded, std::move(loaded_result));
+      return vm::UsageCell::create(std::move(loaded.data_cell), std::move(coordinator_node));
+    }
+
+    TRY_RESULT(loaded, cell->load_cell());
+    auto data_cell = std::move(loaded.data_cell);
+    td::Ref<vm::Cell> children[vm::Cell::max_refs];
+    bool changed = false;
+    for (unsigned ref_id = 0; ref_id < data_cell->size_refs(); ++ref_id) {
+      auto original = data_cell->get_ref(ref_id);
+      TRY_RESULT(child, rebase(original));
+      changed |= child.get() != original.get();
+      children[ref_id] = std::move(child);
+    }
+    if (!changed) {
+      return cell;
+    }
+    TRY_RESULT(rebuilt,
+               vm::DataCell::create(td::Slice{data_cell->get_data(), (data_cell->size() + 7) / 8}, data_cell->size(),
+                                    {children, data_cell->size_refs()}, data_cell->is_special()));
+    if (rebuilt->get_hash() != cell->get_hash()) {
+      return td::Status::Error("rebased parallel usage cell changed its hash");
+    }
+    return td::Ref<vm::Cell>{std::move(rebuilt)};
+  };
+  return rebase(std::move(root));
+}
+
 struct ParallelWorkerConfig {
   block::StoragePhaseConfig storage;
   block::ComputePhaseConfig compute;
@@ -136,8 +188,7 @@ struct ParallelWorkerConfig {
 };
 
 td::Status copy_parallel_worker_config(const block::StoragePhaseConfig& storage,
-                                       const block::ComputePhaseConfig& compute,
-                                       const block::ActionPhaseConfig& action,
+                                       const block::ComputePhaseConfig& compute, const block::ActionPhaseConfig& action,
                                        const block::SerializeConfig& serialize, ParallelWorkerConfig& target) {
   target.storage = storage;
   target.action = action;
@@ -167,8 +218,8 @@ td::Status copy_parallel_worker_config(const block::StoragePhaseConfig& storage,
   target.compute.prev_blocks_info = compute.prev_blocks_info;
   target.compute.unpacked_config_tuple = compute.unpacked_config_tuple;
   if (compute.suspended_addresses) {
-    target.compute.suspended_addresses = std::make_unique<vm::Dictionary>(
-        compute.suspended_addresses->get_root_cell(), compute.suspended_addresses->get_key_bits());
+    target.compute.suspended_addresses = std::make_unique<vm::Dictionary>(compute.suspended_addresses->get_root_cell(),
+                                                                          compute.suspended_addresses->get_key_bits());
   }
   target.compute.size_limits = compute.size_limits;
   target.compute.vm_log_verbosity = compute.vm_log_verbosity;
@@ -4373,7 +4424,12 @@ Ref<vm::Cell> Collator::commit_parallel_inbound_transaction(ParallelInboundPrepa
     fatal_error("cannot commit a parallel inbound transaction");
     return {};
   }
-
+  auto rebased_state = rebase_parallel_usage_cells(prepared.account->total_state, prepared.account_usage);
+  if (rebased_state.is_error()) {
+    fatal_error(rebased_state.move_as_error_prefix("cannot rebase a parallel account state: "));
+    return {};
+  }
+  prepared.account->total_state = rebased_state.move_as_ok();
   auto [account_it, inserted] = accounts.emplace(prepared.account_address, std::move(prepared.account));
   if (!inserted || !account_it->second) {
     fatal_error("cannot publish a parallel inbound account state");
@@ -4454,17 +4510,21 @@ td::Status Collator::flush_parallel_account_continuations() {
 }
 
 td::Result<std::size_t> Collator::process_parallel_inbound_batch() {
+  static constexpr std::size_t kParallelLookahead = 64;
   const auto worker_count = params_.collator_opts->replay_parallel_account_workers;
   if (worker_count < 2 || is_masterchain() || nb_out_msgs_->is_eof() || have_unprocessed_account_dispatch_queue_) {
     return std::size_t{0};
   }
 
+  auto& parallel_stats = stats_.replay_parallel_accounts;
+  ++parallel_stats.attempts;
+  td::ScopedRealCpuTimer prepare_timer{parallel_stats.prepare_time};
   const auto checkpoint = nb_out_msgs_->checkpoint();
   std::vector<std::unique_ptr<ParallelInboundPrepared>> batch;
   std::set<ton::StdSmcAddress> batch_accounts;
-  batch.reserve(worker_count);
+  batch.reserve(kParallelLookahead);
 
-  while (batch.size() < worker_count && !nb_out_msgs_->is_eof()) {
+  while (batch.size() < kParallelLookahead && !nb_out_msgs_->is_eof()) {
     auto* item = nb_out_msgs_->cur();
     if (!item || item->msg.is_null() || item->limit_exceeded) {
       break;
@@ -4480,6 +4540,16 @@ td::Result<std::size_t> Collator::process_parallel_inbound_batch() {
     }
     block::gen::CommonMsgInfo::Record_int_msg_info info;
     if (!tlb::unpack(cs, info)) {
+      break;
+    }
+    if (!block::gen::t_Maybe_Either_StateInit_Ref_StateInit.skip(cs) || !cs.have(1)) {
+      break;
+    }
+    const bool body_in_ref = cs.fetch_ulong(1) != 0;
+    // Keep cheap empty-body transfers on the serial path. They cannot amortize
+    // worker/proof setup, and the selective gate must never make them slower.
+    if ((!body_in_ref && cs.empty_ext()) ||
+        (body_in_ref && (!cs.have_refs(1) || vm::load_cell_slice(cs.prefetch_ref()).empty_ext()))) {
       break;
     }
     ton::WorkchainId destination_workchain;
@@ -4513,7 +4583,7 @@ td::Result<std::size_t> Collator::process_parallel_inbound_batch() {
     prepared->source = item->source;
     prepared->message_hash = env.msg->get_hash().as_bits256();
     batch.push_back(std::move(prepared));
-    if (batch.size() == worker_count || !nb_out_msgs_->next()) {
+    if (batch.size() == kParallelLookahead || !nb_out_msgs_->next()) {
       break;
     }
   }
@@ -4522,11 +4592,14 @@ td::Result<std::size_t> Collator::process_parallel_inbound_batch() {
     return td::Status::Error("cannot restore inbound queue after parallel lookahead");
   }
   if (batch.size() < 2) {
+    ++parallel_stats.serial_fallbacks;
     return std::size_t{0};
   }
 
   auto account_root = account_dict->get_root_cell();
   if (account_root.is_null()) {
+    ++parallel_stats.serial_fallbacks;
+    ++parallel_stats.empty_root_fallbacks;
     return std::size_t{0};
   }
 
@@ -4619,9 +4692,8 @@ td::Result<std::size_t> Collator::process_parallel_inbound_batch() {
             storage_dict.mpb = vm::MerkleProofBuilder(std::move(storage_root));
             storage_dict.mpb.set_cell_load_callback([&](const vm::LoadedCell& cell) { on_cell_loaded(cell); });
           }
-          TRY_RESULT(storage_usage,
-                     ParallelCellUsageContext::create_from_pure(storage_dict.mpb.original_root(),
-                                                                storage_dict.mpb.root()->get_tree_node()));
+          TRY_RESULT(storage_usage, ParallelCellUsageContext::create_from_pure(
+                                        storage_dict.mpb.original_root(), storage_dict.mpb.root()->get_tree_node()));
           prepared->storage_usage = std::move(storage_usage);
           TRY_STATUS(account.init_account_storage_stat(prepared->storage_usage->worker_root()));
         }
@@ -4646,8 +4718,12 @@ td::Result<std::size_t> Collator::process_parallel_inbound_batch() {
   }
 
   if (!replay_parallel_worker_pool_) {
+    prepare_timer.pause();
+    td::ScopedRealCpuTimer worker_timer{parallel_stats.worker_time};
     TRY_RESULT(pool, parallel_inbound::ReusableWorkerPool::create(worker_count));
     replay_parallel_worker_pool_ = std::move(pool);
+  } else {
+    prepare_timer.pause();
   }
   std::vector<parallel_inbound::ReusableWorkerPool::Task> tasks;
   tasks.reserve(batch.size());
@@ -4673,7 +4749,10 @@ td::Result<std::size_t> Collator::process_parallel_inbound_batch() {
       }
     });
   }
-  TRY_STATUS(replay_parallel_worker_pool_->run_batch(std::move(tasks)));
+  {
+    td::ScopedRealCpuTimer worker_timer{parallel_stats.worker_time};
+    TRY_STATUS(replay_parallel_worker_pool_->run_batch(std::move(tasks)));
+  }
   for (const auto& prepared : batch) {
     if (prepared->status.is_error()) {
       return prepared->status.clone().move_as_error_prefix("parallel inbound worker failed: ");
@@ -4681,30 +4760,41 @@ td::Result<std::size_t> Collator::process_parallel_inbound_batch() {
   }
 
   std::size_t committed = 0;
-  for (auto& prepared : batch) {
-    block_full_ = !block_limit_status_->fits(block::ParamLimits::cl_normal);
-    if (block_full_ || internal_msg_timeout_.is_in_past(td::Timestamp::now())) {
-      return td::Status::Error("parallel inbound batch crossed a serial commit boundary");
+  {
+    td::ScopedRealCpuTimer commit_timer{parallel_stats.commit_time};
+    for (auto& prepared : batch) {
+      block_full_ = !block_limit_status_->fits(block::ParamLimits::cl_normal);
+      if (block_full_ || internal_msg_timeout_.is_in_past(td::Timestamp::now())) {
+        // The cursor still points at the first uncommitted item. Publishing only
+        // this canonical prefix cannot advance ProcessedUpto across a hole.
+        ++parallel_stats.boundary_stops;
+        parallel_stats.discarded_prepared += batch.size() - committed;
+        break;
+      }
+      if (!check_cancelled()) {
+        return td::Status::Error("parallel inbound batch was cancelled");
+      }
+      auto* current = nb_out_msgs_->cur();
+      if (!current || current->lt != prepared->message_lt || current->source != prepared->source ||
+          td::bitstring::bits_memcmp(current->key.cbits() + 96, prepared->message_hash.cbits(), 256)) {
+        return td::Status::Error("parallel inbound canonical order changed before commit");
+      }
+      if (!precheck_inbound_message(current->msg, current->lt)) {
+        return td::Status::Error("parallel inbound message failed serial precheck");
+      }
+      auto item = nb_out_msgs_->extract_cur();
+      auto& neighbor_stats = stats_.neighbors.at(item->source);
+      ++neighbor_stats.processed_msgs;
+      if (!process_inbound_message(item->msg, item->lt, item->key.cbits(), item->source, prepared.get())) {
+        return td::Status::Error("parallel inbound message failed serial commit");
+      }
+      ++committed;
+      nb_out_msgs_->next();
     }
-    if (!check_cancelled()) {
-      return td::Status::Error("parallel inbound batch was cancelled");
-    }
-    auto* current = nb_out_msgs_->cur();
-    if (!current || current->lt != prepared->message_lt || current->source != prepared->source ||
-        td::bitstring::bits_memcmp(current->key.cbits() + 96, prepared->message_hash.cbits(), 256)) {
-      return td::Status::Error("parallel inbound canonical order changed before commit");
-    }
-    if (!precheck_inbound_message(current->msg, current->lt)) {
-      return td::Status::Error("parallel inbound message failed serial precheck");
-    }
-    auto item = nb_out_msgs_->extract_cur();
-    auto& neighbor_stats = stats_.neighbors.at(item->source);
-    ++neighbor_stats.processed_msgs;
-    if (!process_inbound_message(item->msg, item->lt, item->key.cbits(), item->source, prepared.get())) {
-      return td::Status::Error("parallel inbound message failed serial commit");
-    }
-    ++committed;
-    nb_out_msgs_->next();
+  }
+  if (committed != 0) {
+    ++parallel_stats.batches;
+    parallel_stats.transactions += committed;
   }
   return committed;
 }

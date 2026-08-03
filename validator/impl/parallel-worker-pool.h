@@ -41,7 +41,7 @@ class ReusableWorkerPool {
 
   td::Status start();
   void shutdown();
-  void worker_loop(std::size_t worker_index);
+  void worker_loop();
 
   const std::size_t worker_count_;
   std::vector<std::thread> workers_;
@@ -51,6 +51,7 @@ class ReusableWorkerPool {
   std::condition_variable workers_ready_;
   std::vector<Task> tasks_;
   std::size_t generation_{0};
+  std::size_t next_task_{0};
   std::size_t tasks_remaining_{0};
   std::size_t ready_workers_{0};
   bool batch_active_{false};

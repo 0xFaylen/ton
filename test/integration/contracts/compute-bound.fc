@@ -1,0 +1,10 @@
+#include "../../../../crypto/smartcont/stdlib.fc";
+
+() recv_internal(int my_balance, int msg_value, cell in_msg_full, slice in_msg_body) impure {
+  int rounds = in_msg_body.slice_empty?() ? 256 : in_msg_body~load_uint(16);
+  int value = my_balance ^ msg_value;
+  repeat (rounds) {
+    value = ((value * 1103515245) + 12345) & 4294967295;
+  }
+  set_data(begin_cell().store_uint(value, 32).end_cell());
+}

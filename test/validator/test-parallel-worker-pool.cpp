@@ -17,8 +17,21 @@ TEST(ParallelWorkerPool, RejectsInvalidBatches) {
   ASSERT_TRUE(ReusableWorkerPool::create(0).is_error());
   auto pool = ReusableWorkerPool::create(2).move_as_ok();
   ASSERT_TRUE(pool->run_batch({}).is_ok());
-  ASSERT_TRUE(pool->run_batch({[] {}, [] {}, [] {}}).is_error());
   ASSERT_TRUE(pool->run_batch({ReusableWorkerPool::Task{}}).is_error());
+}
+
+TEST(ParallelWorkerPool, RunsMoreTasksThanWorkersExactlyOnce) {
+  auto pool = ReusableWorkerPool::create(4).move_as_ok();
+  std::vector<std::atomic<int>> executions(64);
+  std::vector<ReusableWorkerPool::Task> tasks;
+  tasks.reserve(executions.size());
+  for (std::size_t index = 0; index < executions.size(); ++index) {
+    tasks.push_back([&, index] { ++executions[index]; });
+  }
+  ASSERT_TRUE(pool->run_batch(std::move(tasks)).is_ok());
+  for (const auto& execution_count : executions) {
+    ASSERT_EQ(execution_count.load(), 1);
+  }
 }
 
 TEST(ParallelWorkerPool, ReusesReadyWorkersAcrossBatches) {
@@ -64,22 +77,6 @@ TEST(ParallelWorkerPool, ContainsTaskFailureAndRemainsReusable) {
 
   ASSERT_TRUE(pool->run_batch({[&] { ++completed; }, [&] { ++completed; }}).is_ok());
   ASSERT_EQ(completed.load(), 3);
-}
-
-TEST(ParallelWorkerPool, KeepsTaskIndexOnTheSameWorker) {
-  auto pool = ReusableWorkerPool::create(4).move_as_ok();
-  std::vector<std::thread::id> first(pool->worker_count());
-  std::vector<std::thread::id> second(pool->worker_count());
-  auto capture = [&](std::vector<std::thread::id>& ids) {
-    std::vector<ReusableWorkerPool::Task> tasks;
-    for (std::size_t index = 0; index < pool->worker_count(); ++index) {
-      tasks.push_back([&, index] { ids[index] = std::this_thread::get_id(); });
-    }
-    return pool->run_batch(std::move(tasks));
-  };
-  ASSERT_TRUE(capture(first).is_ok());
-  ASSERT_TRUE(capture(second).is_ok());
-  ASSERT_EQ(second, first);
 }
 
 TEST(ParallelWorkerPool, CompletesManyGenerationsWithoutLostWakeups) {

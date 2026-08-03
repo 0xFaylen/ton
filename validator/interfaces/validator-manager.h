@@ -82,6 +82,33 @@ struct StorageStatCacheStats {
 };
 
 struct CollationStats {
+  struct ReplayParallelAccountStats {
+    td::uint64 attempts = 0;
+    td::uint64 batches = 0;
+    td::uint64 transactions = 0;
+    td::uint64 serial_fallbacks = 0;
+    td::uint64 empty_root_fallbacks = 0;
+    td::uint64 boundary_stops = 0;
+    td::uint64 discarded_prepared = 0;
+    td::RealCpuTimer::Time prepare_time;
+    td::RealCpuTimer::Time worker_time;
+    td::RealCpuTimer::Time commit_time;
+
+    ReplayParallelAccountStats& operator+=(const ReplayParallelAccountStats& other) {
+      attempts += other.attempts;
+      batches += other.batches;
+      transactions += other.transactions;
+      serial_fallbacks += other.serial_fallbacks;
+      empty_root_fallbacks += other.empty_root_fallbacks;
+      boundary_stops += other.boundary_stops;
+      discarded_prepared += other.discarded_prepared;
+      prepare_time += other.prepare_time;
+      worker_time += other.worker_time;
+      commit_time += other.commit_time;
+      return *this;
+    }
+  };
+
   BlockIdExt block_id{workchainInvalid, 0, 0, RootHash::zero(), FileHash::zero()};
   td::Status status = td::Status::OK();
 
@@ -105,6 +132,7 @@ struct CollationStats {
   std::string time_stats;
 
   td::uint32 transactions = 0;
+  ReplayParallelAccountStats replay_parallel_accounts;
   std::vector<BlockIdExt> shard_configuration;
   td::uint32 ext_msgs_total = 0;
   td::uint32 ext_msgs_filtered = 0;

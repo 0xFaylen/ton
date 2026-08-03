@@ -313,38 +313,57 @@ queue-frontier, candidate-equality, or validation failure rejects the run.
 
 The option is accepted only for replay and only with `--mode both`. A non-zero
 worker count on a live Collator is rejected during startup. Tick/tock,
-dispatch-queue accounts, repeated destination accounts, transit messages, and
-other barriers remain on the serial coordinator path. Completed worker results
-are committed only in the canonical inbound queue order; a batch that reaches a
-limit or timeout before its complete prefix is committed fails closed instead
-of advancing `ProcessedUpto` over a hole. When a later transaction targets an
+empty-body transfers, dispatch-queue accounts, repeated destination accounts,
+transit messages, and other barriers remain on the serial coordinator path.
+Eligible messages have non-empty bodies and are prepared in a fixed 64-message
+lookahead; a reusable pool may execute more tasks than workers. Completed
+worker results are committed only in the canonical inbound queue order. If a
+block limit or internal timeout is reached partway through a batch, the
+coordinator commits only the continuous prepared prefix and discards the
+prepared suffix. The uncommitted queue tail remains untouched, so
+`ProcessedUpto` never advances over a hole. Other worker, proof, cancellation,
+or commit errors still reject the replay. When a later transaction targets an
 account already committed by a worker, the preserved worker cell-usage context
-records its state reads and the coordinator replays the complete journal before
-limit checks and after serialization. The later transaction remains serial;
-there is no speculative execution or parallel scheduling within one account.
+is rebased onto the coordinator proof anchor and records subsequent state
+reads. The coordinator replays the complete journal before limit checks and
+after serialization. The later transaction remains serial; there is no
+speculative execution or parallel scheduling within one account.
 
 `--parallel-first` reverses the two pass order. Run matched serial-first and
 parallel-first samples before interpreting timings so storage and OS cache
 warming cannot be mistaken for executor speedup.
 
 An isolated one-validator `tontester` network now exercises this gate with real
-Collator and `ValidateQuery` instances. One synthetic block contained 16
-transfers into an initially empty basechain account dictionary; replay fell
-back to the serial coordinator, produced byte-identical block and collated-data
-BOCs, and passed validation. A later block contained 16 transfers to 13
-destination accounts, with four transfers targeting one account. Four-worker
-replay produced byte-identical candidates and passed validation in both
-serial-first and parallel-first order. The measured paired speedups were 0.655x
-and 1.139x respectively, demonstrating that this small workload is dominated
-by fixed overhead and cache order rather than providing a capacity result.
+Collator and `ValidateQuery` instances. Cheap empty-body transfer blocks with
+512 transactions are deliberately kept serial (`actual_parallel=0`), including
+a 449-account hotspot corpus with 64 transactions for one account. These cases
+still produce byte-identical block and collated-data BOCs and pass validation,
+but their replay timing differences are cache and OS noise, not executor
+speedup.
 
-The integration gate exposed two replay-only Collator defects before this pass:
-an empty `ShardAccounts` root was treated as a fatal proof-context error instead
-of a serial fallback, and basechain account preparation queried the
-masterchain-only special-contract dictionary. Both cases now preserve the
-serial path's behavior. This synthetic result is not evidence of sustainable
-shard TPS. A copied mainnet validator database must still pass exact-candidate
-and `ValidateQuery` gates across a representative saturated block set.
+The bounded compute corpus submitted 512 independent contract messages. The
+selected block contained 268 transactions for 268 accounts and reached the gas
+boundary at 10,019,448 gas (`internal_load=1.001945`). Nine paired runs--three
+each with 2, 4, and 8 workers--all produced byte-identical candidates and passed
+`ValidateQuery`. Median serial/parallel Collator speedups were 1.365x, 1.193x,
+and 1.741x respectively. A separate boundary run submitted 128 messages and
+selected a 100-transaction, 10,000,000-gas block. Both 2- and 4-worker runs
+committed the exact canonical prefix, reported one boundary stop, discarded 28
+prepared suffix results, produced byte-identical candidates, and passed
+validation. Their single-sample speedups, 1.125x and 1.932x, are correctness
+diagnostics rather than capacity estimates.
+
+The integration gate exposed four replay-only Collator defects before this
+pass: an empty `ShardAccounts` root was treated as a fatal proof-context error,
+basechain account preparation queried the masterchain-only special-contract
+dictionary, worker `UsageCell` paths were published without rebasing them onto
+the coordinator proof anchor, and a partial prepared batch could not express a
+safe block-limit stop. The current path falls back or preserves a continuous
+canonical prefix for these cases. This synthetic result is not evidence of
+sustainable shard TPS. The report intentionally keeps
+`mainnet_sustainable_raw_tps=null`. A copied mainnet validator database must
+still pass the same exact-candidate and `ValidateQuery` gates across a
+representative saturated jetton/DEX block set.
 
 The output also contains `single_shard_capacity`. It reads Config 23/29/30 from
 the state-bound masterchain proof and reports the exact archive block-file size.

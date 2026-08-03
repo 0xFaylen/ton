@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: LGPL-2.0-or-later
 
-#include "parallel-worker-pool.h"
-
 #include <exception>
 
 #include "td/utils/StringBuilder.h"
+
+#include "parallel-worker-pool.h"
 
 namespace ton::validator::parallel_inbound {
 
@@ -25,7 +25,7 @@ td::Status ReusableWorkerPool::start() {
   try {
     workers_.reserve(worker_count_);
     for (std::size_t i = 0; i < worker_count_; ++i) {
-      workers_.emplace_back([this, i] { worker_loop(i); });
+      workers_.emplace_back([this] { worker_loop(); });
     }
   } catch (const std::exception& error) {
     shutdown();
@@ -58,9 +58,6 @@ td::Status ReusableWorkerPool::run_batch(std::vector<Task> tasks) {
   if (tasks.empty()) {
     return td::Status::OK();
   }
-  if (tasks.size() > worker_count_) {
-    return td::Status::Error("reusable worker batch has more tasks than workers");
-  }
   for (const auto& task : tasks) {
     if (!task) {
       return td::Status::Error("reusable worker batch contains an empty task");
@@ -75,6 +72,7 @@ td::Status ReusableWorkerPool::run_batch(std::vector<Task> tasks) {
     return td::Status::Error("reusable worker pool already has an active batch");
   }
   tasks_ = std::move(tasks);
+  next_task_ = 0;
   tasks_remaining_ = tasks_.size();
   first_task_error_.clear();
   batch_active_ = true;
@@ -89,7 +87,7 @@ td::Status ReusableWorkerPool::run_batch(std::vector<Task> tasks) {
   return td::Status::OK();
 }
 
-void ReusableWorkerPool::worker_loop(std::size_t worker_index) {
+void ReusableWorkerPool::worker_loop() {
   std::unique_lock lock(mutex_);
   ++ready_workers_;
   workers_ready_.notify_one();
@@ -100,28 +98,27 @@ void ReusableWorkerPool::worker_loop(std::size_t worker_index) {
       return;
     }
     observed_generation = generation_;
-    if (worker_index >= tasks_.size()) {
-      continue;
-    }
-    const auto* task = &tasks_[worker_index];
-    lock.unlock();
-    std::string error_message;
-    try {
-      (*task)();
-    } catch (const std::exception& error) {
-      error_message = error.what();
-      if (error_message.empty()) {
-        error_message = "standard exception without a message";
+    while (next_task_ < tasks_.size()) {
+      const auto* task = &tasks_[next_task_++];
+      lock.unlock();
+      std::string error_message;
+      try {
+        (*task)();
+      } catch (const std::exception& error) {
+        error_message = error.what();
+        if (error_message.empty()) {
+          error_message = "standard exception without a message";
+        }
+      } catch (...) {
+        error_message = "unknown exception";
       }
-    } catch (...) {
-      error_message = "unknown exception";
-    }
-    lock.lock();
-    if (!error_message.empty() && first_task_error_.empty()) {
-      first_task_error_ = std::move(error_message);
-    }
-    if (--tasks_remaining_ == 0) {
-      batch_done_.notify_one();
+      lock.lock();
+      if (!error_message.empty() && first_task_error_.empty()) {
+        first_task_error_ = std::move(error_message);
+      }
+      if (--tasks_remaining_ == 0) {
+        batch_done_.notify_one();
+      }
     }
   }
 }

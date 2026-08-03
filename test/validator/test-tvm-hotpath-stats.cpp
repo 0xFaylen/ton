@@ -327,5 +327,34 @@ TEST(ValidationReplay, AggregatesEveryPreviouslyOmittedWorkTimeField) {
   ASSERT_EQ(validate_total.unpack_block_data.real, 1.0);
 }
 
+TEST(ValidationReplay, AggregatesActualParallelAccountWork) {
+  CollationStats::ReplayParallelAccountStats total;
+  CollationStats::ReplayParallelAccountStats block;
+  block.attempts = 4;
+  block.batches = 3;
+  block.transactions = 12;
+  block.serial_fallbacks = 1;
+  block.empty_root_fallbacks = 1;
+  block.boundary_stops = 1;
+  block.discarded_prepared = 5;
+  block.prepare_time = make_time(0.1, 0.08);
+  block.worker_time = make_time(0.2, 0.32);
+  block.commit_time = make_time(0.3, 0.24);
+
+  total += block;
+  total += block;
+
+  ASSERT_EQ(total.attempts, 8u);
+  ASSERT_EQ(total.batches, 6u);
+  ASSERT_EQ(total.transactions, 24u);
+  ASSERT_EQ(total.serial_fallbacks, 2u);
+  ASSERT_EQ(total.empty_root_fallbacks, 2u);
+  ASSERT_EQ(total.boundary_stops, 2u);
+  ASSERT_EQ(total.discarded_prepared, 10u);
+  ASSERT_EQ(total.prepare_time.real, 0.2);
+  ASSERT_EQ(total.worker_time.cpu, 0.64);
+  ASSERT_EQ(total.commit_time.real, 0.6);
+}
+
 }  // namespace
 }  // namespace ton::validator::test

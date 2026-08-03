@@ -1,8 +1,9 @@
-"""Build a multi-account basechain block and gate parallel Collator replay."""
+"""Gate exact selective Collator replay on cheap multi-account messages."""
 
 import asyncio
 import logging
 import os
+import re
 import shutil
 import sys
 from collections import Counter
@@ -67,8 +68,7 @@ async def _find_best_block(
 async def _run_replay(node, seqno: int, run_id: int, parallel_first: bool) -> str:
     order_flag = " --parallel-first" if parallel_first else ""
     command = (
-        "run --mode both --parallel-account-workers 4"
-        f"{order_flag} (0,8000000000000000,{seqno})"
+        f"run --mode both --parallel-account-workers 4{order_flag} (0,8000000000000000,{seqno})"
     )
     started = await node.engine_console.validation_replayer_command(command)
     if not started.startswith("Started"):
@@ -86,6 +86,13 @@ async def _run_replay(node, seqno: int, run_id: int, parallel_first: bool) -> st
         raise RuntimeError(f"candidate equality evidence is missing:\n{status}")
     if status.count("Validate: time=") < run_id + 1:
         raise RuntimeError(f"ValidateQuery evidence is missing:\n{status}")
+    section = re.search(rf"(?ms)^  #{run_id}:.*?(?=^  #\d+:|\Z)", status)
+    if not section or not re.search(
+        r"Parallel account actual:.*transactions=0\.00", section.group(0)
+    ):
+        raise RuntimeError(
+            f"empty-body messages unexpectedly entered parallel execution:\n{status}"
+        )
     return status
 
 
@@ -157,31 +164,27 @@ async def main() -> int:
             while transactions < 8 or distinct_accounts < 6 or max_per_account < 2:
                 last_wc0_seqno = await _wc0_tip(client)
                 if last_wc0_seqno > first_wc0_seqno:
-                    result = await _find_best_block(
-                        client, first_wc0_seqno + 1, last_wc0_seqno
-                    )
+                    result = await _find_best_block(client, first_wc0_seqno + 1, last_wc0_seqno)
                     target, transactions, distinct_accounts, max_per_account = result
                 if transactions >= 8 and distinct_accounts >= 6 and max_per_account >= 2:
                     break
-                await network.wait_block(
-                    workchain=0, shard=FULL_SHARD, seqno=last_wc0_seqno + 1
-                )
+                await network.wait_block(workchain=0, shard=FULL_SHARD, seqno=last_wc0_seqno + 1)
 
-        empty_root_fallback = await _run_replay(
+        initial_state_serial_gate = await _run_replay(
             node, deployment_target, 0, parallel_first=False
         )
         serial_first = await _run_replay(node, target, 1, parallel_first=False)
         parallel_first = await _run_replay(node, target, 2, parallel_first=True)
 
         print("=== parallel_replay_batch PASS ===")
-        print(f"empty-root target:      {deployment_target}")
-        print(f"empty-root tx:          {deployment_transactions}")
+        print(f"initial-state target:   {deployment_target}")
+        print(f"initial-state tx:       {deployment_transactions}")
         print(f"target wc0 seqno:       {target}")
         print(f"raw transactions:      {transactions}")
         print(f"distinct accounts:     {distinct_accounts}")
         print(f"max tx per account:    {max_per_account}")
-        print("empty-root fallback evidence:")
-        print(empty_root_fallback.rstrip())
+        print("initial-state serial-gate evidence:")
+        print(initial_state_serial_gate.rstrip())
         print("serial-first evidence:")
         print(serial_first.rstrip())
         print("parallel-first evidence:")
