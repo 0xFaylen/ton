@@ -47,6 +47,7 @@ namespace validator {
 using td::Ref;
 
 struct ParallelInboundPrepared;
+struct ParallelAccountContinuation;
 
 class Collator final : public td::actor::Actor {
  public:
@@ -103,7 +104,7 @@ class Collator final : public td::actor::Actor {
  public:
   Collator(CollateParams params, td::actor::ActorId<ValidatorManager> manager, td::CancellationToken cancellation_token,
            td::Promise<BlockCandidate> promise);
-  ~Collator() override = default;
+  ~Collator() override;
   bool is_busy() const {
     return busy_;
   }
@@ -155,7 +156,7 @@ class Collator final : public td::actor::Actor {
   std::vector<block::McShardDescr> neighbors_;
   std::unique_ptr<block::OutputQueueMerger> nb_out_msgs_;
   std::unique_ptr<parallel_inbound::ReusableWorkerPool> replay_parallel_worker_pool_;
-  std::set<ton::StdSmcAddress> replay_parallel_committed_accounts_;
+  std::map<ton::StdSmcAddress, std::unique_ptr<ParallelAccountContinuation>> replay_parallel_account_continuations_;
   std::vector<ton::StdSmcAddress> special_smcs;
   Ref<vm::Cell> prev_block_root;
   Ref<vm::Cell> prev_state_root_, prev_state_root_pure_;
@@ -371,6 +372,8 @@ class Collator final : public td::actor::Actor {
   Ref<vm::Cell> commit_parallel_inbound_transaction(ParallelInboundPrepared& prepared,
                                                     const td::Ref<vm::Cell>& expected_message,
                                                     const td::optional<block::MsgMetadata>& msg_metadata);
+  td::Status flush_parallel_account_continuation(const ton::StdSmcAddress& address);
+  td::Status flush_parallel_account_continuations();
   td::actor::Task<> process_external_and_new_messages();
   td::actor::Task<bool> process_inbound_external_messages();
   int process_external_message(Ref<vm::Cell> msg);

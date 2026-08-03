@@ -113,6 +113,21 @@ struct ParallelCellUsageContext {
   }
 };
 
+td::Status replay_parallel_cell_usage_context(const std::unique_ptr<ParallelCellUsageContext>& context, bool storage) {
+  if (!context) {
+    return td::Status::OK();
+  }
+  TRY_STATUS(context->validate_recording());
+  if (context->coordinator_anchor.empty()) {
+    return td::Status::OK();
+  }
+  const auto& journal = storage ? context->storage_journal : context->ordinary_journal;
+  if (!journal) {
+    return td::Status::Error("parallel cell context has no journal for a coordinator proof anchor");
+  }
+  return journal->replay_into(context->pure_root, context->coordinator_anchor);
+}
+
 struct ParallelWorkerConfig {
   block::StoragePhaseConfig storage;
   block::ComputePhaseConfig compute;
@@ -182,6 +197,14 @@ struct ParallelInboundPrepared {
   CollationStats stats;
   td::Status status = td::Status::OK();
 };
+
+struct ParallelAccountContinuation {
+  std::unique_ptr<ParallelCellUsageContext> account_usage;
+  std::unique_ptr<ParallelCellUsageContext> message_usage;
+  std::unique_ptr<ParallelCellUsageContext> storage_usage;
+};
+
+Collator::~Collator() = default;
 
 /**
  * Constructs a Collator object.
@@ -2618,8 +2641,16 @@ td::actor::Task<> Collator::do_collate_inner() {
     // A. serialize ShardAccountBlocks and new ShardAccounts
     LOG(DEBUG) << "serialize account states and blocks";
     td::ScopedRealCpuTimer timer{stats_.work_time.combine_account_transactions};
+    auto flush_status = flush_parallel_account_continuations();
+    if (flush_status.is_error()) {
+      co_return flush_status.move_as_error_prefix("cannot flush parallel proof contexts before serialization: ");
+    }
     if (!combine_account_transactions()) {
       co_return td::Status::Error("cannot combine separate Account transactions into a new ShardAccountBlocks");
+    }
+    flush_status = flush_parallel_account_continuations();
+    if (flush_status.is_error()) {
+      co_return flush_status.move_as_error_prefix("cannot flush parallel proof contexts after serialization: ");
     }
   }
   {
@@ -2641,6 +2672,10 @@ td::actor::Task<> Collator::do_collate_inner() {
     td::ScopedRealCpuTimer timer{stats_.work_time.create_block};
     if (!create_block()) {
       co_return td::Status::Error("cannot create new Block");
+    }
+    auto flush_status = flush_parallel_account_continuations();
+    if (flush_status.is_error()) {
+      co_return flush_status.move_as_error_prefix("cannot flush parallel proof contexts after block serialization: ");
     }
   }
   {
@@ -3493,10 +3528,6 @@ Ref<vm::Cell> Collator::create_ordinary_transaction(Ref<vm::Cell> msg_root,
   if (!block::tlb::t_MsgAddressInt.extract_std_address(dest, wc, addr) || wc != workchain()) {
     return {};
   }
-  if (replay_parallel_committed_accounts_.count(addr) != 0) {
-    fatal_error("a replay-parallel account received another transaction in the same block");
-    return {};
-  }
   LOG(DEBUG) << "inbound message to our smart contract " << addr.to_hex();
   auto acc_res = make_account(addr.cbits(), true);
   if (acc_res.is_error()) {
@@ -3517,6 +3548,11 @@ Ref<vm::Cell> Collator::create_ordinary_transaction(Ref<vm::Cell> msg_root,
   auto res = impl_create_ordinary_transaction(msg_root, acc, now_, start_lt, &storage_phase_cfg_, &compute_phase_cfg_,
                                               &action_phase_cfg_, &serialize_cfg_, external, after_lt, &stats_,
                                               account_work_phase);
+  auto flush_status = flush_parallel_account_continuation(addr);
+  if (flush_status.is_error()) {
+    fatal_error(flush_status.move_as_error_prefix("cannot flush a parallel account proof context: "));
+    return {};
+  }
   if (res.is_error()) {
     auto error = res.move_as_error();
     if (error.code() == -701) {
@@ -3553,6 +3589,11 @@ Ref<vm::Cell> Collator::create_ordinary_transaction(Ref<vm::Cell> msg_root,
     ++new_msg_metadata.value().depth;
   }
   register_new_msgs(*trans, std::move(new_msg_metadata));
+  flush_status = flush_parallel_account_continuation(addr);
+  if (flush_status.is_error()) {
+    fatal_error(flush_status.move_as_error_prefix("cannot flush a parallel account proof context after commit: "));
+    return {};
+  }
   update_max_lt(acc->last_trans_end_lt_);
   value_flow_.burned += trans->blackhole_burned;
   ++stats_.transactions;
@@ -4283,9 +4324,9 @@ bool Collator::process_inbound_message(Ref<vm::CellSlice> enq_msg, ton::LogicalT
   return true;
 }
 
-Ref<vm::Cell> Collator::commit_parallel_inbound_transaction(
-    ParallelInboundPrepared& prepared, const td::Ref<vm::Cell>& expected_message,
-    const td::optional<block::MsgMetadata>& msg_metadata) {
+Ref<vm::Cell> Collator::commit_parallel_inbound_transaction(ParallelInboundPrepared& prepared,
+                                                            const td::Ref<vm::Cell>& expected_message,
+                                                            const td::optional<block::MsgMetadata>& msg_metadata) {
   if (prepared.status.is_error() || !prepared.account || !prepared.transaction || expected_message.is_null() ||
       expected_message->get_hash().as_bits256() != prepared.message_hash ||
       prepared.transaction->account.addr != prepared.account_address ||
@@ -4296,14 +4337,7 @@ Ref<vm::Cell> Collator::commit_parallel_inbound_transaction(
 
   set_current_tx_storage_dict(*prepared.account);
   auto replay_journal = [&](const std::unique_ptr<ParallelCellUsageContext>& context, bool storage) -> bool {
-    if (!context) {
-      return true;
-    }
-    auto status = context->validate_recording();
-    if (status.is_ok() && !context->coordinator_anchor.empty()) {
-      const auto& journal = storage ? context->storage_journal : context->ordinary_journal;
-      status = journal->replay_into(context->pure_root, context->coordinator_anchor);
-    }
+    auto status = replay_parallel_cell_usage_context(context, storage);
     if (status.is_error()) {
       fatal_error(status.move_as_error_prefix("cannot replay parallel cell-usage journal: "));
       return false;
@@ -4344,7 +4378,21 @@ Ref<vm::Cell> Collator::commit_parallel_inbound_transaction(
     fatal_error("cannot publish a parallel inbound account state");
     return {};
   }
-  replay_parallel_committed_accounts_.insert(prepared.account_address);
+  auto continuation = std::make_unique<ParallelAccountContinuation>();
+  continuation->account_usage = std::move(prepared.account_usage);
+  continuation->message_usage = std::move(prepared.message_usage);
+  continuation->storage_usage = std::move(prepared.storage_usage);
+  auto [continuation_it, continuation_inserted] =
+      replay_parallel_account_continuations_.emplace(prepared.account_address, std::move(continuation));
+  if (!continuation_inserted || !continuation_it->second) {
+    fatal_error("cannot retain a parallel inbound account proof context");
+    return {};
+  }
+  auto flush_status = flush_parallel_account_continuation(prepared.account_address);
+  if (flush_status.is_error()) {
+    fatal_error(flush_status.move_as_error_prefix("cannot flush a committed parallel account proof context: "));
+    return {};
+  }
   if (!update_account_dict_estimation(*trans)) {
     fatal_error("cannot update account dictionary estimate for a parallel inbound transaction");
     return {};
@@ -4357,10 +4405,51 @@ Ref<vm::Cell> Collator::commit_parallel_inbound_transaction(
     ++new_msg_metadata.value().depth;
   }
   register_new_msgs(*trans, std::move(new_msg_metadata));
+  flush_status = flush_parallel_account_continuation(prepared.account_address);
+  if (flush_status.is_error()) {
+    fatal_error(flush_status.move_as_error_prefix("cannot flush a parallel account proof context after commit: "));
+    return {};
+  }
   update_max_lt(account_it->second->last_trans_end_lt_);
   value_flow_.burned += trans->blackhole_burned;
   ++stats_.transactions;
   return trans_root;
+}
+
+td::Status Collator::flush_parallel_account_continuation(const ton::StdSmcAddress& address) {
+  auto continuation_it = replay_parallel_account_continuations_.find(address);
+  if (continuation_it == replay_parallel_account_continuations_.end()) {
+    return td::Status::OK();
+  }
+  auto* account = lookup_account(address.cbits());
+  if (!account || !continuation_it->second) {
+    return td::Status::Error("parallel account proof context has no committed account");
+  }
+
+  auto* previous_storage_dict = current_tx_storage_dict_;
+  SCOPE_EXIT {
+    current_tx_storage_dict_ = previous_storage_dict;
+  };
+  set_current_tx_storage_dict(*account);
+  auto& continuation = *continuation_it->second;
+  TRY_STATUS(replay_parallel_cell_usage_context(continuation.account_usage, false));
+  TRY_STATUS(replay_parallel_cell_usage_context(continuation.message_usage, false));
+  TRY_STATUS(replay_parallel_cell_usage_context(continuation.storage_usage, false));
+  {
+    block::StorageStatCalculationContext storage_context{true};
+    block::StorageStatCalculationContext::Guard guard{&storage_context};
+    TRY_STATUS(replay_parallel_cell_usage_context(continuation.account_usage, true));
+    TRY_STATUS(replay_parallel_cell_usage_context(continuation.message_usage, true));
+    TRY_STATUS(replay_parallel_cell_usage_context(continuation.storage_usage, true));
+  }
+  return td::Status::OK();
+}
+
+td::Status Collator::flush_parallel_account_continuations() {
+  for (const auto& entry : replay_parallel_account_continuations_) {
+    TRY_STATUS(flush_parallel_account_continuation(entry.first));
+  }
+  return td::Status::OK();
 }
 
 td::Result<std::size_t> Collator::process_parallel_inbound_batch() {
@@ -6861,6 +6950,11 @@ bool Collator::create_collated_data() {
   if (!is_masterchain()) {
     if (!prepare_proofs()) {
       return fatal_error("cannot prepare proof for collated data");
+    }
+    auto flush_status = flush_parallel_account_continuations();
+    if (flush_status.is_error()) {
+      return fatal_error(
+          flush_status.move_as_error_prefix("cannot flush parallel proof contexts before proof generation: "));
     }
 
     state_usage_tree_->set_use_mark_for_is_loaded(false);

@@ -316,10 +316,11 @@ dispatch-queue accounts, repeated destination accounts, transit messages, and
 other barriers remain on the serial coordinator path. Completed worker results
 are committed only in the canonical inbound queue order; a batch that reaches a
 limit or timeout before its complete prefix is committed fails closed instead
-of advancing `ProcessedUpto` over a hole. Until worker proof contexts can be
-preserved across later transactions, a second transaction to an account already
-committed by a parallel worker also rejects the replay instead of continuing
-with incomplete proof accounting.
+of advancing `ProcessedUpto` over a hole. When a later transaction targets an
+account already committed by a worker, the preserved worker cell-usage context
+records its state reads and the coordinator replays the complete journal before
+limit checks and after serialization. The later transaction remains serial;
+there is no speculative execution or parallel scheduling within one account.
 
 `--parallel-first` reverses the two pass order. Run matched serial-first and
 parallel-first samples before interpreting timings so storage and OS cache

@@ -112,6 +112,44 @@ TEST(ParallelCellUsageJournal, UnionIsIndependentOfWorkerArrivalOrder) {
   ASSERT_EQ(proof_for(root, left_then_right)->get_hash(), proof_for(root, right_then_left)->get_hash());
 }
 
+TEST(ParallelCellUsageJournal, RepeatedFlushIsIdempotentAndLaterLoadsExtendTheProof) {
+  const auto root = make_tree();
+  CellUsageJournal journal{root->get_hash().as_bits256()};
+  auto worker_tree = std::make_shared<vm::CellUsageTree>();
+  bool recording_ok = true;
+  worker_tree->set_cell_load_path_callback([&](const vm::LoadedCell& loaded) {
+    if (journal.record(loaded).is_error()) {
+      recording_ok = false;
+    }
+  });
+  auto worker_root = vm::UsageCell::create(root, worker_tree->root_ptr());
+  ASSERT_TRUE(load_path(worker_root, {0, 0}));
+  ASSERT_TRUE(recording_ok);
+  ASSERT_TRUE(journal.validate().is_ok());
+
+  auto coordinator_tree = std::make_shared<vm::CellUsageTree>();
+  std::size_t coordinator_loads = 0;
+  coordinator_tree->set_cell_load_callback([&](const vm::LoadedCell&) { ++coordinator_loads; });
+  ASSERT_TRUE(journal.replay_into(root, coordinator_tree).is_ok());
+  const auto first_flush_loads = coordinator_loads;
+  ASSERT_TRUE(first_flush_loads > 0u);
+
+  ASSERT_TRUE(journal.replay_into(root, coordinator_tree).is_ok());
+  ASSERT_EQ(coordinator_loads, first_flush_loads);
+
+  ASSERT_TRUE(load_path(worker_root, {1, 0}));
+  ASSERT_TRUE(recording_ok);
+  ASSERT_TRUE(journal.validate().is_ok());
+  ASSERT_TRUE(journal.replay_into(root, coordinator_tree).is_ok());
+  ASSERT_TRUE(coordinator_loads > first_flush_loads);
+
+  auto serial_tree = std::make_shared<vm::CellUsageTree>();
+  auto serial_root = vm::UsageCell::create(root, serial_tree->root_ptr());
+  ASSERT_TRUE(load_path(serial_root, {0, 0}));
+  ASSERT_TRUE(load_path(serial_root, {1, 0}));
+  ASSERT_EQ(proof_for(root, coordinator_tree)->get_hash(), proof_for(root, serial_tree)->get_hash());
+}
+
 TEST(ParallelCellUsageJournal, ReplaysBelowAnExistingCoordinatorAnchor) {
   const auto root = make_tree();
   const auto root_data = root->load_cell().move_as_ok().data_cell;

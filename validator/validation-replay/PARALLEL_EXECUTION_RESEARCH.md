@@ -573,10 +573,12 @@ coordinator replays the recorded account/message/storage load journals into the
 original proof anchors and commits successful transactions in canonical
 `(lt, message hash)` order. Existing tick/tock execution stays serial, and any
 account already touched by tick/tock, dispatch, or an earlier transaction is a
-serial barrier. A later transaction to an account already committed by a worker
-currently fails the replay closed: the worker cell-usage context is deliberately
-not reused after the batch, so silently continuing would make proof accounting
-incomplete.
+serial barrier. The cell-usage context of an account first executed by a worker
+is retained until candidate serialization. A later serial transaction can keep
+using that account state; newly observed account and storage paths are replayed
+into the coordinator proof tree before limit checks and after serialization.
+This closes the proof-accounting gap without adding speculative execution or
+parallel scheduling within one account.
 
 The corresponding `vrp` option requires `--mode both`. It always produces a
 serial reference and a parallel candidate from the same replay inputs, rejects
