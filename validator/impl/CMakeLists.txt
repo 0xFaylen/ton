@@ -14,6 +14,7 @@ set(TON_VALIDATOR_SOURCE
   parallel-cell-usage-journal.cpp
   parallel-worker-pool.cpp
   proof.cpp
+  selective-split-state.cpp
   shard.cpp
   top-shard-descr.cpp
   validate-query.cpp
@@ -33,6 +34,7 @@ set(TON_VALIDATOR_SOURCE
   parallel-cell-usage-journal.h
   parallel-worker-pool.h
   proof.hpp
+  selective-split-state.h
   shard.hpp
   top-shard-descr.hpp
   validate-query.hpp)

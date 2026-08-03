@@ -58,6 +58,7 @@
 #include "validator/impl/parallel-merkle-proof-merge.h"
 #include "validator/impl/parallel-transaction-payload.h"
 #include "validator/impl/parallel-worker-pool.h"
+#include "validator/impl/selective-split-state.h"
 #include "validator/interfaces/tvm-hotpath-stats.h"
 #include "vm/boc.h"
 #include "vm/cells/CellUsageTree.h"
@@ -128,6 +129,7 @@ struct LoadedBlock {
 
 struct LoadedState {
   std::shared_ptr<vm::StaticBagOfCellsDb> boc;
+  Ref<vm::Cell> serialized_root;
   Ref<vm::Cell> root;
   block::gen::ShardStateUnsplit::Record record;
   BlockId id;
@@ -815,6 +817,7 @@ td::Result<LoadedState> load_state_boc_unchecked(const std::string& path, td::Sl
     return td::Status::Error(PSLICE() << description << " BOC must contain exactly one root, found " << root_count);
   }
   TRY_RESULT(root, boc->get_root_cell(0));
+  Ref<vm::Cell> serialized_root = root;
 
   block::gen::ShardStateUnsplit::Record state;
   bool split_header = false;
@@ -830,7 +833,8 @@ td::Result<LoadedState> load_state_boc_unchecked(const std::string& path, td::Sl
     split_header = true;
   }
   BlockId actual_id{ton::ShardIdFull(block::ShardId{state.shard_id}), static_cast<ton::BlockSeqno>(state.seq_no)};
-  return LoadedState{std::move(boc), std::move(root), std::move(state), actual_id, split_header};
+  return LoadedState{std::move(boc), std::move(serialized_root), std::move(root), std::move(state), actual_id,
+                     split_header};
 }
 
 td::Result<LoadedState> load_state_boc(const std::string& path, const BlockIdExt& expected_id, td::Slice description) {
@@ -918,7 +922,8 @@ td::Result<LoadedState> load_config_proof(const std::string& path, const BlockId
   if (state_id != expected_id.id) {
     return td::Status::Error("masterchain state in config proof has the wrong block id");
   }
-  return LoadedState{nullptr, std::move(root), std::move(state), state_id, false};
+  Ref<vm::Cell> serialized_root = root;
+  return LoadedState{nullptr, std::move(serialized_root), std::move(root), std::move(state), state_id, false};
 }
 
 td::Result<LoadedAccountProof> load_account_proof(const std::string& spec, const BlockContext& target) {
@@ -2838,12 +2843,15 @@ td::Result<std::string> inspect_json(const BlockContext& target, int split_depth
   TRY_RESULT(prefixes, collect_account_prefixes(target, split_depth));
   TRY_RESULT(accounts, collect_accounts(target));
   TRY_RESULT(workload, summarize_account_blocks(target));
+  TRY_RESULT(state_update_views, extract_state_update_raw_views(target));
   td::StringBuilder out;
   out << "{\"schema_version\":1,\"mode\":\"inspect\",\"block_id\":\"" << target.id.to_str()
       << "\",\"global_id\":" << target.global_id << ",\"gen_utime\":" << target.gen_utime
       << ",\"start_lt\":" << target.start_lt << ",\"end_lt\":" << target.end_lt
       << ",\"after_split\":" << target.after_split << ",\"after_merge\":" << target.after_merge
       << ",\"before_split\":" << target.before_split << ",\"file_bytes\":" << target.file_bytes
+      << ",\"predecessor_state_root\":\"" << state_update_views.first->get_hash(0).to_hex()
+      << "\",\"result_state_root\":\"" << state_update_views.second->get_hash(0).to_hex() << "\""
       << ",\"distinct_accounts\":" << workload.distinct_accounts
       << ",\"raw_transactions\":" << workload.raw_transactions
       << ",\"transaction_kinds\":" << transaction_kinds_json(workload.transaction_kinds)
@@ -2879,12 +2887,29 @@ td::Result<std::string> inspect_json(const BlockContext& target, int split_depth
   return out.as_cslice().str();
 }
 
-std::string inspect_state_json(const LoadedState& state) {
+td::Result<std::string> inspect_state_json(const LoadedState& state, int split_depth) {
+  std::vector<ton::validator::SelectiveSplitStatePartDescriptor> parts;
+  if (state.split_header) {
+    TRY_RESULT(assembler,
+               ton::validator::SelectiveSplitStateAssembler::create(
+                   state.id.shard_full(), ton::RootHash{state.root->get_hash().bits()}, state.serialized_root,
+                   static_cast<td::uint32>(split_depth)));
+    parts = assembler->parts();
+  }
   td::StringBuilder out;
   out << "{\"schema_version\":1,\"mode\":\"inspect_state\",\"state_id\":\"" << state.id.to_str()
       << "\",\"global_id\":" << state.record.global_id << ",\"gen_utime\":" << state.record.gen_utime
       << ",\"gen_lt\":" << state.record.gen_lt << ",\"root_hash\":\"" << state.root->get_hash().to_hex()
-      << "\",\"split_header\":" << state.split_header << "}";
+      << "\",\"split_header\":" << state.split_header << ",\"split_depth\":" << split_depth
+      << ",\"account_part_count\":" << parts.size() << ",\"account_parts\":[";
+  for (std::size_t i = 0; i < parts.size(); ++i) {
+    if (i != 0) {
+      out << ",";
+    }
+    out << "{\"effective_shard\":\"" << ton::shard_to_str(parts[i].effective_shard)
+        << "\",\"root_hash\":\"" << parts[i].wrapped_root_hash.to_hex() << "\"}";
+  }
+  out << "]}";
   return out.as_cslice().str();
 }
 
@@ -3517,7 +3542,7 @@ int main(int argc, char** argv) {
     }
   } else if (!inspect_state.empty()) {
     if (!archive.empty() || !block_boc.empty() || !export_block_boc_path.empty() || !block_id.empty() || list_blocks ||
-        inspect || split_depth != 4 || has_replay_inputs) {
+        inspect || has_replay_inputs) {
       std::cerr << "Error: --inspect-state cannot be combined with block-source, replay, or block-inspection options\n";
       return 1;
     }
@@ -3577,7 +3602,7 @@ int main(int argc, char** argv) {
       if (state.is_error()) {
         result = state.move_as_error();
       } else {
-        result = inspect_state_json(state.move_as_ok());
+        result = inspect_state_json(state.move_as_ok(), split_depth);
       }
     } else {
       result = run(archive, block_boc, mc_archive, block_id, inspect, collated_data, prev_state, mc_state, mc_proof,

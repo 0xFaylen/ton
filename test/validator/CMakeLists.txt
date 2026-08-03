@@ -69,3 +69,16 @@ target_link_libraries(test-parallel-transaction-payload PRIVATE
 )
 target_include_directories(test-parallel-transaction-payload PRIVATE ${CMAKE_SOURCE_DIR}/validator)
 ton_test(test-parallel-transaction-payload)
+
+add_executable(test-selective-split-state
+    test-selective-split-state.cpp
+    ${CMAKE_SOURCE_DIR}/validator/impl/selective-split-state.cpp
+)
+target_link_libraries(test-selective-split-state PRIVATE
+    td-test-main
+    tdutils
+    ton_crypto
+    ton_block
+)
+target_include_directories(test-selective-split-state PRIVATE ${CMAKE_SOURCE_DIR}/validator)
+ton_test(test-selective-split-state)
