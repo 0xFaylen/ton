@@ -337,6 +337,7 @@ class TestNode : public td::actor::Actor {
   bool get_msg_queue_sizes();
   void get_msg_queue_sizes_cont(ton::BlockIdExt mc_blkid, td::BufferSlice data);
   void get_msg_queue_sizes_finish(std::vector<ton::BlockIdExt> blocks, std::vector<td::uint64> sizes);
+  bool save_block_out_msg_queue_proof(ton::BlockIdExt block_id, std::string filename);
   bool get_dispatch_queue_info(ton::BlockIdExt block_id);
   bool get_dispatch_queue_info_cont(ton::BlockIdExt block_id, bool first, td::Bits256 after_addr);
   void got_dispatch_queue_info(ton::BlockIdExt block_id,

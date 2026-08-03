@@ -78,7 +78,7 @@ td::Status write_new_file(td::CSlice path, td::Slice data) {
   file.close();
   return td::Status::OK();
 }
-}
+}  // namespace
 
 void TestNode::run() {
   class Cb : public td::TerminalIO::Callback {
@@ -1063,6 +1063,7 @@ bool TestNode::show_help(std::string command) {
          "into files <filename-pfx><complaint-hash>.boc\n"
          "complaintprice <expires-in> <complaint-boc>\tComputes the price (in nanograms) for creating a complaint\n"
          "msgqueuesizes\tShows current sizes of outbound message queues in all shards\n"
+         "saveoutmsgqueueproof <filename> <block-id-ext>\tSaves a block-bound OutMsgQueueInfo proof\n"
          "dispatchqueueinfo <block-id>\tShows list of account dispatch queue of a block\n"
          "dispatchqueuemessages <block-id> <addr> [<after-lt>]\tShows deferred messages from account <addr>, lt > "
          "<after_lt>\n"
@@ -1278,6 +1279,10 @@ bool TestNode::do_parse_line() {
            set_error(get_complaint_price(expire_in, filename));
   } else if (word == "msgqueuesizes") {
     return get_msg_queue_sizes();
+  } else if (word == "saveoutmsgqueueproof") {
+    std::string filename;
+    return get_word_to(filename) && parse_block_id_ext(blkid) && seekeoln() &&
+           save_block_out_msg_queue_proof(blkid, std::move(filename));
   } else if (word == "dispatchqueueinfo") {
     return parse_block_id_ext(blkid) && seekeoln() && get_dispatch_queue_info(blkid);
   } else if (word == "dispatchqueuemessages" || word == "dispatchqueuemessagesall") {
@@ -1879,6 +1884,58 @@ void TestNode::get_msg_queue_sizes_finish(std::vector<ton::BlockIdExt> blocks, s
   for (size_t i = 0; i < blocks.size(); ++i) {
     td::TerminalIO::out() << blocks[i].id.to_str() << "    " << sizes[i] << std::endl;
   }
+}
+
+bool TestNode::save_block_out_msg_queue_proof(ton::BlockIdExt block_id, std::string filename) {
+  if (!block_id.is_valid_full()) {
+    return set_error("out-message-queue proof requires a full block id");
+  }
+  if (!(ready_ && !client_.empty())) {
+    return set_error("server connection not ready");
+  }
+  auto query = ton::create_serialize_tl_object<ton::lite_api::liteServer_getBlockOutMsgQueueSize>(
+      1, ton::create_tl_lite_block_id(block_id), true);
+  LOG(INFO) << "requesting OutMsgQueueInfo proof for " << block_id;
+  return envelope_send_query(
+      std::move(query), [block_id, filename = std::move(filename)](td::Result<td::BufferSlice> result) mutable {
+        if (result.is_error()) {
+          LOG(ERROR) << "cannot obtain OutMsgQueueInfo proof: " << result.move_as_error();
+          return;
+        }
+        auto raw = result.move_as_ok();
+        auto bundle = raw.clone();
+        auto parsed = ton::fetch_tl_object<ton::lite_api::liteServer_blockOutMsgQueueSize>(std::move(raw), true);
+        if (parsed.is_error()) {
+          LOG(ERROR) << "cannot parse liteServer.blockOutMsgQueueSize: " << parsed.move_as_error();
+          return;
+        }
+        auto response = parsed.move_as_ok();
+        if (ton::create_block_id(response->id_) != block_id || !(response->mode_ & 1) || response->proof_.empty()) {
+          LOG(ERROR) << "OutMsgQueueInfo response is not bound to the requested block";
+          return;
+        }
+        auto roots = vm::std_boc_deserialize_multi(response->proof_.as_slice());
+        if (roots.is_error() || roots.ok().size() != 2) {
+          LOG(ERROR) << "OutMsgQueueInfo response has an invalid proof bundle";
+          return;
+        }
+        auto state_proof = vm::std_boc_serialize(roots.ok()[0]);
+        auto data_proof = vm::std_boc_serialize(roots.ok()[1]);
+        if (state_proof.is_error() || data_proof.is_error() ||
+            block::check_extract_state_proof(block_id, state_proof.ok().as_slice(), data_proof.ok().as_slice())
+                .is_error()) {
+          LOG(ERROR) << "OutMsgQueueInfo response failed block-bound proof validation";
+          return;
+        }
+        const auto size = bundle.size();
+        auto status = td::write_file(filename, std::move(bundle));
+        if (status.is_error()) {
+          LOG(ERROR) << "cannot save OutMsgQueueInfo proof to `" << filename << "`: " << status.move_as_error();
+          return;
+        }
+        td::TerminalIO::out() << "saved verified OutMsgQueueInfo proof into file `" << filename << "` (" << size
+                              << " bytes)" << std::endl;
+      });
 }
 
 bool TestNode::get_dispatch_queue_info(ton::BlockIdExt block_id) {
@@ -3137,61 +3194,57 @@ bool TestNode::save_library_bodies(std::vector<td::Bits256> libraries, std::stri
   auto query = ton::serialize_tl_object(
       ton::create_tl_object<ton::lite_api::liteServer_getLibraries>(std::move(query_libraries)), true);
   LOG(INFO) << "requesting " << libraries.size() << " public library bodies";
-  return envelope_send_query(
-      std::move(query),
-      [libraries = std::move(libraries), filename = std::move(filename)](
-          td::Result<td::BufferSlice> result) mutable {
-        if (result.is_error()) {
-          LOG(ERROR) << "cannot obtain public library bodies: " << result.move_as_error();
-          return;
-        }
-        auto raw = result.move_as_ok();
-        auto bundle = raw.clone();
-        auto parsed = ton::fetch_tl_object<ton::lite_api::liteServer_libraryResult>(std::move(raw), true);
-        if (parsed.is_error()) {
-          LOG(ERROR) << "cannot parse liteServer.libraryResult: " << parsed.move_as_error();
-          return;
-        }
-        auto response = parsed.move_as_ok();
-        std::set<td::Bits256> seen;
-        for (const auto& entry : response->result_) {
-          if (!std::binary_search(libraries.begin(), libraries.end(), entry->hash_)) {
-            LOG(ERROR) << "public-library response contains an unrequested hash " << entry->hash_.to_hex();
-            return;
-          }
-          if (!seen.insert(entry->hash_).second) {
-            LOG(ERROR) << "public-library response contains duplicate hash " << entry->hash_.to_hex();
-            return;
-          }
-          auto contents = vm::std_boc_deserialize(entry->data_.as_slice());
-          if (contents.is_error() || contents.ok().is_null() ||
-              !contents.ok()->get_hash().bits().equals(entry->hash_.cbits(), 256)) {
-            LOG(ERROR) << "public library " << entry->hash_.to_hex() << " has invalid content";
-            return;
-          }
-          if (contents.ok()->get_depth() > 512) {
-            LOG(ERROR) << "public library " << entry->hash_.to_hex() << " exceeds the VM depth limit";
-            return;
-          }
-        }
-        if (seen.size() != libraries.size()) {
-          LOG(ERROR) << "one or more requested public libraries are absent from the latest state";
-          return;
-        }
-        auto size = bundle.size();
-        auto status = td::write_file(filename, std::move(bundle));
-        if (status.is_error()) {
-          LOG(ERROR) << "cannot save public-library body bundle to `" << filename << "`: "
-                     << status.move_as_error();
-          return;
-        }
-        td::TerminalIO::out() << "saved content-hash-checked public-library body bundle into file `" << filename
-                              << "` (" << size << " bytes)" << std::endl;
-      });
+  return envelope_send_query(std::move(query), [libraries = std::move(libraries), filename = std::move(filename)](
+                                                   td::Result<td::BufferSlice> result) mutable {
+    if (result.is_error()) {
+      LOG(ERROR) << "cannot obtain public library bodies: " << result.move_as_error();
+      return;
+    }
+    auto raw = result.move_as_ok();
+    auto bundle = raw.clone();
+    auto parsed = ton::fetch_tl_object<ton::lite_api::liteServer_libraryResult>(std::move(raw), true);
+    if (parsed.is_error()) {
+      LOG(ERROR) << "cannot parse liteServer.libraryResult: " << parsed.move_as_error();
+      return;
+    }
+    auto response = parsed.move_as_ok();
+    std::set<td::Bits256> seen;
+    for (const auto& entry : response->result_) {
+      if (!std::binary_search(libraries.begin(), libraries.end(), entry->hash_)) {
+        LOG(ERROR) << "public-library response contains an unrequested hash " << entry->hash_.to_hex();
+        return;
+      }
+      if (!seen.insert(entry->hash_).second) {
+        LOG(ERROR) << "public-library response contains duplicate hash " << entry->hash_.to_hex();
+        return;
+      }
+      auto contents = vm::std_boc_deserialize(entry->data_.as_slice());
+      if (contents.is_error() || contents.ok().is_null() ||
+          !contents.ok()->get_hash().bits().equals(entry->hash_.cbits(), 256)) {
+        LOG(ERROR) << "public library " << entry->hash_.to_hex() << " has invalid content";
+        return;
+      }
+      if (contents.ok()->get_depth() > 512) {
+        LOG(ERROR) << "public library " << entry->hash_.to_hex() << " exceeds the VM depth limit";
+        return;
+      }
+    }
+    if (seen.size() != libraries.size()) {
+      LOG(ERROR) << "one or more requested public libraries are absent from the latest state";
+      return;
+    }
+    auto size = bundle.size();
+    auto status = td::write_file(filename, std::move(bundle));
+    if (status.is_error()) {
+      LOG(ERROR) << "cannot save public-library body bundle to `" << filename << "`: " << status.move_as_error();
+      return;
+    }
+    td::TerminalIO::out() << "saved content-hash-checked public-library body bundle into file `" << filename << "` ("
+                          << size << " bytes)" << std::endl;
+  });
 }
 
-bool TestNode::save_libraries_proof(ton::BlockIdExt blkid, std::vector<td::Bits256> libraries,
-                                    std::string filename) {
+bool TestNode::save_libraries_proof(ton::BlockIdExt blkid, std::vector<td::Bits256> libraries, std::string filename) {
   if (!blkid.is_masterchain_ext()) {
     return set_error("public-library proof requires a full masterchain block id");
   }
@@ -3206,9 +3259,8 @@ bool TestNode::save_libraries_proof(ton::BlockIdExt blkid, std::vector<td::Bits2
                                         true);
   LOG(INFO) << "requesting " << libraries.size() << " public libraries with proof for " << blkid;
   return envelope_send_query(
-      std::move(query),
-      [blkid, libraries = std::move(libraries), filename = std::move(filename)](
-          td::Result<td::BufferSlice> result) mutable {
+      std::move(query), [blkid, libraries = std::move(libraries),
+                         filename = std::move(filename)](td::Result<td::BufferSlice> result) mutable {
         if (result.is_error()) {
           LOG(ERROR) << "cannot obtain public-library proof: " << result.move_as_error();
           return;
@@ -3230,8 +3282,8 @@ bool TestNode::save_libraries_proof(ton::BlockIdExt blkid, std::vector<td::Bits2
           LOG(ERROR) << "public-library response omitted library bodies";
           return;
         }
-        auto checked_state = block::check_extract_state_proof(
-            blkid, response->state_proof_.as_slice(), response->data_proof_.as_slice());
+        auto checked_state = block::check_extract_state_proof(blkid, response->state_proof_.as_slice(),
+                                                              response->data_proof_.as_slice());
         if (checked_state.is_error()) {
           LOG(ERROR) << "invalid public-library state proof: " << checked_state.move_as_error();
           return;
@@ -3288,12 +3340,11 @@ bool TestNode::save_libraries_proof(ton::BlockIdExt blkid, std::vector<td::Bits2
         auto size = bundle.size();
         auto status = td::write_file(filename, std::move(bundle));
         if (status.is_error()) {
-          LOG(ERROR) << "cannot save public-library proof bundle to `" << filename << "`: "
-                     << status.move_as_error();
+          LOG(ERROR) << "cannot save public-library proof bundle to `" << filename << "`: " << status.move_as_error();
           return;
         }
-        td::TerminalIO::out() << "saved verified public-library proof bundle into file `" << filename << "` ("
-                              << size << " bytes)" << std::endl;
+        td::TerminalIO::out() << "saved verified public-library proof bundle into file `" << filename << "` (" << size
+                              << " bytes)" << std::endl;
       });
 }
 

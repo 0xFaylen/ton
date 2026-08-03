@@ -169,6 +169,8 @@ struct ReplayAccountArtifacts {
   std::vector<ton::validator::parallel_inbound::BasechainLimitContext> limit_contexts;
   std::vector<ShadowCoordinatorCandidate> coordinator_candidates;
   std::vector<ton::validator::parallel_inbound::AccountDictionaryDelta> account_dictionary_deltas;
+  std::map<Hash256, Hash256> inbound_message_transactions;
+  std::map<Hash256, Hash256> outbound_message_transactions;
 };
 
 struct TransactionKindCounts {
@@ -224,6 +226,9 @@ struct ReplayResult {
   std::size_t canonical_inbound_fin_descriptors = 0;
   std::size_t canonical_outbound_deq_imm_descriptors = 0;
   std::size_t canonical_fee_augmentations_validated = 0;
+  std::size_t in_msg_descriptors_bound = 0;
+  std::size_t out_msg_descriptors_bound = 0;
+  bool complete_message_descriptor_coverage = false;
   std::size_t basechain_limit_effects_applied = 0;
   std::size_t basechain_limit_accounts = 0;
   td::uint64 basechain_limit_gas = 0;
@@ -235,6 +240,7 @@ struct ReplayResult {
   std::size_t shadow_coordinator_queue_deletions = 0;
   std::size_t shadow_coordinator_new_messages = 0;
   std::size_t shard_account_proof_values_bound = 0;
+  bool predecessor_state_witness_loaded = false;
   bool collated_predecessor_witness_loaded = false;
   std::string predecessor_state_witness_source = "none";
   bool shard_accounts_predecessor_root_bound = false;
@@ -243,7 +249,9 @@ struct ReplayResult {
   std::size_t out_msg_queue_diff_additions = 0;
   std::size_t out_msg_queue_diff_deletions = 0;
   std::size_t out_msg_queue_diff_replacements = 0;
+  std::size_t out_msg_queue_additions_bound = 0;
   std::size_t out_msg_queue_deletions_bound = 0;
+  bool out_msg_queue_unchanged_root_commitment = false;
   std::string out_msg_queue_transition_status = "not_run";
   std::size_t augmented_dictionary_roots_validated = 0;
   td::uint32 consensus_max_block_bytes = 0;
@@ -513,9 +521,7 @@ td::Result<std::string> list_archive_blocks(const std::string& archive) {
   }));
   TRY_STATUS(std::move(scan_status));
 
-  std::sort(blocks.begin(), blocks.end(), [](const auto& left, const auto& right) {
-    return left.id.id < right.id.id;
-  });
+  std::sort(blocks.begin(), blocks.end(), [](const auto& left, const auto& right) { return left.id.id < right.id.id; });
   std::size_t nonempty_blocks = 0;
   std::size_t total_file_bytes = 0;
   std::size_t total_raw_transactions = 0;
@@ -951,8 +957,8 @@ td::Result<LoadedAccountProof> load_account_proof(const std::string& spec, const
       target.prev.size() == 1 && proof.blk == target.prev[0] && proof.shard_blk == target.prev[0];
   if (!masterchain_bound && !predecessor_bound) {
     return td::Status::Error(PSLICE() << "account proof reference must equal the target masterchain reference or exact "
-                                        "predecessor shard block: "
-                                     << proof.blk.to_str());
+                                         "predecessor shard block: "
+                                      << proof.blk.to_str());
   }
   TRY_RESULT(info, proof.validate(proof.blk, block::StdAddress(ton::basechainId, address)));
   TRY_RESULT(proof_roots, vm::std_boc_deserialize_multi(proof.proof.as_slice()));
@@ -971,6 +977,40 @@ td::Result<LoadedAccountProof> load_account_proof(const std::string& spec, const
     }
   }
   return LoadedAccountProof{address, proof.shard_blk, std::move(shard_account), std::move(proof_roots[1])};
+}
+
+td::Result<Ref<vm::Cell>> load_out_msg_queue_proof(const std::string& path, const BlockIdExt& expected_id) {
+  TRY_RESULT(data, td::read_file(path));
+  TRY_RESULT(response, ton::fetch_tl_object<ton::lite_api::liteServer_blockOutMsgQueueSize>(std::move(data), true));
+  if (ton::create_block_id(response->id_) != expected_id || !(response->mode_ & 1) || response->proof_.empty()) {
+    return td::Status::Error("OutMsgQueueInfo proof is not bound to the expected predecessor block");
+  }
+  TRY_RESULT(roots, vm::std_boc_deserialize_multi(response->proof_.as_slice()));
+  if (roots.size() != 2) {
+    return td::Status::Error("OutMsgQueueInfo proof bundle must contain exactly two roots");
+  }
+  TRY_RESULT(state_proof, vm::std_boc_serialize(roots[0]));
+  TRY_RESULT(data_proof, vm::std_boc_serialize(roots[1]));
+  TRY_RESULT(state, block::check_extract_state_proof(expected_id, state_proof.as_slice(), data_proof.as_slice()));
+
+  block::gen::ShardStateUnsplit::Record shard_state;
+  block::gen::OutMsgQueueInfo::Record queue_info;
+  if (!tlb::unpack_cell(state, shard_state) || !tlb::unpack_cell(shard_state.out_msg_queue_info, queue_info)) {
+    return td::Status::Error("cannot unpack verified OutMsgQueueInfo proof");
+  }
+  auto& extra = queue_info.extra.write();
+  if (!extra.fetch_long(1)) {
+    return td::Status::Error("verified OutMsgQueueInfo proof has no queue-size commitment");
+  }
+  block::gen::OutMsgQueueExtra::Record queue_extra;
+  if (!tlb::unpack(extra, queue_extra)) {
+    return td::Status::Error("cannot unpack verified OutMsgQueueExtra");
+  }
+  auto& size = queue_extra.out_queue_size.write();
+  if (!size.fetch_long(1) || size.prefetch_ulong(48) != static_cast<td::uint64>(response->size_)) {
+    return td::Status::Error("OutMsgQueueInfo proof size disagrees with the response");
+  }
+  return state;
 }
 
 td::Result<LoadedLibraryBodies> load_library_bodies(const std::vector<std::string>& paths) {
@@ -1211,6 +1251,53 @@ struct PartialStateDictionaries {
   Ref<vm::Cell> out_msg_queue_root;
 };
 
+struct PartialStateReferences {
+  Ref<vm::Cell> out_msg_queue_info;
+  Ref<vm::Cell> shard_accounts;
+};
+
+td::Result<PartialStateReferences> extract_partial_state_references(const Ref<vm::Cell>& state_root) {
+  if (state_root.is_null()) {
+    return td::Status::Error("cannot unpack partial ShardState references");
+  }
+  vm::CellSlice state{vm::NoVm(), state_root};
+  if (state.fetch_ulong(32) != 0x9023afe2U || !state.advance(328)) {
+    return td::Status::Error("partial state is not ShardStateUnsplit");
+  }
+  auto out_msg_queue_info = state.fetch_ref();
+  bool before_split = false;
+  if (out_msg_queue_info.is_null() || !state.fetch_bool_to(before_split)) {
+    return td::Status::Error("partial ShardState has no OutMsgQueueInfo");
+  }
+  auto shard_accounts = state.fetch_ref();
+  if (shard_accounts.is_null()) {
+    return td::Status::Error("partial ShardState has no ShardAccounts");
+  }
+  return PartialStateReferences{std::move(out_msg_queue_info), std::move(shard_accounts)};
+}
+
+td::Result<Ref<vm::Cell>> extract_out_msg_queue_wrapper(const Ref<vm::Cell>& out_msg_queue_info) {
+  if (out_msg_queue_info.is_null()) {
+    return td::Status::Error("cannot unpack partial OutMsgQueueInfo");
+  }
+  vm::CellSlice queue_info{vm::NoVm(), out_msg_queue_info};
+  bool queue_non_empty = false;
+  if (!queue_info.fetch_bool_to(queue_non_empty)) {
+    return td::Status::Error("partial OutMsgQueueInfo has no OutMsgQueue");
+  }
+  vm::CellBuilder out_queue;
+  if (!out_queue.store_bool_bool(queue_non_empty)) {
+    return td::Status::Error("cannot reconstruct partial OutMsgQueue wrapper");
+  }
+  if (queue_non_empty) {
+    auto dictionary_root = queue_info.fetch_ref();
+    if (dictionary_root.is_null() || !out_queue.store_ref_bool(std::move(dictionary_root))) {
+      return td::Status::Error("partial OutMsgQueue has no dictionary root");
+    }
+  }
+  return out_queue.finalize_novm();
+}
+
 td::Result<PartialStateDictionaries> extract_partial_state_dictionaries(const Ref<vm::Cell>& state_root) {
   if (state_root.is_null()) {
     return td::Status::Error("cannot unpack partial ShardState dictionaries");
@@ -1229,12 +1316,7 @@ td::Result<PartialStateDictionaries> extract_partial_state_dictionaries(const Re
     return td::Status::Error("partial ShardState has no ShardAccounts");
   }
 
-  auto queue_info = vm::load_cell_slice(std::move(out_msg_queue_info));
-  Ref<vm::CellSlice> out_queue;
-  if (!block::tlb::t_OutMsgQueue.fetch_to(queue_info, out_queue)) {
-    return td::Status::Error("partial OutMsgQueueInfo has no OutMsgQueue");
-  }
-  TRY_RESULT(out_msg_queue_root, serialize_slice(std::move(out_queue)));
+  TRY_RESULT(out_msg_queue_root, extract_out_msg_queue_wrapper(out_msg_queue_info));
   return PartialStateDictionaries{std::move(shard_accounts_root), std::move(out_msg_queue_root)};
 }
 
@@ -1252,6 +1334,121 @@ class StructuralAugmentedDictionary final : public vm::DictionaryFixed {
     return vm::dict::LabelParser::chk_size;
   }
 };
+
+td::Result<Ref<vm::Cell>> validate_inbound_descriptor(Ref<vm::CellSlice> descriptor, const Hash256& message_hash,
+                                                      const Hash256& transaction_hash) {
+  TRY_RESULT(descriptor_cell, serialize_slice(std::move(descriptor)));
+  auto descriptor_slice = vm::load_cell_slice_ref(descriptor_cell);
+  const auto tag = block::gen::t_InMsg.get_tag(*descriptor_slice);
+  Ref<vm::Cell> message;
+  Ref<vm::Cell> transaction;
+  if (tag == block::gen::InMsg::msg_import_ext) {
+    auto unpack_slice = descriptor_slice->clone();
+    if (!block::gen::t_InMsg.unpack_msg_import_ext(unpack_slice, message, transaction)) {
+      return td::Status::Error("cannot unpack canonical external inbound descriptor");
+    }
+  } else {
+    Ref<vm::Cell> envelope;
+    if (tag == block::gen::InMsg::msg_import_imm) {
+      block::gen::InMsg::Record_msg_import_imm in;
+      if (!tlb::csr_unpack(td::make_ref<vm::CellSlice>(descriptor_slice->clone()), in)) {
+        return td::Status::Error("cannot unpack canonical immediate inbound descriptor");
+      }
+      envelope = std::move(in.in_msg);
+      transaction = std::move(in.transaction);
+    } else if (tag == block::gen::InMsg::msg_import_fin) {
+      block::gen::InMsg::Record_msg_import_fin in;
+      if (!tlb::csr_unpack(td::make_ref<vm::CellSlice>(descriptor_slice->clone()), in)) {
+        return td::Status::Error("cannot unpack canonical final inbound descriptor");
+      }
+      envelope = std::move(in.in_msg);
+      transaction = std::move(in.transaction);
+    } else if (tag == block::gen::InMsg::msg_import_deferred_fin) {
+      block::gen::InMsg::Record_msg_import_deferred_fin in;
+      if (!tlb::csr_unpack(td::make_ref<vm::CellSlice>(descriptor_slice->clone()), in)) {
+        return td::Status::Error("cannot unpack canonical deferred inbound descriptor");
+      }
+      envelope = std::move(in.in_msg);
+      transaction = std::move(in.transaction);
+    } else if (tag == block::gen::InMsg::msg_import_ihr) {
+      block::gen::InMsg::Record_msg_import_ihr in;
+      if (!tlb::csr_unpack(td::make_ref<vm::CellSlice>(descriptor_slice->clone()), in)) {
+        return td::Status::Error("cannot unpack canonical IHR inbound descriptor");
+      }
+      message = std::move(in.msg);
+      transaction = std::move(in.transaction);
+    } else {
+      return td::Status::Error("canonical transaction refers to an unsupported inbound descriptor tag");
+    }
+    if (message.is_null()) {
+      block::tlb::MsgEnvelope::Record_std envelope_record;
+      if (envelope.is_null() || !tlb::unpack_cell(envelope, envelope_record)) {
+        return td::Status::Error("cannot unpack canonical inbound message envelope");
+      }
+      message = std::move(envelope_record.msg);
+    }
+  }
+  if (message.is_null() || transaction.is_null() || as_hash256(message->get_hash().as_bits256()) != message_hash ||
+      as_hash256(transaction->get_hash().as_bits256()) != transaction_hash) {
+    return td::Status::Error("canonical inbound descriptor binding failed");
+  }
+  return descriptor_cell;
+}
+
+td::Result<Ref<vm::Cell>> validate_generated_outbound_descriptor(Ref<vm::CellSlice> descriptor,
+                                                                 const Hash256& message_hash,
+                                                                 const Hash256& transaction_hash) {
+  TRY_RESULT(descriptor_cell, serialize_slice(std::move(descriptor)));
+  auto descriptor_slice = vm::load_cell_slice_ref(descriptor_cell);
+  const auto tag = block::gen::t_OutMsg.get_tag(*descriptor_slice);
+  Ref<vm::Cell> message;
+  Ref<vm::Cell> transaction;
+  if (tag == block::gen::OutMsg::msg_export_ext) {
+    auto unpack_slice = descriptor_slice->clone();
+    if (!block::gen::t_OutMsg.unpack_msg_export_ext(unpack_slice, message, transaction)) {
+      return td::Status::Error("cannot unpack canonical external outbound descriptor");
+    }
+  } else {
+    Ref<vm::Cell> envelope;
+    if (tag == block::gen::OutMsg::msg_export_new) {
+      block::gen::OutMsg::Record_msg_export_new out;
+      auto unpack_slice = td::make_ref<vm::CellSlice>(descriptor_slice->clone());
+      if (!tlb::csr_unpack(unpack_slice, out)) {
+        return td::Status::Error("cannot unpack canonical queued outbound descriptor");
+      }
+      envelope = std::move(out.out_msg);
+      transaction = std::move(out.transaction);
+    } else if (tag == block::gen::OutMsg::msg_export_imm) {
+      block::gen::OutMsg::Record_msg_export_imm out;
+      auto unpack_slice = td::make_ref<vm::CellSlice>(descriptor_slice->clone());
+      if (!tlb::csr_unpack(unpack_slice, out)) {
+        return td::Status::Error("cannot unpack canonical immediate outbound descriptor");
+      }
+      envelope = std::move(out.out_msg);
+      transaction = std::move(out.transaction);
+    } else if (tag == block::gen::OutMsg::msg_export_new_defer) {
+      block::gen::OutMsg::Record_msg_export_new_defer out;
+      auto unpack_slice = td::make_ref<vm::CellSlice>(descriptor_slice->clone());
+      if (!tlb::csr_unpack(unpack_slice, out)) {
+        return td::Status::Error("cannot unpack canonical deferred outbound descriptor");
+      }
+      envelope = std::move(out.out_msg);
+      transaction = std::move(out.transaction);
+    } else {
+      return td::Status::Error("canonical transaction refers to an unsupported outbound descriptor tag");
+    }
+    block::tlb::MsgEnvelope::Record_std envelope_record;
+    if (envelope.is_null() || !tlb::unpack_cell(envelope, envelope_record)) {
+      return td::Status::Error("cannot unpack canonical outbound message envelope");
+    }
+    message = std::move(envelope_record.msg);
+  }
+  if (message.is_null() || transaction.is_null() || as_hash256(message->get_hash().as_bits256()) != message_hash ||
+      as_hash256(transaction->get_hash().as_bits256()) != transaction_hash) {
+    return td::Status::Error("canonical outbound descriptor binding failed");
+  }
+  return descriptor_cell;
+}
 
 td::Result<std::pair<Ref<vm::Cell>, Ref<vm::Cell>>> extract_state_update_raw_views(const BlockContext& block_context) {
   if (block_context.state_update.is_null()) {
@@ -1360,6 +1557,77 @@ td::Result<Ref<vm::Cell>> build_predecessor_accounts_proof(const std::string& ar
   return accounts_root;
 }
 
+td::Result<Ref<vm::Cell>> build_target_update_predecessor_witness(const std::string& archive,
+                                                                  const HistoryBlocks& history,
+                                                                  const BlockContext& target,
+                                                                  const std::vector<LoadedAccountProof>& account_proofs,
+                                                                  const LoadedState* base_state,
+                                                                  const Ref<vm::Cell>& out_msg_queue_state_proof) {
+  if (account_proofs.empty()) {
+    return td::Status::Error("target-update witness requires predecessor-bound account proofs");
+  }
+  TRY_RESULT(update_views, extract_state_update_views(target));
+  const auto expected_root = update_views.first->get_hash();
+
+  if (out_msg_queue_state_proof.is_null()) {
+    return td::Status::Error("target-update witness requires an exact predecessor OutMsgQueueInfo proof");
+  }
+  if (out_msg_queue_state_proof->get_hash() != expected_root) {
+    return td::Status::Error("OutMsgQueueInfo proof does not match the target predecessor state root");
+  }
+  if (base_state != nullptr) {
+    if (base_state->id.shard_full() != target.id.shard_full() || base_state->id.seqno > target.prev[0].seqno()) {
+      return td::Status::Error("target-update witness base state is outside the target predecessor history");
+    }
+    TRY_RESULT(base_block, load_intermediate_block(archive, history, target, base_state->id.seqno));
+    if (base_block.id.id != base_state->id) {
+      return td::Status::Error("target-update witness base state does not match its producing block");
+    }
+    TRY_RESULT(base_state_hash, get_new_state_hash(base_block));
+    Ref<vm::Cell> current_root = base_state->root;
+    if (current_root.is_null() || td::Bits256(current_root->get_hash().bits()) != base_state_hash) {
+      return td::Status::Error("target-update witness base state root does not match its producing block");
+    }
+
+    BlockIdExt current_id = base_block.id;
+    for (ton::BlockSeqno seqno = base_state->id.seqno + 1; seqno <= target.prev[0].seqno(); ++seqno) {
+      TRY_RESULT(intermediate, load_intermediate_block(archive, history, target, seqno));
+      if (intermediate.prev.size() != 1 || intermediate.prev[0] != current_id) {
+        return td::Status::Error(PSLICE()
+                                 << "non-linear target-update witness history at " << intermediate.id.to_str());
+      }
+      TRY_RESULT(raw_views, extract_state_update_raw_views(intermediate));
+      if (current_root->get_hash() != raw_views.first->get_hash(0)) {
+        return td::Status::Error("target-update witness history does not match the current sparse state root");
+      }
+      TRY_RESULT(next_root, vm::MerkleUpdate::apply(current_root, intermediate.state_update));
+      if (next_root->get_hash() != raw_views.second->get_hash(0)) {
+        return td::Status::Error("target-update witness sparse state advance changed the committed root");
+      }
+      current_root = std::move(next_root);
+      current_id = intermediate.id;
+    }
+    if (current_id != target.prev[0] || current_root->get_hash() != expected_root) {
+      return td::Status::Error("target-update witness history does not reach the exact target predecessor");
+    }
+  }
+  for (const auto& account_proof : account_proofs) {
+    if (account_proof.shard_block != target.prev[0] || account_proof.state_proof.is_null()) {
+      return td::Status::Error("target-update witness requires exact predecessor account proofs");
+    }
+  }
+  std::vector<Ref<vm::Cell>> queue_proofs;
+  queue_proofs.reserve(2);
+  queue_proofs.push_back(vm::CellBuilder::create_merkle_proof(update_views.first));
+  queue_proofs.push_back(vm::CellBuilder::create_merkle_proof(out_msg_queue_state_proof));
+  TRY_RESULT(combined_queue_proof, ton::validator::parallel_inbound::merge_merkle_proofs_fast(queue_proofs));
+  TRY_RESULT(queue_witness, vm::MerkleProof::virtualize(std::move(combined_queue_proof)));
+  if (queue_witness->get_hash() != expected_root) {
+    return td::Status::Error("combined OutMsgQueueInfo witness changed the committed predecessor root");
+  }
+  return queue_witness;
+}
+
 td::Status collect_library_refs(Ref<vm::Cell> cell, std::set<vm::Cell::Hash>& visited, std::set<td::Bits256>& libraries,
                                 int depth) {
   if (cell.is_null()) {
@@ -1416,15 +1684,19 @@ std::string join_library_hashes(const std::set<td::Bits256>& libraries) {
 
 td::Result<ReplayResult> replay_transactions(
     const std::string& archive, const HistoryBlocks& history, const BlockContext& target,
-    const Ref<vm::Cell>& collated_predecessor_witness, const LoadedState* prev_state, const LoadedState& mc_state,
+    const Ref<vm::Cell>& predecessor_state_witness, const LoadedState* prev_state, const LoadedState& mc_state,
     const std::vector<LoadedAccountPart>& account_parts, const std::vector<LoadedAccountProof>& account_proofs,
     const LoadedLibraryBodies* library_bodies, bool profile_ed25519, bool validate_augmented_roots,
     ReplayExecutionMode execution_mode = ReplayExecutionMode::full,
-    ReplayAccountArtifacts* collected_artifacts = nullptr, const PreparedAccountReplay* prepared = nullptr) {
+    ReplayAccountArtifacts* collected_artifacts = nullptr, const PreparedAccountReplay* prepared = nullptr,
+    td::Slice predecessor_state_witness_source = {}) {
   td::Timer replay_timer;
   ReplayResult result;
   if ((execution_mode == ReplayExecutionMode::prepared_effects) != (prepared != nullptr)) {
     return td::Status::Error("prepared replay mode requires exactly one prepared account replay");
+  }
+  if (predecessor_state_witness.not_null() == predecessor_state_witness_source.empty()) {
+    return td::Status::Error("predecessor-state witness and provenance must be supplied together");
   }
   TRY_STATUS(verify_replay_scope(target));
   if ((prev_state != nullptr && prev_state->record.global_id != target.global_id) ||
@@ -1463,8 +1735,7 @@ td::Result<ReplayResult> replay_transactions(
   result.consensus_target_rate_ms = static_cast<td::uint64>(consensus_config.noncritical_params.target_rate.count());
   result.consensus_min_block_interval_ms =
       static_cast<td::uint64>(consensus_config.noncritical_params.min_block_interval.count());
-  TRY_RESULT(configured_block_limits,
-             config->get_block_limits(target.id.id.workchain == ton::masterchainId));
+  TRY_RESULT(configured_block_limits, config->get_block_limits(target.id.id.workchain == ton::masterchainId));
   const auto capture_limits = [](const block::ParamLimits& limits) {
     return ReplayResult::LimitTriplet{limits.underload(), limits.soft(), limits.hard()};
   };
@@ -1522,6 +1793,8 @@ td::Result<ReplayResult> replay_transactions(
   auto& canonical_limit_contexts = artifacts.limit_contexts;
   auto& shadow_coordinator_candidates = artifacts.coordinator_candidates;
   auto& account_dictionary_deltas = artifacts.account_dictionary_deltas;
+  auto& inbound_message_transactions = artifacts.inbound_message_transactions;
+  auto& outbound_message_transactions = artifacts.outbound_message_transactions;
   td::Status replay_status = td::Status::OK();
   std::set<td::Bits256> missing_libraries;
   bool accounts_ok = prepared != nullptr || account_blocks.check_for_each_extra([&](Ref<vm::CellSlice>
@@ -1603,216 +1876,230 @@ td::Result<ReplayResult> replay_transactions(
     block::CurrencyCollection derived_account_fees{0};
     bool first_account_transaction = true;
     bool account_missing_libraries = false;
-    bool transactions_ok = transactions.check_for_each_extra(
-        [&](Ref<vm::CellSlice> transaction_slice, Ref<vm::CellSlice>, td::ConstBitPtr tx_key, int tx_key_len) {
-          if (tx_key_len != 64) {
-            replay_status = td::Status::Error("invalid transaction key length");
+    bool transactions_ok = transactions.check_for_each_extra([&](Ref<vm::CellSlice> transaction_slice,
+                                                                 Ref<vm::CellSlice>, td::ConstBitPtr tx_key,
+                                                                 int tx_key_len) {
+      if (tx_key_len != 64) {
+        replay_status = td::Status::Error("invalid transaction key length");
+        return false;
+      }
+      auto transaction = transaction_slice->prefetch_ref();
+      if (transaction.is_null()) {
+        replay_status = td::Status::Error("transaction dictionary contains a null transaction");
+        return false;
+      }
+      TransactionKindCounts transaction_kind;
+      auto classified_kind = classify_and_count_transaction(transaction, transaction_kind);
+      if (classified_kind.is_error()) {
+        replay_status = classified_kind.move_as_error_prefix(PSTRING() << "transaction " << tx_key.get_uint(64)
+                                                                       << " of " << address.to_hex() << ": ");
+        return false;
+      }
+      const auto execution_kind = classified_kind.move_as_ok();
+      auto required = required_libraries(account, transaction);
+      if (required.is_error()) {
+        replay_status = required.move_as_error_prefix(PSTRING() << "transaction " << tx_key.get_uint(64) << " of "
+                                                                << address.to_hex() << ": ");
+        return false;
+      }
+      if (mc_state.boc == nullptr) {
+        std::set<td::Bits256> missing;
+        for (const auto& hash : required.ok()) {
+          if (library_bodies == nullptr || library_bodies->hashes.count(hash) == 0) {
+            missing.insert(hash);
+            missing_libraries.insert(hash);
+          }
+        }
+        if (!missing.empty()) {
+          account_missing_libraries = true;
+          return false;
+        }
+      }
+      const auto pre_account_state = account.total_state;
+      const auto pre_account_state_hash = pre_account_state->get_hash().as_bits256();
+      auto emulation = emulator.emulate_transaction(std::move(account), transaction);
+      if (emulation.is_error()) {
+        replay_status = emulation.move_as_error_prefix(PSTRING() << "transaction " << tx_key.get_uint(64) << " of "
+                                                                 << address.to_hex() << ": ");
+        return false;
+      }
+      auto emulated = emulation.move_as_ok();
+      CanonicalTransactionPayload canonical_payload{.transaction_root = emulated.transaction,
+                                                    .post_account_state = emulated.account.total_state,
+                                                    .proof_journals = {}};
+      auto payload_result = inspect_transaction_payload(canonical_payload);
+      if (!payload_result) {
+        replay_status = td::Status::Error(
+            PSTRING() << "canonical PSAE payload validation failed for transaction " << tx_key.get_uint(64) << " of "
+                      << address.to_hex() << ": " << ton::validator::parallel_inbound::to_string(payload_result.error));
+        return false;
+      }
+      const auto& payload_effects = payload_result.effects.value();
+      if (payload_effects.account != as_hash256(address) ||
+          payload_effects.pre_account_state_hash != as_hash256(pre_account_state_hash) ||
+          payload_effects.transaction_hash != as_hash256(transaction->get_hash().as_bits256()) ||
+          payload_effects.post_account_state_hash !=
+              as_hash256(emulated.account.total_state->get_hash().as_bits256()) ||
+          payload_effects.gas_used != emulated.vm.billed_gas_used) {
+        replay_status =
+            td::Status::Error(PSTRING() << "canonical PSAE payload fields disagree with replay for transaction "
+                                        << tx_key.get_uint(64) << " of " << address.to_hex());
+        return false;
+      }
+
+      td::optional<block::MsgMetadata> inbound_metadata;
+      std::optional<ton::validator::parallel_inbound::MessageKey> coordinator_message_key;
+      std::optional<InboundDescriptorContext> coordinator_inbound_descriptor;
+      std::optional<OutboundQueueKey> coordinator_queue_deletion;
+      if (payload_effects.inbound_message.not_null()) {
+        auto message_key = payload_effects.inbound_message->get_hash().bits();
+        auto declared_in_slice = in_msg_descr.lookup(message_key, 256);
+        if (declared_in_slice.is_null()) {
+          replay_status = td::Status::Error(PSTRING() << "canonical inbound message is absent from InMsgDescr for "
+                                                      << address.to_hex() << " at " << tx_key.get_uint(64));
+          return false;
+        }
+        const auto in_tag = block::gen::t_InMsg.get_tag(*declared_in_slice);
+        const bool has_envelope = in_tag == block::gen::InMsg::msg_import_imm ||
+                                  in_tag == block::gen::InMsg::msg_import_fin ||
+                                  in_tag == block::gen::InMsg::msg_import_deferred_fin;
+        if (has_envelope) {
+          auto envelope_cell = declared_in_slice->prefetch_ref();
+          block::tlb::MsgEnvelope::Record_std envelope;
+          if (envelope_cell.is_null() || !block::tlb::unpack_cell(envelope_cell, envelope) || envelope.msg.is_null() ||
+              envelope.msg->get_hash() != payload_effects.inbound_message->get_hash()) {
+            replay_status = td::Status::Error(PSTRING() << "canonical inbound envelope mismatch for "
+                                                        << address.to_hex() << " at " << tx_key.get_uint(64));
             return false;
           }
-          auto transaction = transaction_slice->prefetch_ref();
-          if (transaction.is_null()) {
-            replay_status = td::Status::Error("transaction dictionary contains a null transaction");
-            return false;
-          }
-          TransactionKindCounts transaction_kind;
-          auto classified_kind = classify_and_count_transaction(transaction, transaction_kind);
-          if (classified_kind.is_error()) {
-            replay_status = classified_kind.move_as_error_prefix(PSTRING() << "transaction " << tx_key.get_uint(64)
-                                                                           << " of " << address.to_hex() << ": ");
-            return false;
-          }
-          const auto execution_kind = classified_kind.move_as_ok();
-          auto required = required_libraries(account, transaction);
-          if (required.is_error()) {
-            replay_status = required.move_as_error_prefix(PSTRING() << "transaction " << tx_key.get_uint(64) << " of "
-                                                                    << address.to_hex() << ": ");
-            return false;
-          }
-          if (mc_state.boc == nullptr) {
-            std::set<td::Bits256> missing;
-            for (const auto& hash : required.ok()) {
-              if (library_bodies == nullptr || library_bodies->hashes.count(hash) == 0) {
-                missing.insert(hash);
-                missing_libraries.insert(hash);
-              }
-            }
-            if (!missing.empty()) {
-              account_missing_libraries = true;
-              return false;
-            }
-          }
-          const auto pre_account_state = account.total_state;
-          const auto pre_account_state_hash = pre_account_state->get_hash().as_bits256();
-          auto emulation = emulator.emulate_transaction(std::move(account), transaction);
-          if (emulation.is_error()) {
-            replay_status = emulation.move_as_error_prefix(PSTRING() << "transaction " << tx_key.get_uint(64) << " of "
-                                                                     << address.to_hex() << ": ");
-            return false;
-          }
-          auto emulated = emulation.move_as_ok();
-          CanonicalTransactionPayload canonical_payload{.transaction_root = emulated.transaction,
-                                                        .post_account_state = emulated.account.total_state,
-                                                        .proof_journals = {}};
-          auto payload_result = inspect_transaction_payload(canonical_payload);
-          if (!payload_result) {
-            replay_status =
-                td::Status::Error(PSTRING() << "canonical PSAE payload validation failed for transaction "
-                                            << tx_key.get_uint(64) << " of " << address.to_hex() << ": "
-                                            << ton::validator::parallel_inbound::to_string(payload_result.error));
-            return false;
-          }
-          const auto& payload_effects = payload_result.effects.value();
-          if (payload_effects.account != as_hash256(address) ||
-              payload_effects.pre_account_state_hash != as_hash256(pre_account_state_hash) ||
-              payload_effects.transaction_hash != as_hash256(transaction->get_hash().as_bits256()) ||
-              payload_effects.post_account_state_hash !=
-                  as_hash256(emulated.account.total_state->get_hash().as_bits256()) ||
-              payload_effects.gas_used != emulated.vm.billed_gas_used) {
-            replay_status =
-                td::Status::Error(PSTRING() << "canonical PSAE payload fields disagree with replay for transaction "
-                                            << tx_key.get_uint(64) << " of " << address.to_hex());
+          inbound_metadata = envelope.metadata;
+        }
+
+        if (in_tag == block::gen::InMsg::msg_import_fin) {
+          auto declared_in_cell = vm::CellBuilder().append_cellslice(declared_in_slice->clone()).finalize_novm();
+          block::gen::InMsg::Record_msg_import_fin declared_in;
+          if (declared_in_cell.is_null() || !block::gen::t_InMsg.cell_unpack(declared_in_cell, declared_in) ||
+              declared_in.transaction.is_null() || declared_in.transaction->get_hash() != transaction->get_hash()) {
+            replay_status = td::Status::Error(PSTRING() << "invalid msg_import_fin transaction binding for "
+                                                        << address.to_hex() << " at " << tx_key.get_uint(64));
             return false;
           }
 
-          td::optional<block::MsgMetadata> inbound_metadata;
-          std::optional<ton::validator::parallel_inbound::MessageKey> coordinator_message_key;
-          std::optional<InboundDescriptorContext> coordinator_inbound_descriptor;
-          std::optional<OutboundQueueKey> coordinator_queue_deletion;
-          if (payload_effects.inbound_message.not_null()) {
-            auto message_key = payload_effects.inbound_message->get_hash().bits();
-            auto declared_in_slice = in_msg_descr.lookup(message_key, 256);
-            if (declared_in_slice.is_null()) {
-              replay_status = td::Status::Error(PSTRING() << "canonical inbound message is absent from InMsgDescr for "
-                                                          << address.to_hex() << " at " << tx_key.get_uint(64));
-              return false;
-            }
-            const auto in_tag = block::gen::t_InMsg.get_tag(*declared_in_slice);
-            const bool has_envelope = in_tag == block::gen::InMsg::msg_import_imm ||
-                                      in_tag == block::gen::InMsg::msg_import_fin ||
-                                      in_tag == block::gen::InMsg::msg_import_deferred_fin;
-            if (has_envelope) {
-              auto envelope_cell = declared_in_slice->prefetch_ref();
-              block::tlb::MsgEnvelope::Record_std envelope;
-              if (envelope_cell.is_null() || !block::tlb::unpack_cell(envelope_cell, envelope) ||
-                  envelope.msg.is_null() || envelope.msg->get_hash() != payload_effects.inbound_message->get_hash()) {
-                replay_status = td::Status::Error(PSTRING() << "canonical inbound envelope mismatch for "
-                                                            << address.to_hex() << " at " << tx_key.get_uint(64));
-                return false;
-              }
-              inbound_metadata = envelope.metadata;
-            }
-
-            if (in_tag == block::gen::InMsg::msg_import_fin) {
-              auto declared_in_cell = vm::CellBuilder().append_cellslice(declared_in_slice->clone()).finalize_novm();
-              block::gen::InMsg::Record_msg_import_fin declared_in;
-              if (declared_in_cell.is_null() || !block::gen::t_InMsg.cell_unpack(declared_in_cell, declared_in) ||
-                  declared_in.transaction.is_null() || declared_in.transaction->get_hash() != transaction->get_hash()) {
-                replay_status = td::Status::Error(PSTRING() << "invalid msg_import_fin transaction binding for "
-                                                            << address.to_hex() << " at " << tx_key.get_uint(64));
-                return false;
-              }
-
-              bool dequeued_from_current_shard = false;
-              td::Ref<vm::Cell> declared_out_cell;
-              auto declared_out_slice = out_msg_descr.lookup(message_key, 256);
-              if (declared_out_slice.not_null() &&
-                  block::gen::t_OutMsg.get_tag(*declared_out_slice) == block::gen::OutMsg::msg_export_deq_imm) {
-                dequeued_from_current_shard = true;
-                declared_out_cell = vm::CellBuilder().append_cellslice(declared_out_slice->clone()).finalize_novm();
-              }
-
-              auto descriptors = ton::validator::parallel_inbound::materialize_inbound_internal_descriptors(
-                  payload_effects,
-                  {.message_envelope = declared_in.in_msg, .dequeued_from_current_shard = dequeued_from_current_shard});
-              if (!descriptors || descriptors.delta->in_msg_descriptor->get_hash() != declared_in_cell->get_hash() ||
-                  (dequeued_from_current_shard &&
-                   (declared_out_cell.is_null() || descriptors.delta->out_msg_descriptor.is_null() ||
-                    descriptors.delta->out_msg_descriptor->get_hash() != declared_out_cell->get_hash())) ||
-                  (!dequeued_from_current_shard && descriptors.delta->out_msg_descriptor.not_null())) {
-                replay_status = td::Status::Error(PSTRING() << "canonical inbound descriptor reconstruction failed for "
-                                                            << address.to_hex() << " at " << tx_key.get_uint(64));
-                return false;
-              }
-
-              block::tlb::MsgEnvelope::Record_std inbound_envelope;
-              block::gen::CommonMsgInfo::Record_int_msg_info inbound_info;
-              if (!block::tlb::unpack_cell(declared_in.in_msg, inbound_envelope) ||
-                  !block::tlb::unpack_cell_inexact(inbound_envelope.msg, inbound_info)) {
-                replay_status = td::Status::Error(PSTRING() << "cannot derive canonical inbound queue order for "
-                                                            << address.to_hex() << " at " << tx_key.get_uint(64));
-                return false;
-              }
-              coordinator_message_key = ton::validator::parallel_inbound::MessageKey{
-                  inbound_envelope.emitted_lt ? inbound_envelope.emitted_lt.value() : inbound_info.created_lt,
-                  payload_effects.inbound_message_hash.value()};
-              coordinator_inbound_descriptor = InboundDescriptorContext{
-                  .message_envelope = declared_in.in_msg, .dequeued_from_current_shard = dequeued_from_current_shard};
-              if (dequeued_from_current_shard) {
-                OutboundQueueKey queue_key;
-                if (!block::compute_out_msg_queue_key(declared_in.in_msg, queue_key)) {
-                  replay_status = td::Status::Error(PSTRING() << "cannot derive outbound queue key for "
-                                                              << address.to_hex() << " at " << tx_key.get_uint(64));
-                  return false;
-                }
-                coordinator_queue_deletion = queue_key;
-              }
-              ++result.canonical_inbound_fin_descriptors;
-              result.canonical_outbound_deq_imm_descriptors += dequeued_from_current_shard;
-            }
+          bool dequeued_from_current_shard = false;
+          td::Ref<vm::Cell> declared_out_cell;
+          auto declared_out_slice = out_msg_descr.lookup(message_key, 256);
+          if (declared_out_slice.not_null() &&
+              block::gen::t_OutMsg.get_tag(*declared_out_slice) == block::gen::OutMsg::msg_export_deq_imm) {
+            dequeued_from_current_shard = true;
+            declared_out_cell = vm::CellBuilder().append_cellslice(declared_out_slice->clone()).finalize_novm();
           }
 
-          auto outbound_metadata = inbound_metadata;
-          if (outbound_metadata) {
-            ++outbound_metadata.value().depth;
-          }
-          auto registrations = ton::validator::parallel_inbound::materialize_outbound_registrations(
+          auto descriptors = ton::validator::parallel_inbound::materialize_inbound_internal_descriptors(
               payload_effects,
-              {.metadata_enabled = config->has_capability(ton::capMsgMetadata), .metadata = outbound_metadata});
-          if (!registrations || registrations.batch->messages.size() != payload_effects.outbound_messages.size()) {
-            replay_status = td::Status::Error(PSTRING() << "canonical outbound registration failed for transaction "
-                                                        << tx_key.get_uint(64) << " of " << address.to_hex());
+              {.message_envelope = declared_in.in_msg, .dequeued_from_current_shard = dequeued_from_current_shard});
+          if (!descriptors || descriptors.delta->in_msg_descriptor->get_hash() != declared_in_cell->get_hash() ||
+              (dequeued_from_current_shard &&
+               (declared_out_cell.is_null() || descriptors.delta->out_msg_descriptor.is_null() ||
+                descriptors.delta->out_msg_descriptor->get_hash() != declared_out_cell->get_hash())) ||
+              (!dequeued_from_current_shard && descriptors.delta->out_msg_descriptor.not_null())) {
+            replay_status = td::Status::Error(PSTRING() << "canonical inbound descriptor reconstruction failed for "
+                                                        << address.to_hex() << " at " << tx_key.get_uint(64));
             return false;
           }
-          result.canonical_outbound_registrations += registrations.batch->messages.size();
-          ++result.canonical_payloads_validated;
-          result.canonical_payload_out_messages += payload_effects.outbound_messages.size();
-          derived_account_fees += payload_effects.total_fees;
-          if (!derived_account_fees.is_valid()) {
-            replay_status =
-                td::Status::Error(PSTRING() << "canonical fee accumulation failed for " << address.to_hex());
+
+          block::tlb::MsgEnvelope::Record_std inbound_envelope;
+          block::gen::CommonMsgInfo::Record_int_msg_info inbound_info;
+          if (!block::tlb::unpack_cell(declared_in.in_msg, inbound_envelope) ||
+              !block::tlb::unpack_cell_inexact(inbound_envelope.msg, inbound_info)) {
+            replay_status = td::Status::Error(PSTRING() << "cannot derive canonical inbound queue order for "
+                                                        << address.to_hex() << " at " << tx_key.get_uint(64));
             return false;
           }
-          canonical_limit_effects.push_back(payload_effects);
-          canonical_limit_contexts.push_back({.account_is_first = first_account_transaction, .charge_gas = true});
-          if (coordinator_message_key) {
-            CHECK(coordinator_inbound_descriptor);
-            shadow_coordinator_candidates.push_back(
-                {.work = {.key = coordinator_message_key.value(),
-                          .account = std::optional<Hash256>{payload_effects.account}},
-                 .effects = payload_effects,
-                 .context = {.limit = {.account_is_first = first_account_transaction, .charge_gas = true},
-                             .outbound_registration = {.metadata_enabled = config->has_capability(ton::capMsgMetadata),
-                                                       .metadata = outbound_metadata},
-                             .inbound_descriptor = coordinator_inbound_descriptor,
-                             .outbound_queue_deletion = coordinator_queue_deletion},
-                 .pre_account_state = pre_account_state});
+          coordinator_message_key = ton::validator::parallel_inbound::MessageKey{
+              inbound_envelope.emitted_lt ? inbound_envelope.emitted_lt.value() : inbound_info.created_lt,
+              payload_effects.inbound_message_hash.value()};
+          coordinator_inbound_descriptor = InboundDescriptorContext{
+              .message_envelope = declared_in.in_msg, .dequeued_from_current_shard = dequeued_from_current_shard};
+          if (dequeued_from_current_shard) {
+            OutboundQueueKey queue_key;
+            if (!block::compute_out_msg_queue_key(declared_in.in_msg, queue_key)) {
+              replay_status = td::Status::Error(PSTRING() << "cannot derive outbound queue key for " << address.to_hex()
+                                                          << " at " << tx_key.get_uint(64));
+              return false;
+            }
+            coordinator_queue_deletion = queue_key;
           }
-          first_account_transaction = false;
-          ++result.transactions;
-          result.transaction_kinds.add(transaction_kind);
-          auto& account_work = result.account_work[address];
-          ++account_work.transactions;
-          account_work.transaction_seconds += emulated.elapsed_time;
-          if (emulated.vm.executed) {
-            ++result.tvm_transactions;
-            account_work.tvm_seconds += emulated.vm.time.real;
-            result.hotpaths.record(emulated.vm.code_hash, target.id.id.workchain, address, emulated.vm.time,
-                                   emulated.vm.vm_gas_used, emulated.vm.billed_gas_used, emulated.vm.vm_steps,
-                                   emulated.vm.ed25519_verifications, emulated.vm.ed25519_time, execution_kind);
-          }
-          account = std::move(emulated.account);
-          return true;
-        });
+          ++result.canonical_inbound_fin_descriptors;
+          result.canonical_outbound_deq_imm_descriptors += dequeued_from_current_shard;
+        }
+      }
+
+      auto outbound_metadata = inbound_metadata;
+      if (outbound_metadata) {
+        ++outbound_metadata.value().depth;
+      }
+      auto registrations = ton::validator::parallel_inbound::materialize_outbound_registrations(
+          payload_effects,
+          {.metadata_enabled = config->has_capability(ton::capMsgMetadata), .metadata = outbound_metadata});
+      if (!registrations || registrations.batch->messages.size() != payload_effects.outbound_messages.size()) {
+        replay_status = td::Status::Error(PSTRING() << "canonical outbound registration failed for transaction "
+                                                    << tx_key.get_uint(64) << " of " << address.to_hex());
+        return false;
+      }
+      if (payload_effects.inbound_message_hash &&
+          !inbound_message_transactions
+               .emplace(payload_effects.inbound_message_hash.value(), payload_effects.transaction_hash)
+               .second) {
+        replay_status = td::Status::Error(PSTRING() << "duplicate canonical inbound message for transaction "
+                                                    << tx_key.get_uint(64) << " of " << address.to_hex());
+        return false;
+      }
+      for (const auto& outbound : payload_effects.outbound_messages) {
+        if (!outbound_message_transactions.emplace(outbound.message_hash, payload_effects.transaction_hash).second) {
+          replay_status = td::Status::Error(PSTRING() << "duplicate canonical outbound message for transaction "
+                                                      << tx_key.get_uint(64) << " of " << address.to_hex());
+          return false;
+        }
+      }
+      result.canonical_outbound_registrations += registrations.batch->messages.size();
+      ++result.canonical_payloads_validated;
+      result.canonical_payload_out_messages += payload_effects.outbound_messages.size();
+      derived_account_fees += payload_effects.total_fees;
+      if (!derived_account_fees.is_valid()) {
+        replay_status = td::Status::Error(PSTRING() << "canonical fee accumulation failed for " << address.to_hex());
+        return false;
+      }
+      canonical_limit_effects.push_back(payload_effects);
+      canonical_limit_contexts.push_back({.account_is_first = first_account_transaction, .charge_gas = true});
+      if (coordinator_message_key) {
+        CHECK(coordinator_inbound_descriptor);
+        shadow_coordinator_candidates.push_back(
+            {.work = {.key = coordinator_message_key.value(),
+                      .account = std::optional<Hash256>{payload_effects.account}},
+             .effects = payload_effects,
+             .context = {.limit = {.account_is_first = first_account_transaction, .charge_gas = true},
+                         .outbound_registration = {.metadata_enabled = config->has_capability(ton::capMsgMetadata),
+                                                   .metadata = outbound_metadata},
+                         .inbound_descriptor = coordinator_inbound_descriptor,
+                         .outbound_queue_deletion = coordinator_queue_deletion},
+             .pre_account_state = pre_account_state});
+      }
+      first_account_transaction = false;
+      ++result.transactions;
+      result.transaction_kinds.add(transaction_kind);
+      auto& account_work = result.account_work[address];
+      ++account_work.transactions;
+      account_work.transaction_seconds += emulated.elapsed_time;
+      if (emulated.vm.executed) {
+        ++result.tvm_transactions;
+        account_work.tvm_seconds += emulated.vm.time.real;
+        result.hotpaths.record(emulated.vm.code_hash, target.id.id.workchain, address, emulated.vm.time,
+                               emulated.vm.vm_gas_used, emulated.vm.billed_gas_used, emulated.vm.vm_steps,
+                               emulated.vm.ed25519_verifications, emulated.vm.ed25519_time, execution_kind);
+      }
+      account = std::move(emulated.account);
+      return true;
+    });
     if (!transactions_ok && account_missing_libraries) {
       return true;
     }
@@ -1975,15 +2262,55 @@ td::Result<ReplayResult> replay_transactions(
     };
     try {
       TRY_RESULT(update_views, extract_state_update_views(target));
-      result.collated_predecessor_witness_loaded = collated_predecessor_witness.not_null();
+      TRY_RESULT(raw_update_views, extract_state_update_raw_views(target));
+      TRY_RESULT(old_state_references, extract_partial_state_references(raw_update_views.first));
+      TRY_RESULT(new_state_references, extract_partial_state_references(raw_update_views.second));
+      bool queue_root_commitment_unchanged =
+          old_state_references.out_msg_queue_info->get_hash(0) == new_state_references.out_msg_queue_info->get_hash(0);
+      Ref<vm::Cell> old_raw_out_msg_queue_wrapper;
+      Ref<vm::Cell> new_raw_out_msg_queue_wrapper;
+      if (!queue_root_commitment_unchanged) {
+        TRY_RESULT_ASSIGN(old_raw_out_msg_queue_wrapper,
+                          extract_out_msg_queue_wrapper(old_state_references.out_msg_queue_info));
+        TRY_RESULT_ASSIGN(new_raw_out_msg_queue_wrapper,
+                          extract_out_msg_queue_wrapper(new_state_references.out_msg_queue_info));
+        queue_root_commitment_unchanged =
+            old_raw_out_msg_queue_wrapper->get_hash() == new_raw_out_msg_queue_wrapper->get_hash();
+      }
+      result.predecessor_state_witness_loaded = predecessor_state_witness.not_null();
+      result.collated_predecessor_witness_loaded = predecessor_state_witness_source == "collated_data";
       PartialStateDictionaries old_state_dictionaries;
       PartialStateDictionaries new_state_dictionaries;
       result.predecessor_state_witness_source =
-          collated_predecessor_witness.not_null() ? "collated_data" : "not_available";
-      if (collated_predecessor_witness.not_null()) {
-        root_stage = "extract_state_dictionaries";
-        TRY_RESULT_ASSIGN(old_state_dictionaries, extract_partial_state_dictionaries(collated_predecessor_witness));
-        TRY_RESULT_ASSIGN(new_state_dictionaries, extract_partial_state_dictionaries(update_views.second));
+          predecessor_state_witness.not_null() ? predecessor_state_witness_source.str() : "not_available";
+      if (predecessor_state_witness.not_null()) {
+        if (predecessor_state_witness_source == "target_block_state_update_hindsight" &&
+            queue_root_commitment_unchanged) {
+          vm::AugmentedDictionary unchanged_queue_placeholder{352, block::tlb::aug_OutMsgQueue};
+          old_state_dictionaries.out_msg_queue_root = unchanged_queue_placeholder.get_wrapped_dict_root();
+          new_state_dictionaries.out_msg_queue_root = unchanged_queue_placeholder.get_wrapped_dict_root();
+          old_state_dictionaries.shard_accounts_root = old_state_references.shard_accounts;
+          new_state_dictionaries.shard_accounts_root = new_state_references.shard_accounts;
+          result.out_msg_queue_unchanged_root_commitment = true;
+        } else if (predecessor_state_witness_source == "target_block_state_update_hindsight") {
+          if (old_raw_out_msg_queue_wrapper.is_null() || new_raw_out_msg_queue_wrapper.is_null()) {
+            return td::Status::Error("target MerkleUpdate has no structural OutMsgQueue transition");
+          }
+          old_state_dictionaries.out_msg_queue_root = old_raw_out_msg_queue_wrapper;
+          new_state_dictionaries.out_msg_queue_root = new_raw_out_msg_queue_wrapper;
+          old_state_dictionaries.shard_accounts_root = old_state_references.shard_accounts;
+          new_state_dictionaries.shard_accounts_root = new_state_references.shard_accounts;
+        } else {
+          root_stage = "extract_state_dictionaries";
+          TRY_RESULT_ASSIGN(old_state_dictionaries, extract_partial_state_dictionaries(predecessor_state_witness));
+          root_stage = "apply_target_state_update";
+          TRY_RESULT(next_state_witness, vm::MerkleUpdate::apply(predecessor_state_witness, target.state_update));
+          if (next_state_witness->get_hash() != update_views.second->get_hash()) {
+            return td::Status::Error("target state update changed the committed result root");
+          }
+          root_stage = "extract_new_state_dictionaries";
+          TRY_RESULT_ASSIGN(new_state_dictionaries, extract_partial_state_dictionaries(next_state_witness));
+        }
       }
       root_stage = "extract_predecessor_accounts_root";
       TRY_RESULT(target_predecessor_accounts_root, extract_partial_shard_accounts_root(update_views.first));
@@ -1999,31 +2326,82 @@ td::Result<ReplayResult> replay_transactions(
       root_stage = "strip_target_descriptors";
       block::tlb::Aug_InMsgDescr in_augmentation{config->get_global_version()};
       block::tlb::Aug_OutMsgDescr out_augmentation{config->get_global_version()};
-      vm::AugmentedDictionary in_baseline{vm::load_cell_slice_ref(target.in_msg_descr), 256, in_augmentation};
-      vm::AugmentedDictionary out_baseline{vm::load_cell_slice_ref(target.out_msg_descr), 256, out_augmentation};
-      for (const auto& [hash, descriptor] : coordinator_state.in_msg_descriptors) {
-        auto removed = in_baseline.lookup_delete(as_dictionary_key(hash));
-        if (removed.is_null()) {
-          return td::Status::Error("canonical InMsg descriptor is absent from target root");
+      auto in_baseline = std::make_unique<vm::AugmentedDictionary>(256, in_augmentation);
+      auto out_baseline = std::make_unique<vm::AugmentedDictionary>(256, out_augmentation);
+      std::map<Hash256, Ref<vm::Cell>> root_in_descriptors = coordinator_state.in_msg_descriptors;
+      std::map<Hash256, Ref<vm::Cell>> root_out_descriptors = coordinator_state.out_msg_descriptors;
+      if (predecessor_state_witness.not_null()) {
+        root_stage = "bind_complete_target_descriptors";
+        vm::AugmentedDictionary target_in_descriptors{vm::load_cell_slice_ref(target.in_msg_descr), 256,
+                                                      in_augmentation};
+        vm::AugmentedDictionary target_out_descriptors{vm::load_cell_slice_ref(target.out_msg_descr), 256,
+                                                       out_augmentation};
+        std::size_t target_in_count = 0;
+        std::size_t target_out_count = 0;
+        if (!target_in_descriptors.check_for_each([&](Ref<vm::CellSlice>, td::ConstBitPtr, int key_len) {
+              ++target_in_count;
+              return key_len == 256;
+            }) ||
+            !target_out_descriptors.check_for_each([&](Ref<vm::CellSlice>, td::ConstBitPtr, int key_len) {
+              ++target_out_count;
+              return key_len == 256;
+            })) {
+          return td::Status::Error("cannot enumerate target message descriptors");
         }
-        TRY_RESULT(removed_cell, serialize_slice(std::move(removed)));
-        if (removed_cell->get_hash() != descriptor->get_hash()) {
-          return td::Status::Error("canonical InMsg descriptor value disagrees with target root");
+        if (target_in_count != inbound_message_transactions.size() ||
+            target_out_count != outbound_message_transactions.size()) {
+          return td::Status::Error("canonical transaction messages do not cover the target descriptor roots");
         }
-      }
-      for (const auto& [hash, descriptor] : coordinator_state.out_msg_descriptors) {
-        auto removed = out_baseline.lookup_delete(as_dictionary_key(hash));
-        if (removed.is_null()) {
-          return td::Status::Error("canonical OutMsg descriptor is absent from target root");
+        root_in_descriptors.clear();
+        for (const auto& [message_hash, transaction_hash] : inbound_message_transactions) {
+          auto descriptor = target_in_descriptors.lookup(as_dictionary_key(message_hash));
+          if (descriptor.is_null()) {
+            return td::Status::Error("canonical inbound message is absent from target InMsgDescr");
+          }
+          TRY_RESULT(descriptor_cell,
+                     validate_inbound_descriptor(std::move(descriptor), message_hash, transaction_hash));
+          root_in_descriptors.emplace(message_hash, std::move(descriptor_cell));
+          ++result.in_msg_descriptors_bound;
         }
-        TRY_RESULT(removed_cell, serialize_slice(std::move(removed)));
-        if (removed_cell->get_hash() != descriptor->get_hash()) {
-          return td::Status::Error("canonical OutMsg descriptor value disagrees with target root");
+        root_out_descriptors.clear();
+        for (const auto& [message_hash, transaction_hash] : outbound_message_transactions) {
+          auto descriptor = target_out_descriptors.lookup(as_dictionary_key(message_hash));
+          if (descriptor.is_null()) {
+            return td::Status::Error("canonical outbound message is absent from target OutMsgDescr");
+          }
+          TRY_RESULT(descriptor_cell,
+                     validate_generated_outbound_descriptor(std::move(descriptor), message_hash, transaction_hash));
+          root_out_descriptors.emplace(message_hash, std::move(descriptor_cell));
+          ++result.out_msg_descriptors_bound;
+        }
+        result.complete_message_descriptor_coverage = true;
+      } else {
+        in_baseline = std::make_unique<vm::AugmentedDictionary>(vm::load_cell_slice_ref(target.in_msg_descr), 256,
+                                                                in_augmentation);
+        out_baseline = std::make_unique<vm::AugmentedDictionary>(vm::load_cell_slice_ref(target.out_msg_descr), 256,
+                                                                 out_augmentation);
+        for (const auto& [hash, descriptor] : coordinator_state.in_msg_descriptors) {
+          auto removed = in_baseline->lookup_delete(as_dictionary_key(hash));
+          if (removed.is_null()) {
+            return td::Status::Error("canonical InMsg descriptor is absent from target root");
+          }
+          TRY_RESULT(removed_cell, serialize_slice(std::move(removed)));
+          if (removed_cell->get_hash() != descriptor->get_hash()) {
+            return td::Status::Error("canonical InMsg descriptor value disagrees with target root");
+          }
+        }
+        for (const auto& [hash, descriptor] : coordinator_state.out_msg_descriptors) {
+          auto removed = out_baseline->lookup_delete(as_dictionary_key(hash));
+          if (removed.is_null()) {
+            return td::Status::Error("canonical OutMsg descriptor is absent from target root");
+          }
+          TRY_RESULT(removed_cell, serialize_slice(std::move(removed)));
+          if (removed_cell->get_hash() != descriptor->get_hash()) {
+            return td::Status::Error("canonical OutMsg descriptor value disagrees with target root");
+          }
         }
       }
       record_root_phase(result.phase_root_descriptor_baseline_seconds);
-
-      std::vector<ton::validator::parallel_inbound::QueueDictionaryDelta> queue_deltas;
 
       root_stage = "bind_account_proofs";
       vm::AugmentedDictionary predecessor_accounts{
@@ -2049,128 +2427,200 @@ td::Result<ReplayResult> replay_transactions(
       }
       record_root_phase(result.phase_root_account_binding_seconds);
 
-      if (collated_predecessor_witness.not_null()) {
-        root_stage = "apply_account_state_transition";
-        ton::validator::parallel_inbound::AugmentedDictionarySeed account_transition_seed{
-            .global_version = config->get_global_version(),
-            .shard_accounts_root = old_state_dictionaries.shard_accounts_root,
-            .in_msg_descr_root = in_baseline.get_wrapped_dict_root(),
-            .out_msg_descr_root = out_baseline.get_wrapped_dict_root(),
-            .out_msg_queue_root = old_state_dictionaries.out_msg_queue_root};
-        auto account_transition = ton::validator::parallel_inbound::apply_augmented_dictionary_deltas_atomic(
-            account_transition_seed, account_dictionary_deltas, {}, {}, {});
-        if (!account_transition) {
-          return td::Status::Error(
-              PSTRING() << "predecessor witness cannot apply the canonical ShardAccounts transition at item "
-                        << (account_transition.item_index ? td::to_string(account_transition.item_index.value())
-                                                          : std::string("none"))
-                        << ": " << ton::validator::parallel_inbound::to_string(account_transition.error)
-                        << (account_transition.error_detail.empty() ? std::string()
-                                                                    : ": " + account_transition.error_detail));
-        }
-        if (account_transition.roots->shard_accounts_root->get_hash() !=
-            new_state_dictionaries.shard_accounts_root->get_hash()) {
-          return td::Status::Error("canonical ShardAccounts transition disagrees with target Merkle-update new root");
-        }
-        result.shard_accounts_transition_validated = true;
-        result.shard_accounts_transition_status = "exact_root_match";
-
-        root_stage = "scan_out_msg_queue_transition";
-        vm::AugmentedDictionary old_out_queue{vm::load_cell_slice_ref(old_state_dictionaries.out_msg_queue_root), 352,
-                                              block::tlb::aug_OutMsgQueue};
-        vm::AugmentedDictionary new_out_queue{vm::load_cell_slice_ref(new_state_dictionaries.out_msg_queue_root), 352,
-                                              block::tlb::aug_OutMsgQueue};
-        root_stage = "bind_out_msg_queue_deletions";
-        for (const auto& context : coordinator_contexts) {
-          if (!context.outbound_queue_deletion) {
+      if (predecessor_state_witness.not_null()) {
+        root_stage = "bind_new_shard_account_values";
+        TRY_RESULT(target_new_accounts_root, extract_partial_shard_accounts_root(update_views.second));
+        vm::AugmentedDictionary target_new_accounts{
+            vm::DictNonEmpty(), vm::load_cell_slice_ref(target_new_accounts_root), 256, block::tlb::aug_ShardAccounts};
+        for (std::size_t i = 0; i < account_dictionary_deltas.size(); ++i) {
+          const auto& delta = account_dictionary_deltas[i];
+          auto target_value = target_new_accounts.lookup(as_dictionary_key(delta.account));
+          if (target_value.is_null() != !delta.exists_after) {
+            return td::Status::Error(PSLICE() << "new ShardAccounts existence disagrees at item " << i);
+          }
+          if (!delta.exists_after) {
             continue;
           }
-          auto old_value = old_out_queue.lookup(context.outbound_queue_deletion.value());
-          auto new_value = new_out_queue.lookup(context.outbound_queue_deletion.value());
-          if (old_value.is_null() || new_value.not_null() || !context.inbound_descriptor) {
-            return td::Status::Error("coordinator queue deletion disagrees with target OutMsgQueue update views");
+          if (delta.post_account_state.is_null()) {
+            return td::Status::Error(PSLICE() << "ShardAccounts delta has no post-state at item " << i);
           }
-          TRY_RESULT(old_value_cell, serialize_slice(std::move(old_value)));
-          vm::CellSlice enqueued{vm::NoVm(), old_value_cell};
-          auto envelope =
-              enqueued.size() == 64 && enqueued.size_refs() == 1 ? enqueued.prefetch_ref() : Ref<vm::Cell>{};
-          if (envelope.is_null() || envelope->get_hash() != context.inbound_descriptor->message_envelope->get_hash()) {
-            return td::Status::Error("predecessor OutMsgQueue value disagrees with canonical inbound envelope");
+          vm::CellBuilder builder;
+          if (!(builder.store_ref_bool(delta.post_account_state) &&
+                builder.store_bytes_bool(delta.last_transaction_hash.data(), delta.last_transaction_hash.size()) &&
+                builder.store_long_bool(delta.last_transaction_lt, 64))) {
+            return td::Status::Error(PSLICE() << "cannot serialize ShardAccounts delta at item " << i);
           }
-          ++result.out_msg_queue_deletions_bound;
+          TRY_RESULT(target_value_cell, serialize_slice(std::move(target_value)));
+          if (target_value_cell->get_hash() != builder.finalize_novm()->get_hash()) {
+            return td::Status::Error(PSLICE() << "new ShardAccount value disagrees at item " << i);
+          }
         }
 
-        root_stage = "scan_out_msg_queue_transition";
-        auto old_out_queue_raw = vm::load_cell_slice(old_state_dictionaries.out_msg_queue_root).prefetch_ref();
-        auto new_out_queue_raw = vm::load_cell_slice(new_state_dictionaries.out_msg_queue_root).prefetch_ref();
-        StructuralAugmentedDictionary old_out_queue_structure{std::move(old_out_queue_raw), 352};
-        StructuralAugmentedDictionary new_out_queue_structure{std::move(new_out_queue_raw), 352};
-        std::map<OutboundQueueKey, std::pair<Ref<vm::Cell>, Ref<vm::Cell>>> queue_diff;
-        td::Status queue_diff_status = td::Status::OK();
-        bool queue_diff_ok = false;
-        try {
-          queue_diff_ok = old_out_queue_structure.scan_diff(
-              new_out_queue_structure,
-              [&](td::ConstBitPtr key, int key_len, Ref<vm::CellSlice> old_value,
-                  Ref<vm::CellSlice> new_value) -> bool {
-                if (key_len != 352) {
-                  queue_diff_status = td::Status::Error("OutMsgQueue diff has a non-canonical key length");
-                  return false;
-                }
-                OutboundQueueKey queue_key;
-                queue_key.bits().copy_from(key, 352);
-                Ref<vm::Cell> old_cell;
-                Ref<vm::Cell> new_cell;
-                if (old_value.not_null()) {
-                  auto serialized = serialize_slice(old_out_queue.extract_value(std::move(old_value)));
-                  if (serialized.is_error()) {
-                    queue_diff_status = serialized.move_as_error_prefix("cannot serialize old OutMsgQueue value: ");
-                    return false;
-                  }
-                  old_cell = serialized.move_as_ok();
-                }
-                if (new_value.not_null()) {
-                  auto serialized = serialize_slice(new_out_queue.extract_value(std::move(new_value)));
-                  if (serialized.is_error()) {
-                    queue_diff_status = serialized.move_as_error_prefix("cannot serialize new OutMsgQueue value: ");
-                    return false;
-                  }
-                  new_cell = serialized.move_as_ok();
-                }
-                queue_diff.emplace(queue_key, std::make_pair(std::move(old_cell), std::move(new_cell)));
-                return true;
-              },
-              0);
-        } catch (vm::VmVirtError& error) {
-          if (std::string(error.get_msg()) != "prunned branch") {
-            throw;
-          }
-          queue_diff_status =
-              td::Status::Error("predecessor witness is incomplete for the canonical OutMsgQueue transition");
+        root_stage = "scan_shard_accounts_transition";
+        StructuralAugmentedDictionary old_accounts_structure{predecessor_accounts_root, 256};
+        StructuralAugmentedDictionary new_accounts_structure{target_new_accounts_root, 256};
+        std::map<StdSmcAddress, std::pair<bool, bool>> account_diff;
+        const bool account_diff_ok = old_accounts_structure.scan_diff(
+            new_accounts_structure,
+            [&](td::ConstBitPtr key, int key_len, Ref<vm::CellSlice> old_value, Ref<vm::CellSlice> new_value) -> bool {
+              if (key_len != 256) {
+                return false;
+              }
+              StdSmcAddress account;
+              account.bits().copy_from(key, 256);
+              return account_diff.emplace(account, std::make_pair(old_value.not_null(), new_value.not_null())).second;
+            },
+            0);
+        if (!account_diff_ok || account_diff.size() != account_dictionary_deltas.size()) {
+          return td::Status::Error("target ShardAccounts diff is incomplete or has unexpected keys");
         }
-        if (!queue_diff_ok) {
-          if (queue_diff_status.is_error()) {
-            return queue_diff_status;
+        for (const auto& delta : account_dictionary_deltas) {
+          const auto entry = account_diff.find(delta.account);
+          if (entry == account_diff.end() || entry->second.first != delta.existed_before ||
+              entry->second.second != delta.exists_after) {
+            return td::Status::Error("target ShardAccounts diff disagrees with canonical account deltas");
           }
-          if (result.out_msg_queue_transition_status == "not_run") {
-            return td::Status::Error("cannot scan target OutMsgQueue Merkle diff");
-          }
-        } else {
-          for (const auto& [key, values] : queue_diff) {
-            if (values.first.is_null()) {
-              ++result.out_msg_queue_diff_additions;
-            } else if (values.second.is_null()) {
-              ++result.out_msg_queue_diff_deletions;
-            } else {
-              ++result.out_msg_queue_diff_replacements;
+        }
+        result.shard_accounts_transition_validated = true;
+        result.shard_accounts_transition_status = "exact_diff_and_value_binding";
+
+        if (result.out_msg_queue_unchanged_root_commitment) {
+          for (const auto& context : coordinator_contexts) {
+            if (context.outbound_queue_deletion) {
+              return td::Status::Error(
+                  "canonical queue deletion contradicts the unchanged OutMsgQueue root commitment");
             }
-            queue_deltas.push_back({.key = key,
-                                    .expected_value = values.first,
-                                    .post_value = values.second,
-                                    .existed_before = values.first.not_null(),
-                                    .exists_after = values.second.not_null()});
           }
-          result.out_msg_queue_transition_status = "complete_diff_enumerated";
+          result.out_msg_queue_transition_status = "exact_unchanged_root_commitment";
+        } else {
+          root_stage = "scan_out_msg_queue_transition";
+          auto old_out_queue_raw = vm::load_cell_slice(old_state_dictionaries.out_msg_queue_root).prefetch_ref();
+          auto new_out_queue_raw = vm::load_cell_slice(new_state_dictionaries.out_msg_queue_root).prefetch_ref();
+          StructuralAugmentedDictionary old_out_queue_structure{std::move(old_out_queue_raw), 352};
+          StructuralAugmentedDictionary new_out_queue_structure{std::move(new_out_queue_raw), 352};
+          std::map<OutboundQueueKey, std::pair<Ref<vm::Cell>, Ref<vm::Cell>>> queue_diff;
+          td::Status queue_diff_status = td::Status::OK();
+          bool queue_diff_ok = false;
+          try {
+            queue_diff_ok = old_out_queue_structure.scan_diff(
+                new_out_queue_structure,
+                [&](td::ConstBitPtr key, int key_len, Ref<vm::CellSlice> old_value,
+                    Ref<vm::CellSlice> new_value) -> bool {
+                  if (key_len != 352) {
+                    queue_diff_status = td::Status::Error("OutMsgQueue diff has a non-canonical key length");
+                    return false;
+                  }
+                  OutboundQueueKey queue_key;
+                  queue_key.bits().copy_from(key, 352);
+                  Ref<vm::Cell> old_cell;
+                  Ref<vm::Cell> new_cell;
+                  if (old_value.not_null()) {
+                    if (!old_value.write().advance(64)) {
+                      queue_diff_status = td::Status::Error("old OutMsgQueue leaf has no augmentation");
+                      return false;
+                    }
+                    auto serialized = serialize_slice(std::move(old_value));
+                    if (serialized.is_error()) {
+                      queue_diff_status = serialized.move_as_error_prefix("cannot serialize old OutMsgQueue value: ");
+                      return false;
+                    }
+                    old_cell = serialized.move_as_ok();
+                  }
+                  if (new_value.not_null()) {
+                    if (!new_value.write().advance(64)) {
+                      queue_diff_status = td::Status::Error("new OutMsgQueue leaf has no augmentation");
+                      return false;
+                    }
+                    auto serialized = serialize_slice(std::move(new_value));
+                    if (serialized.is_error()) {
+                      queue_diff_status = serialized.move_as_error_prefix("cannot serialize new OutMsgQueue value: ");
+                      return false;
+                    }
+                    new_cell = serialized.move_as_ok();
+                  }
+                  queue_diff.emplace(queue_key, std::make_pair(std::move(old_cell), std::move(new_cell)));
+                  return true;
+                },
+                0);
+          } catch (vm::VmVirtError& error) {
+            if (std::string(error.get_msg()) != "prunned branch") {
+              throw;
+            }
+            queue_diff_status =
+                td::Status::Error("predecessor witness is incomplete for the canonical OutMsgQueue transition");
+          }
+          if (!queue_diff_ok) {
+            if (queue_diff_status.is_error()) {
+              return queue_diff_status;
+            }
+            if (result.out_msg_queue_transition_status == "not_run") {
+              return td::Status::Error("cannot scan target OutMsgQueue Merkle diff");
+            }
+          } else {
+            std::map<OutboundQueueKey, Ref<vm::Cell>> expected_deletions;
+            for (const auto& context : coordinator_contexts) {
+              if (context.outbound_queue_deletion) {
+                if (!context.inbound_descriptor ||
+                    !expected_deletions
+                         .emplace(context.outbound_queue_deletion.value(), context.inbound_descriptor->message_envelope)
+                         .second) {
+                  return td::Status::Error("invalid canonical OutMsgQueue deletion set");
+                }
+              }
+            }
+            for (const auto& [key, values] : queue_diff) {
+              if (values.first.is_null()) {
+                ++result.out_msg_queue_diff_additions;
+                if (values.second.is_null()) {
+                  return td::Status::Error("OutMsgQueue addition has no value");
+                }
+                td::Bits256 message_hash_bits;
+                message_hash_bits.bits().copy_from(key.bits() + 96, 256);
+                const auto message_hash = as_hash256(message_hash_bits);
+                auto canonical_message = outbound_message_transactions.find(message_hash);
+                auto canonical_descriptor = root_out_descriptors.find(message_hash);
+                if (canonical_message == outbound_message_transactions.end() ||
+                    canonical_descriptor == root_out_descriptors.end()) {
+                  return td::Status::Error("OutMsgQueue addition is not bound to a canonical outbound message");
+                }
+                vm::CellSlice enqueued{vm::NoVm(), values.second};
+                auto envelope = enqueued.advance(64) ? enqueued.fetch_ref() : Ref<vm::Cell>{};
+                block::tlb::MsgEnvelope::Record_std envelope_record;
+                if (envelope.is_null() || !enqueued.empty_ext() || !tlb::unpack_cell(envelope, envelope_record) ||
+                    envelope_record.msg.is_null() ||
+                    as_hash256(envelope_record.msg->get_hash().as_bits256()) != message_hash) {
+                  return td::Status::Error("OutMsgQueue addition has an invalid canonical envelope");
+                }
+                auto descriptor_slice = vm::load_cell_slice_ref(canonical_descriptor->second);
+                block::gen::OutMsg::Record_msg_export_new out;
+                if (!tlb::csr_unpack(descriptor_slice, out) || out.out_msg.is_null() ||
+                    out.out_msg->get_hash() != envelope->get_hash()) {
+                  return td::Status::Error("OutMsgQueue addition disagrees with msg_export_new");
+                }
+                ++result.out_msg_queue_additions_bound;
+              } else if (values.second.is_null()) {
+                ++result.out_msg_queue_diff_deletions;
+                const auto expected = expected_deletions.find(key);
+                if (expected == expected_deletions.end() || values.first.is_null()) {
+                  return td::Status::Error("OutMsgQueue deletion is not bound to a canonical inbound message");
+                }
+                vm::CellSlice enqueued{vm::NoVm(), values.first};
+                auto envelope = enqueued.advance(64) ? enqueued.fetch_ref() : Ref<vm::Cell>{};
+                if (envelope.is_null() || !enqueued.empty_ext() ||
+                    envelope->get_hash() != expected->second->get_hash()) {
+                  return td::Status::Error("OutMsgQueue deletion disagrees with the canonical inbound envelope");
+                }
+                ++result.out_msg_queue_deletions_bound;
+              } else {
+                ++result.out_msg_queue_diff_replacements;
+                return td::Status::Error("OutMsgQueue replacement is outside the canonical replay model");
+              }
+            }
+            if (result.out_msg_queue_deletions_bound != expected_deletions.size()) {
+              return td::Status::Error("canonical OutMsgQueue deletions do not cover the target diff");
+            }
+            result.out_msg_queue_transition_status = "exact_diff_and_value_binding";
+          }
         }
 
       } else {
@@ -2180,24 +2630,23 @@ td::Result<ReplayResult> replay_transactions(
       record_root_phase(result.phase_root_state_transition_seconds);
 
       root_stage = "apply_augmented_deltas";
-      const bool complete_state_transition = collated_predecessor_witness.not_null() &&
-                                             result.shard_accounts_transition_validated &&
-                                             result.out_msg_queue_transition_status == "complete_diff_enumerated";
+      const bool exact_queue_transition = result.out_msg_queue_transition_status == "exact_unchanged_root_commitment" ||
+                                          result.out_msg_queue_transition_status == "exact_diff_and_value_binding";
+      const bool complete_state_transition = predecessor_state_witness.not_null() &&
+                                             result.shard_accounts_transition_validated && exact_queue_transition &&
+                                             result.complete_message_descriptor_coverage;
+      vm::AugmentedDictionary accounts_out_of_scope{256, block::tlb::aug_ShardAccounts};
       vm::AugmentedDictionary queue_out_of_scope{352, block::tlb::aug_OutMsgQueue};
       ton::validator::parallel_inbound::AugmentedDictionarySeed seed{
           .global_version = config->get_global_version(),
-          .shard_accounts_root = complete_state_transition ? old_state_dictionaries.shard_accounts_root
-                                                           : predecessor_accounts.get_wrapped_dict_root(),
-          .in_msg_descr_root = in_baseline.get_wrapped_dict_root(),
-          .out_msg_descr_root = out_baseline.get_wrapped_dict_root(),
-          .out_msg_queue_root = complete_state_transition ? old_state_dictionaries.out_msg_queue_root
-                                                          : queue_out_of_scope.get_wrapped_dict_root()};
+          .shard_accounts_root = accounts_out_of_scope.get_wrapped_dict_root(),
+          .in_msg_descr_root = in_baseline->get_wrapped_dict_root(),
+          .out_msg_descr_root = out_baseline->get_wrapped_dict_root(),
+          .out_msg_queue_root = queue_out_of_scope.get_wrapped_dict_root()};
       const std::vector<ton::validator::parallel_inbound::AccountDictionaryDelta> account_deltas_out_of_scope;
       auto root_result = ton::validator::parallel_inbound::apply_augmented_dictionary_deltas_atomic(
-          seed, complete_state_transition ? account_dictionary_deltas : account_deltas_out_of_scope,
-          coordinator_state.in_msg_descriptors, coordinator_state.out_msg_descriptors,
-          complete_state_transition ? queue_deltas
-                                    : std::vector<ton::validator::parallel_inbound::QueueDictionaryDelta>{});
+          seed, account_deltas_out_of_scope, root_in_descriptors, root_out_descriptors,
+          std::vector<ton::validator::parallel_inbound::QueueDictionaryDelta>{});
       if (!root_result) {
         return td::Status::Error(
             PSTRING() << "canonical augmented dictionary commit failed at item "
@@ -2211,11 +2660,6 @@ td::Result<ReplayResult> replay_transactions(
         return td::Status::Error("canonical augmented dictionary roots disagree with copied block artifacts");
       }
       if (complete_state_transition) {
-        if (roots.shard_accounts_root->get_hash() != new_state_dictionaries.shard_accounts_root->get_hash() ||
-            roots.out_msg_queue_root->get_hash() != new_state_dictionaries.out_msg_queue_root->get_hash()) {
-          return td::Status::Error("canonical state dictionary roots disagree with target Merkle-update new roots");
-        }
-        result.out_msg_queue_transition_status = "exact_root_match";
         result.augmented_dictionary_roots_validated = 4;
       } else {
         result.augmented_dictionary_roots_validated = 2;
@@ -2229,9 +2673,9 @@ td::Result<ReplayResult> replay_transactions(
                                          << error.get_msg());
     }
   }
-  if (collated_predecessor_witness.not_null() && result.augmented_dictionary_roots_validated != 4) {
+  if (predecessor_state_witness.not_null() && result.augmented_dictionary_roots_validated != 4) {
     return td::Status::Error(
-        "--collated-data requires complete account-proof replay scope and an exact four-root transition");
+        "predecessor-state witness requires complete account-proof replay scope and an exact four-root transition");
   }
   phase_elapsed = replay_timer.elapsed();
   result.phase_augmented_roots_seconds = phase_elapsed - phase_checkpoint;
@@ -2330,10 +2774,9 @@ td::Status validate_account_replay_batch(const ReplayResult& reference,
   TRY_STATUS(check_sum(&ReplayResult::canonical_payload_out_messages, "canonical_payload_out_messages"));
   TRY_STATUS(check_sum(&ReplayResult::canonical_outbound_registrations, "canonical_outbound_registrations"));
   TRY_STATUS(check_sum(&ReplayResult::canonical_inbound_fin_descriptors, "canonical_inbound_fin_descriptors"));
-  TRY_STATUS(check_sum(&ReplayResult::canonical_outbound_deq_imm_descriptors,
-                       "canonical_outbound_deq_imm_descriptors"));
-  TRY_STATUS(check_sum(&ReplayResult::canonical_fee_augmentations_validated,
-                       "canonical_fee_augmentations_validated"));
+  TRY_STATUS(
+      check_sum(&ReplayResult::canonical_outbound_deq_imm_descriptors, "canonical_outbound_deq_imm_descriptors"));
+  TRY_STATUS(check_sum(&ReplayResult::canonical_fee_augmentations_validated, "canonical_fee_augmentations_validated"));
   if (expect_global_effects) {
     TRY_STATUS(check_sum(&ReplayResult::basechain_limit_effects_applied, "basechain_limit_effects_applied"));
     TRY_STATUS(check_sum(&ReplayResult::basechain_limit_accounts, "basechain_limit_accounts"));
@@ -2467,7 +2910,9 @@ td::Status validate_account_artifact_equivalence(const ReplayAccountArtifacts& r
   if (reference.limit_effects.size() != actual.limit_effects.size() ||
       reference.limit_contexts.size() != actual.limit_contexts.size() ||
       reference.coordinator_candidates.size() != actual.coordinator_candidates.size() ||
-      reference.account_dictionary_deltas.size() != actual.account_dictionary_deltas.size()) {
+      reference.account_dictionary_deltas.size() != actual.account_dictionary_deltas.size() ||
+      reference.inbound_message_transactions != actual.inbound_message_transactions ||
+      reference.outbound_message_transactions != actual.outbound_message_transactions) {
     return td::Status::Error("offline collator artifact cardinality mismatch");
   }
   for (std::size_t i = 0; i < reference.limit_effects.size(); ++i) {
@@ -2533,6 +2978,9 @@ td::Status validate_offline_replay_result(const ReplayResult& reference, const R
       actual.canonical_inbound_fin_descriptors != reference.canonical_inbound_fin_descriptors ||
       actual.canonical_outbound_deq_imm_descriptors != reference.canonical_outbound_deq_imm_descriptors ||
       actual.canonical_fee_augmentations_validated != reference.canonical_fee_augmentations_validated ||
+      actual.in_msg_descriptors_bound != reference.in_msg_descriptors_bound ||
+      actual.out_msg_descriptors_bound != reference.out_msg_descriptors_bound ||
+      actual.complete_message_descriptor_coverage != reference.complete_message_descriptor_coverage ||
       actual.basechain_limit_effects_applied != reference.basechain_limit_effects_applied ||
       actual.basechain_limit_accounts != reference.basechain_limit_accounts ||
       actual.basechain_limit_gas != reference.basechain_limit_gas ||
@@ -2544,6 +2992,8 @@ td::Status validate_offline_replay_result(const ReplayResult& reference, const R
       actual.shadow_coordinator_queue_deletions != reference.shadow_coordinator_queue_deletions ||
       actual.shadow_coordinator_new_messages != reference.shadow_coordinator_new_messages ||
       actual.shard_account_proof_values_bound != reference.shard_account_proof_values_bound ||
+      actual.predecessor_state_witness_loaded != reference.predecessor_state_witness_loaded ||
+      actual.collated_predecessor_witness_loaded != reference.collated_predecessor_witness_loaded ||
       actual.predecessor_state_witness_source != reference.predecessor_state_witness_source ||
       actual.shard_accounts_predecessor_root_bound != reference.shard_accounts_predecessor_root_bound ||
       actual.shard_accounts_transition_validated != reference.shard_accounts_transition_validated ||
@@ -2551,7 +3001,9 @@ td::Status validate_offline_replay_result(const ReplayResult& reference, const R
       actual.out_msg_queue_diff_additions != reference.out_msg_queue_diff_additions ||
       actual.out_msg_queue_diff_deletions != reference.out_msg_queue_diff_deletions ||
       actual.out_msg_queue_diff_replacements != reference.out_msg_queue_diff_replacements ||
+      actual.out_msg_queue_additions_bound != reference.out_msg_queue_additions_bound ||
       actual.out_msg_queue_deletions_bound != reference.out_msg_queue_deletions_bound ||
+      actual.out_msg_queue_unchanged_root_commitment != reference.out_msg_queue_unchanged_root_commitment ||
       actual.out_msg_queue_transition_status != reference.out_msg_queue_transition_status ||
       actual.augmented_dictionary_roots_validated != reference.augmented_dictionary_roots_validated) {
     return td::Status::Error("offline collator replay result disagrees with serial reference");
@@ -2672,6 +3124,16 @@ td::Result<PreparedAccountReplay> merge_account_replay_lanes(
         merged.artifacts.account_dictionary_deltas.end(),
         std::make_move_iterator(artifacts.account_dictionary_deltas.begin()),
         std::make_move_iterator(artifacts.account_dictionary_deltas.end()));
+    for (const auto& [message, transaction] : artifacts.inbound_message_transactions) {
+      if (!merged.artifacts.inbound_message_transactions.emplace(message, transaction).second) {
+        return td::Status::Error("offline collator duplicated an inbound message artifact");
+      }
+    }
+    for (const auto& [message, transaction] : artifacts.outbound_message_transactions) {
+      if (!merged.artifacts.outbound_message_transactions.emplace(message, transaction).second) {
+        return td::Status::Error("offline collator duplicated an outbound message artifact");
+      }
+    }
   }
   summary.skipped_accounts = summary.target_accounts - summary.accounts;
   TRY_STATUS(normalize_account_artifacts(merged.artifacts));
@@ -2680,10 +3142,10 @@ td::Result<PreparedAccountReplay> merge_account_replay_lanes(
 
 td::Result<OfflineCollatorReplayProbe> run_offline_collator_replay(
     const std::string& archive, const HistoryBlocks& history, const BlockContext& target,
-    const Ref<vm::Cell>& collated_predecessor_witness, const LoadedState& mc_state,
-    const std::vector<LoadedAccountProof>& account_proofs, const LoadedLibraryBodies* library_bodies,
-    bool profile_ed25519, const ReplayResult& reference, ReplayAccountArtifacts reference_artifacts,
-    std::size_t requested_workers) {
+    const Ref<vm::Cell>& predecessor_state_witness, td::Slice predecessor_state_witness_source,
+    const LoadedState& mc_state, const std::vector<LoadedAccountProof>& account_proofs,
+    const LoadedLibraryBodies* library_bodies, bool profile_ed25519, const ReplayResult& reference,
+    ReplayAccountArtifacts reference_artifacts, std::size_t requested_workers) {
   if (reference.transaction_kinds.total() != reference.transaction_kinds.ordinary) {
     return td::Status::Error(
         "offline collator probe rejects blocks containing special transactions; serial separation is not implemented");
@@ -2744,9 +3206,10 @@ td::Result<OfflineCollatorReplayProbe> run_offline_collator_replay(
   equivalence_seconds += artifact_equivalence_timer.elapsed();
 
   td::Timer commit_timer;
-  TRY_RESULT(committed, replay_transactions(archive, history, target, collated_predecessor_witness, nullptr, mc_state,
-                                            {}, account_proofs, library_bodies, profile_ed25519, true,
-                                            ReplayExecutionMode::prepared_effects, nullptr, &prepared));
+  TRY_RESULT(committed, replay_transactions(archive, history, target, predecessor_state_witness, nullptr, mc_state, {},
+                                            account_proofs, library_bodies, profile_ed25519, true,
+                                            ReplayExecutionMode::prepared_effects, nullptr, &prepared,
+                                            predecessor_state_witness_source));
   const double commit_seconds = commit_timer.elapsed();
   td::Timer result_equivalence_timer;
   TRY_STATUS(validate_offline_replay_result(reference, committed));
@@ -2890,10 +3353,9 @@ td::Result<std::string> inspect_json(const BlockContext& target, int split_depth
 td::Result<std::string> inspect_state_json(const LoadedState& state, int split_depth) {
   std::vector<ton::validator::SelectiveSplitStatePartDescriptor> parts;
   if (state.split_header) {
-    TRY_RESULT(assembler,
-               ton::validator::SelectiveSplitStateAssembler::create(
-                   state.id.shard_full(), ton::RootHash{state.root->get_hash().bits()}, state.serialized_root,
-                   static_cast<td::uint32>(split_depth)));
+    TRY_RESULT(assembler, ton::validator::SelectiveSplitStateAssembler::create(
+                              state.id.shard_full(), ton::RootHash{state.root->get_hash().bits()},
+                              state.serialized_root, static_cast<td::uint32>(split_depth)));
     parts = assembler->parts();
   }
   td::StringBuilder out;
@@ -2906,8 +3368,8 @@ td::Result<std::string> inspect_state_json(const LoadedState& state, int split_d
     if (i != 0) {
       out << ",";
     }
-    out << "{\"effective_shard\":\"" << ton::shard_to_str(parts[i].effective_shard)
-        << "\",\"root_hash\":\"" << parts[i].wrapped_root_hash.to_hex() << "\"}";
+    out << "{\"effective_shard\":\"" << ton::shard_to_str(parts[i].effective_shard) << "\",\"root_hash\":\""
+        << parts[i].wrapped_root_hash.to_hex() << "\"}";
   }
   out << "]}";
   return out.as_cslice().str();
@@ -2963,11 +3425,11 @@ std::string single_shard_capacity_json(const BlockContext& target, const ReplayR
           : 0.0;
   const bool byte_projection_available = full_block && target_rate_seconds > 0.0 && target.file_bytes > 0 &&
                                          replay.transactions > 0 && replay.consensus_max_block_bytes > 0;
-  const double byte_ceiling_raw_tps =
-      byte_projection_available
-          ? static_cast<double>(replay.transactions) * static_cast<double>(replay.consensus_max_block_bytes) /
-                static_cast<double>(target.file_bytes) / target_rate_seconds
-          : 0.0;
+  const double byte_ceiling_raw_tps = byte_projection_available
+                                          ? static_cast<double>(replay.transactions) *
+                                                static_cast<double>(replay.consensus_max_block_bytes) /
+                                                static_cast<double>(target.file_bytes) / target_rate_seconds
+                                          : 0.0;
 
   td::StringBuilder out;
   out << "{\"status\":\"incomplete_requires_collator_validate_query_and_saturated_workload\""
@@ -3050,7 +3512,7 @@ std::string single_shard_capacity_json(const BlockContext& target, const ReplayR
   }
   out << ",\"mainnet_sustainable_raw_tps\":null"
       << ",\"missing_gates\":[\"live_collator_integration\",\"validate_query_wall\","
-         "\"four_root_commit_wall\",\"active_config23_dimension_under_saturation\","
+         "\"live_four_root_commit_wall\",\"active_config23_dimension_under_saturation\","
          "\"multi_block_saturated_workload\","
          "\"network_candidate_delivery\"]"
       << ",\"warnings\":[\"linear_block_boc_density_projection\",\"mixed_raw_transaction_workload\","
@@ -3059,7 +3521,11 @@ std::string single_shard_capacity_json(const BlockContext& target, const ReplayR
          "\"three_transaction_operation_is_not_workload_classification\","
          "\"billed_gas_sum_excludes_unreconstructed_special_context\","
          "\"target_rate_is_not_observed_block_interval\",\"max_block_bytes_may_not_be_active_limit\","
-         "\"collated_bytes_are_not_block_bytes\"]}";
+         "\"collated_bytes_are_not_block_bytes\"";
+  if (replay.predecessor_state_witness_source == "target_block_state_update_hindsight") {
+    out << ",\"target_block_update_witness_is_hindsight_only\"";
+  }
+  out << "]}";
   return out.as_cslice().str();
 }
 
@@ -3108,6 +3574,10 @@ std::string replay_json(const BlockContext& target, const LoadedState* account_s
       << ",\"inbound_fin_descriptors\":" << replay.canonical_inbound_fin_descriptors
       << ",\"outbound_deq_imm_descriptors\":" << replay.canonical_outbound_deq_imm_descriptors
       << ",\"fee_augmentations\":" << replay.canonical_fee_augmentations_validated
+      << ",\"in_msg_descriptors_bound\":" << replay.in_msg_descriptors_bound
+      << ",\"out_msg_descriptors_bound\":" << replay.out_msg_descriptors_bound
+      << ",\"complete_message_descriptor_coverage\":"
+      << (replay.complete_message_descriptor_coverage ? "true" : "false")
       << ",\"basechain_limit_effects\":" << replay.basechain_limit_effects_applied
       << ",\"basechain_limit_accounts\":" << replay.basechain_limit_accounts
       << ",\"basechain_limit_gas\":" << replay.basechain_limit_gas
@@ -3120,6 +3590,7 @@ std::string replay_json(const BlockContext& target, const LoadedState* account_s
       << ",\"shadow_coordinator_queue_deletions\":" << replay.shadow_coordinator_queue_deletions
       << ",\"shadow_coordinator_new_messages\":" << replay.shadow_coordinator_new_messages
       << ",\"shadow_coordinator_queue_scope\":\"descriptor_derived_deletion_subset\""
+      << ",\"predecessor_state_witness_loaded\":" << (replay.predecessor_state_witness_loaded ? "true" : "false")
       << ",\"collated_predecessor_witness_loaded\":" << (replay.collated_predecessor_witness_loaded ? "true" : "false")
       << ",\"predecessor_state_witness_source\":\"" << replay.predecessor_state_witness_source << "\""
       << ",\"predecessor_proof_merge_algorithm\":";
@@ -3136,7 +3607,10 @@ std::string replay_json(const BlockContext& target, const LoadedState* account_s
       << ",\"out_msg_queue_diff_additions\":" << replay.out_msg_queue_diff_additions
       << ",\"out_msg_queue_diff_deletions\":" << replay.out_msg_queue_diff_deletions
       << ",\"out_msg_queue_diff_replacements\":" << replay.out_msg_queue_diff_replacements
+      << ",\"out_msg_queue_additions_bound\":" << replay.out_msg_queue_additions_bound
       << ",\"out_msg_queue_deletions_bound\":" << replay.out_msg_queue_deletions_bound
+      << ",\"out_msg_queue_unchanged_root_commitment\":"
+      << (replay.out_msg_queue_unchanged_root_commitment ? "true" : "false")
       << ",\"out_msg_queue_transition_status\":\"" << replay.out_msg_queue_transition_status << "\""
       << ",\"augmented_dictionary_roots_validated\":" << replay.augmented_dictionary_roots_validated
       << ",\"augmented_dictionary_root_scope\":\""
@@ -3146,16 +3620,18 @@ std::string replay_json(const BlockContext& target, const LoadedState* account_s
       << ",\"augmented_dictionary_baseline_source\":\"target_minus_validated_deltas\""
       << ",\"augmented_dictionary_historical_transition_proven\":"
       << (replay.collated_predecessor_witness_loaded ? "true" : "false") << ",\"shard_accounts_root_status\":\""
-      << (replay.shard_accounts_transition_validated   ? "exact_transition_validated"
-          : replay.collated_predecessor_witness_loaded ? "collated_witness_loaded_transition_incomplete"
-                                                       : "requires_collated_data_predecessor_witness")
+      << (replay.shard_accounts_transition_validated ? "exact_transition_validated"
+          : replay.predecessor_state_witness_loaded  ? "predecessor_witness_loaded_transition_incomplete"
+                                                     : "requires_predecessor_state_witness")
       << "\""
       << ",\"out_msg_queue_root_status\":\""
-      << (replay.out_msg_queue_transition_status == "exact_root_match" ? "exact_transition_validated"
+      << ((replay.out_msg_queue_transition_status == "exact_unchanged_root_commitment" ||
+           replay.out_msg_queue_transition_status == "exact_diff_and_value_binding")
+              ? "exact_transition_validated"
           : replay.out_msg_queue_transition_status == "complete_diff_enumerated"
               ? "complete_diff_enumerated_root_commit_pending"
-          : replay.collated_predecessor_witness_loaded ? "collated_witness_loaded_transition_incomplete"
-                                                       : "requires_collated_data_predecessor_witness")
+          : replay.predecessor_state_witness_loaded ? "predecessor_witness_loaded_transition_incomplete"
+                                                    : "requires_predecessor_state_witness")
       << "\""
       << ",\"block_size_status\":\"not_claimed_without_collator_usage_tree\""
       << ",\"proof_journals\":\"empty_in_transaction_replay\""
@@ -3182,8 +3658,7 @@ std::string replay_json(const BlockContext& target, const LoadedState* account_s
   out << ",\"hotpaths_cpu\":" << replay.hotpaths.to_json(true, 0, replay.hotpaths.size())
       << ",\"cpu_metric_status\":\"available\"";
 #endif
-  out << ",\"account_lane_ceiling\":" << account_lane_ceiling_json(replay)
-      << ",\"parallel_account_replay\":";
+  out << ",\"account_lane_ceiling\":" << account_lane_ceiling_json(replay) << ",\"parallel_account_replay\":";
   if (parallel_probe == nullptr) {
     out << "null";
   } else {
@@ -3285,8 +3760,10 @@ std::string replay_json(const BlockContext& target, const LoadedState* account_s
 
 td::Result<std::string> run(const std::string& archive, const std::string& block_boc, const std::string& mc_archive,
                             const std::string& block_id_text, bool inspect, const std::string& collated_data_path,
-                            const std::string& prev_state_path, const std::string& mc_state_path,
-                            const std::string& mc_proof_path, const std::vector<std::string>& history_block_boc_paths,
+                            bool use_block_update_witness, const std::string& block_update_witness_base_state_path,
+                            const std::string& out_msg_queue_proof_path, const std::string& prev_state_path,
+                            const std::string& mc_state_path, const std::string& mc_proof_path,
+                            const std::vector<std::string>& history_block_boc_paths,
                             const std::vector<std::string>& library_body_paths,
                             const std::vector<std::string>& account_part_specs,
                             const std::vector<std::string>& account_proof_specs, int split_depth, bool profile_ed25519,
@@ -3310,12 +3787,16 @@ td::Result<std::string> run(const std::string& archive, const std::string& block
     return inspect_json(target, split_depth);
   }
 
-  Ref<vm::Cell> collated_predecessor_witness;
+  Ref<vm::Cell> predecessor_state_witness;
+  std::string predecessor_state_witness_source;
   if (!collated_data_path.empty()) {
     TRY_RESULT(raw_views, extract_state_update_raw_views(target));
     TRY_RESULT(witness,
                load_collated_predecessor_witness(collated_data_path, td::Bits256(raw_views.first->get_hash(0).bits())));
-    collated_predecessor_witness = std::move(witness);
+    predecessor_state_witness = std::move(witness);
+    predecessor_state_witness_source = "collated_data";
+  } else if (use_block_update_witness) {
+    predecessor_state_witness_source = "target_block_state_update_hindsight";
   }
 
   TRY_STATUS(verify_replay_scope(target));
@@ -3381,10 +3862,28 @@ td::Result<std::string> run(const std::string& archive, const std::string& block
     TRY_RESULT(loaded, load_library_bodies(library_body_paths));
     library_bodies = std::make_unique<LoadedLibraryBodies>(std::move(loaded));
   }
+  std::unique_ptr<LoadedState> block_update_witness_base_state;
+  if (!block_update_witness_base_state_path.empty()) {
+    TRY_RESULT(loaded,
+               load_state_boc_unchecked(block_update_witness_base_state_path, "target-update witness base state"));
+    block_update_witness_base_state = std::make_unique<LoadedState>(std::move(loaded));
+  }
+  Ref<vm::Cell> out_msg_queue_state_proof;
+  if (!out_msg_queue_proof_path.empty()) {
+    TRY_RESULT(proof, load_out_msg_queue_proof(out_msg_queue_proof_path, target.prev[0]));
+    out_msg_queue_state_proof = std::move(proof);
+  }
+  if (use_block_update_witness) {
+    TRY_RESULT(witness, build_target_update_predecessor_witness(archive, history, target, account_proofs,
+                                                                block_update_witness_base_state.get(),
+                                                                out_msg_queue_state_proof));
+    predecessor_state_witness = std::move(witness);
+  }
   ReplayAccountArtifacts serial_artifacts;
-  TRY_RESULT(replay, replay_transactions(archive, history, target, collated_predecessor_witness, prev_state.get(),
+  TRY_RESULT(replay, replay_transactions(archive, history, target, predecessor_state_witness, prev_state.get(),
                                          *mc_state, account_parts, account_proofs, library_bodies.get(),
-                                         profile_ed25519, true, ReplayExecutionMode::full, &serial_artifacts));
+                                         profile_ed25519, true, ReplayExecutionMode::full, &serial_artifacts, nullptr,
+                                         predecessor_state_witness_source));
   std::optional<ParallelAccountReplayProbe> parallel_probe;
   if (account_workers != 0) {
     if (prev_state != nullptr || !account_parts.empty() || account_proofs.empty()) {
@@ -3400,8 +3899,9 @@ td::Result<std::string> run(const std::string& archive, const std::string& block
     if (prev_state != nullptr || !account_parts.empty() || account_proofs.empty()) {
       return td::Status::Error("--offline-collator-workers requires complete --account-proof replay mode");
     }
-    TRY_RESULT(probe, run_offline_collator_replay(archive, history, target, collated_predecessor_witness, *mc_state,
-                                                  account_proofs, library_bodies.get(), profile_ed25519, replay,
+    TRY_RESULT(probe, run_offline_collator_replay(archive, history, target, predecessor_state_witness,
+                                                  predecessor_state_witness_source, *mc_state, account_proofs,
+                                                  library_bodies.get(), profile_ed25519, replay,
                                                   std::move(serial_artifacts), offline_collator_workers));
     offline_collator_probe = std::move(probe);
   }
@@ -3424,6 +3924,8 @@ int main(int argc, char** argv) {
   std::string mc_state;
   std::string mc_proof;
   std::string collated_data;
+  std::string block_update_witness_base_state;
+  std::string out_msg_queue_proof;
   std::vector<std::string> history_block_bocs;
   std::vector<std::string> library_bodies;
   std::string inspect_state;
@@ -3433,6 +3935,7 @@ int main(int argc, char** argv) {
   bool inspect = false;
   bool list_blocks = false;
   bool profile_ed25519 = false;
+  bool use_block_update_witness = false;
   std::size_t account_workers = 0;
   std::size_t account_samples = 1;
   bool account_samples_explicit = false;
@@ -3464,6 +3967,15 @@ int main(int argc, char** argv) {
                      [&](td::Slice value) { mc_proof = value.str(); });
   options.add_option(0, "collated-data", "raw block-candidate collated-data BOC with predecessor-state witness",
                      [&](td::Slice value) { collated_data = value.str(); });
+  options.add_option(0, "block-update-witness",
+                     "offline only: use the finalized target MerkleUpdate old view as a hindsight predecessor witness",
+                     [&]() { use_block_update_witness = true; });
+  options.add_option(0, "block-update-witness-base-state",
+                     "sparse ancestor state advanced through --history-block-boc files for the hindsight witness",
+                     [&](td::Slice value) { block_update_witness_base_state = value.str(); });
+  options.add_option(0, "out-msg-queue-proof",
+                     "verified predecessor liteServer.blockOutMsgQueueSize response for the hindsight witness",
+                     [&](td::Slice value) { out_msg_queue_proof = value.str(); });
   options.add_option(0, "library-bodies",
                      "content-hash-checked liteServer.libraryResult from savelibraries; may be repeated",
                      [&](td::Slice value) { library_bodies.push_back(value.str()); });
@@ -3486,8 +3998,8 @@ int main(int argc, char** argv) {
                      [&](td::Slice value) { inspect_state = value.str(); });
   options.add_option(0, "profile-ed25519", "time Ed25519 verification during offline transaction replay",
                      [&]() { profile_ed25519 = true; });
-  options.add_checked_option(0, "account-workers",
-                             "run the isolated account-proof replay probe with 1..64 workers", [&](td::Slice value) {
+  options.add_checked_option(0, "account-workers", "run the isolated account-proof replay probe with 1..64 workers",
+                             [&](td::Slice value) {
                                TRY_RESULT_ASSIGN(account_workers, td::to_integer_safe<std::size_t>(value));
                                if (account_workers == 0 || account_workers > 64) {
                                  return td::Status::Error("account worker count must be between 1 and 64");
@@ -3526,12 +4038,25 @@ int main(int argc, char** argv) {
     std::cerr << "Error: " << parse_status.move_as_error().to_string() << '\n';
     return 1;
   }
-  const bool has_replay_inputs = !mc_archive.empty() || !prev_state.empty() || !mc_state.empty() || !mc_proof.empty() ||
-                                 !collated_data.empty() || !library_bodies.empty() || !account_parts.empty() ||
-                                 !account_proofs.empty() || !history_block_bocs.empty() || profile_ed25519 ||
-                                 account_workers != 0 || account_samples_explicit || offline_collator_workers != 0;
+  const bool has_replay_inputs =
+      !mc_archive.empty() || !prev_state.empty() || !mc_state.empty() || !mc_proof.empty() || !collated_data.empty() ||
+      !library_bodies.empty() || !account_parts.empty() || !account_proofs.empty() || !history_block_bocs.empty() ||
+      profile_ed25519 || use_block_update_witness || !block_update_witness_base_state.empty() ||
+      !out_msg_queue_proof.empty() || account_workers != 0 || account_samples_explicit || offline_collator_workers != 0;
   if (account_samples_explicit && account_workers == 0) {
     std::cerr << "Error: --account-samples requires --account-workers\n";
+    return 1;
+  }
+  if (use_block_update_witness && !collated_data.empty()) {
+    std::cerr << "Error: --block-update-witness cannot be combined with --collated-data\n";
+    return 1;
+  }
+  if (!block_update_witness_base_state.empty() && !use_block_update_witness) {
+    std::cerr << "Error: --block-update-witness-base-state requires --block-update-witness\n";
+    return 1;
+  }
+  if (!out_msg_queue_proof.empty() && !use_block_update_witness) {
+    std::cerr << "Error: --out-msg-queue-proof requires --block-update-witness\n";
     return 1;
   }
   if (!derive_block_boc_id_path.empty()) {
@@ -3605,7 +4130,8 @@ int main(int argc, char** argv) {
         result = inspect_state_json(state.move_as_ok(), split_depth);
       }
     } else {
-      result = run(archive, block_boc, mc_archive, block_id, inspect, collated_data, prev_state, mc_state, mc_proof,
+      result = run(archive, block_boc, mc_archive, block_id, inspect, collated_data, use_block_update_witness,
+                   block_update_witness_base_state, out_msg_queue_proof, prev_state, mc_state, mc_proof,
                    history_block_bocs, library_bodies, account_parts, account_proofs, split_depth, profile_ed25519,
                    account_workers, account_samples, offline_collator_workers);
     }
