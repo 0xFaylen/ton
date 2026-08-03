@@ -394,22 +394,32 @@ serialized file size, so the tool deliberately leaves
 of `max_block_bytes`; it is neither saturated nor a
 classified jetton or DEX workload. The JSON therefore keeps
 `mainnet_sustainable_raw_tps=null` until live collator integration,
-`ValidateQuery` wall time, exact four-root commit time, candidate delivery, and
+`ValidateQuery` wall time, live four-root commit time, candidate delivery, and
 a representative saturated multi-block corpus have all passed.
 
 A fresh exact-predecessor raw-BOC replay of basechain block `88028077` covers
 138 transactions across all 108 touched accounts. Its 374,873-byte BOC occupies
 17.88% of the 2 MiB candidate cap. All historical transaction and resulting
 account-state hashes match. Its transaction-kind split is `138 ordinary, 0
-tick, 0 tock`; the 134 TVM executions are also all ordinary. One Release process
-measured 166.6 ms for the isolated serial account replay and 46.4 ms with four
-workers, or 3.59x. A later independent process passed the same equivalence gate
-but measured 2.98x. The reusable-pool five-pair median is 3.24x, with individual
-paired results from 3.11x to 3.76x. These are isolated-account replay results,
-not block collation or shard TPS. The same sample gives a 1,930 raw tx/s linear
-byte-envelope projection, but remains far from saturation and keeps
-`mainnet_sustainable_raw_tps=null`. Without matching historical collated data it
-validates the two descriptor roots, not the complete four-root state transition.
+tick, 0 tock`; the 134 TVM executions are also all ordinary. A block-bound
+predecessor OutMsgQueueInfo proof plus the finalized target MerkleUpdate now
+allow the offline hindsight path to bind all 138 InMsg and 114 OutMsg
+descriptors, including 14 `msg_export_deq_imm` records, and validate all four
+augmented dictionary roots. This is not a historical collated-data witness, so
+the JSON explicitly reports
+`predecessor_state_witness_source=target_block_state_update_hindsight` and
+`augmented_dictionary_historical_transition_proven=false`.
+
+Seven alternating account-replay pairs per worker count passed exact historical
+transaction/account-state equivalence. Median serial/parallel account walls were
+37.096/19.479 ms with two workers, 35.285/12.656 ms with four, and
+37.613/8.903 ms with eight, or 1.856x, 2.854x, and 4.152x. The corresponding
+single serial-first full offline paths, including deterministic merge, limits,
+coordinator, and the four-root gate, were 47.077/30.916 ms, 44.013/26.788 ms,
+and 45.258/24.648 ms, or 1.523x, 1.643x, and 1.836x. These rates are replay
+diagnostics, not block collation or shard TPS. The sample remains only 17.88% of
+the candidate cap, does not run ValidateQuery or the network, and keeps
+`mainnet_sustainable_raw_tps=null`.
 
 The shard archive anchors the predecessor state through the intervening block
 chain. The masterchain archive anchors the configuration state by requiring its
@@ -424,12 +434,14 @@ lite-client -c 'saveconfigproof mc-config.tl <masterchain-block-id-ext>'
 lite-client -c 'saveaccountproof account.tl 0:<account> <predecessor-shard-block-id-ext>'
 lite-client -c 'savelibraries libraries.tl <library-hash>...'
 lite-client -c 'saveblock target-block.boc <target-shard-block-id-ext>'
+lite-client -c 'saveoutmsgqueueproof predecessor-queue.tl <predecessor-shard-block-id-ext>'
 
 tvm-replay-bundle \
   --archive <closed-shard.pack> \
   --block-id '(0,8000000000000000,SEQNO)' \
   --mc-proof mc-config.tl \
-  --collated-data candidate-collated-data.boc \
+  --block-update-witness \
+  --out-msg-queue-proof predecessor-queue.tl \
   --account-proof <account>=account.tl \
   --library-bodies libraries.tl \
   --account-workers 4 \
@@ -445,6 +457,8 @@ tvm-replay-bundle \
   --block-boc target-block.boc \
   --block-id <target-shard-block-id-ext> \
   --mc-proof mc-config.tl \
+  --block-update-witness \
+  --out-msg-queue-proof predecessor-queue.tl \
   --account-proof <account>=account.tl \
   --library-bodies libraries.tl \
   --account-workers 4 \

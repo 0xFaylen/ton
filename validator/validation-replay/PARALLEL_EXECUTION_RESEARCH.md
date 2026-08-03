@@ -550,19 +550,30 @@ path currently depends on the external copied-mainnet corpus for its positive
 integration test. A compact checked-in BOC/proof fixture remains a
 regression-coverage gate before live Collator integration.
 
-The corpus lacks the target candidate's collated-data predecessor witness, so
-the gate validates `InMsgDescr` and `OutMsgDescr`, not the complete
-`ShardAccounts` and `OutMsgQueue` transition. Trying to use the target block's
-old Merkle-update view as that witness fails on pruned augmentation branches;
-the utility retains the fail-closed collated-data requirement instead of
-claiming four roots from hash-only data.
+The corpus still lacks the target candidate's historical collated-data witness.
+A later block-bound OutMsgQueueInfo proof made a stricter hindsight gate
+possible: combine all predecessor account proofs, bind the exact queue proof,
+use the finalized target MerkleUpdate only as the old/new state commitment, and
+reject any descriptor, account, or queue mismatch. The first attempt exposed a
+coverage bug: the transaction effect set contains 100 generated outbound
+messages, while the target OutMsgDescr also contains 14
+`msg_export_deq_imm` records. The corrected gate removes all generated records,
+requires every remainder to unpack as `msg_export_deq_imm`, binds its envelope
+and reimported InMsg to the canonical transaction, and derives the queue key.
+Block `88028077` then bound 138/138 InMsg and 114/114 OutMsg descriptors and
+validated all four augmented roots. Because the witness uses finalized target
+data, `augmented_dictionary_historical_transition_proven` deliberately remains
+false.
 
-The corrected measurement shows a real 2.21x offline whole-path gain, not only
-an account-lane ceiling. It still does not mutate a live Collator, create the
-candidate BOC, validate all four dictionary roots, or run `ValidateQuery`. Those
-are now the direct next gate on copied validator state. Only that gate can turn
-the diagnostic 1,634 raw tx/s rate into evidence about sustainable single-shard
-capacity.
+Seven alternating account-replay pairs gave median serial/parallel walls of
+37.096/19.479, 35.285/12.656, and 37.613/8.903 ms for 2, 4, and 8 workers.
+The corresponding single serial-first full offline paths, including the
+four-root gate, measured 47.077/30.916, 44.013/26.788, and 45.258/24.648 ms,
+or 1.523x, 1.643x, and 1.836x. Exact artifact and replay-result checks passed
+at every point. This still does not mutate a live Collator, create the candidate
+BOC, run ValidateQuery, or measure delivery. The direct next gate remains a
+copied mainnet validator database with byte-identical candidates and normal
+ValidateQuery; `mainnet_sustainable_raw_tps` remains null.
 
 ## Replay-only Collator integration - implementation gate
 

@@ -1988,10 +1988,20 @@ td::Result<ReplayResult> replay_transactions(
           bool dequeued_from_current_shard = false;
           td::Ref<vm::Cell> declared_out_cell;
           auto declared_out_slice = out_msg_descr.lookup(message_key, 256);
-          if (declared_out_slice.not_null() &&
-              block::gen::t_OutMsg.get_tag(*declared_out_slice) == block::gen::OutMsg::msg_export_deq_imm) {
-            dequeued_from_current_shard = true;
+          if (declared_out_slice.not_null()) {
             declared_out_cell = vm::CellBuilder().append_cellslice(declared_out_slice->clone()).finalize_novm();
+            block::gen::OutMsg::Record_msg_export_deq_imm declared_out;
+            if (declared_out_cell.not_null() && block::gen::t_OutMsg.cell_unpack(declared_out_cell, declared_out)) {
+              if (declared_out.out_msg.is_null() || declared_out.reimport.is_null() ||
+                  declared_out.out_msg->get_hash() != declared_in.in_msg->get_hash() ||
+                  declared_out.reimport->get_hash() != declared_in_cell->get_hash()) {
+                replay_status = td::Status::Error(PSTRING()
+                                                  << "invalid msg_export_deq_imm binding for " << address.to_hex()
+                                                  << " at " << tx_key.get_uint(64));
+                return false;
+              }
+              dequeued_from_current_shard = true;
+            }
           }
 
           auto descriptors = ton::validator::parallel_inbound::materialize_inbound_internal_descriptors(
@@ -2330,6 +2340,7 @@ td::Result<ReplayResult> replay_transactions(
       auto out_baseline = std::make_unique<vm::AugmentedDictionary>(256, out_augmentation);
       std::map<Hash256, Ref<vm::Cell>> root_in_descriptors = coordinator_state.in_msg_descriptors;
       std::map<Hash256, Ref<vm::Cell>> root_out_descriptors = coordinator_state.out_msg_descriptors;
+      std::map<OutboundQueueKey, Ref<vm::Cell>> complete_queue_deletions;
       if (predecessor_state_witness.not_null()) {
         root_stage = "bind_complete_target_descriptors";
         vm::AugmentedDictionary target_in_descriptors{vm::load_cell_slice_ref(target.in_msg_descr), 256,
@@ -2348,9 +2359,13 @@ td::Result<ReplayResult> replay_transactions(
             })) {
           return td::Status::Error("cannot enumerate target message descriptors");
         }
-        if (target_in_count != inbound_message_transactions.size() ||
-            target_out_count != outbound_message_transactions.size()) {
-          return td::Status::Error("canonical transaction messages do not cover the target descriptor roots");
+        if (target_in_count != inbound_message_transactions.size()) {
+          return td::Status::Error(
+              PSTRING() << "canonical transaction messages do not cover the target descriptor roots: target_in="
+                        << target_in_count << ", canonical_in=" << inbound_message_transactions.size()
+                        << ", target_out=" << target_out_count
+                        << ", canonical_generated_out=" << outbound_message_transactions.size()
+                        << ", canonical_dequeued_out=" << coordinator_state.out_msg_descriptors.size());
         }
         root_in_descriptors.clear();
         for (const auto& [message_hash, transaction_hash] : inbound_message_transactions) {
@@ -2371,8 +2386,96 @@ td::Result<ReplayResult> replay_transactions(
           }
           TRY_RESULT(descriptor_cell,
                      validate_generated_outbound_descriptor(std::move(descriptor), message_hash, transaction_hash));
-          root_out_descriptors.emplace(message_hash, std::move(descriptor_cell));
+          if (!root_out_descriptors.emplace(message_hash, std::move(descriptor_cell)).second) {
+            return td::Status::Error("duplicate canonical target OutMsg descriptor");
+          }
           ++result.out_msg_descriptors_bound;
+        }
+        if (root_out_descriptors.size() != target_out_count) {
+          vm::AugmentedDictionary remaining_out_descriptors{vm::load_cell_slice_ref(target.out_msg_descr), 256,
+                                                            out_augmentation};
+          for (const auto& [message_hash, descriptor] : root_out_descriptors) {
+            auto removed = remaining_out_descriptors.lookup_delete(as_dictionary_key(message_hash));
+            if (removed.is_null()) {
+              return td::Status::Error("canonical OutMsg descriptor is absent while computing coverage remainder");
+            }
+            TRY_RESULT(removed_cell, serialize_slice(std::move(removed)));
+            if (removed_cell->get_hash() != descriptor->get_hash()) {
+              return td::Status::Error("canonical OutMsg descriptor changed while computing coverage remainder");
+            }
+          }
+          std::size_t remaining_count = 0;
+          td::Status remaining_status = td::Status::OK();
+          if (!remaining_out_descriptors.check_for_each(
+                  [&](Ref<vm::CellSlice>, td::ConstBitPtr key, int key_len) {
+                    ++remaining_count;
+                    if (key_len != 256) {
+                      remaining_status = td::Status::Error("uncovered target OutMsg descriptor has invalid key");
+                      return false;
+                    }
+                    td::Bits256 message_hash_bits;
+                    message_hash_bits.bits().copy_from(key, 256);
+                    const auto message_hash = as_hash256(message_hash_bits);
+                    auto descriptor = target_out_descriptors.lookup(key, key_len);
+                    if (descriptor.is_null()) {
+                      remaining_status = td::Status::Error("uncovered target OutMsg descriptor disappeared");
+                      return false;
+                    }
+                    auto descriptor_cell_result = serialize_slice(std::move(descriptor));
+                    if (descriptor_cell_result.is_error()) {
+                      remaining_status = descriptor_cell_result.move_as_error_prefix(
+                          "cannot serialize uncovered target OutMsg descriptor: ");
+                      return false;
+                    }
+                    auto descriptor_cell = descriptor_cell_result.move_as_ok();
+                    block::gen::OutMsg::Record_msg_export_deq_imm dequeued;
+                    block::tlb::MsgEnvelope::Record_std envelope;
+                    block::gen::InMsg::Record_msg_import_fin reimported;
+                    if (!block::gen::t_OutMsg.cell_unpack(descriptor_cell, dequeued) || dequeued.out_msg.is_null() ||
+                        dequeued.reimport.is_null() || !block::tlb::unpack_cell(dequeued.out_msg, envelope) ||
+                        envelope.msg.is_null() || !block::gen::t_InMsg.cell_unpack(dequeued.reimport, reimported) ||
+                        reimported.transaction.is_null()) {
+                      remaining_status =
+                          td::Status::Error("uncovered target OutMsg descriptor is not a valid msg_export_deq_imm");
+                      return false;
+                    }
+                    if (as_hash256(envelope.msg->get_hash().as_bits256()) != message_hash) {
+                      remaining_status = td::Status::Error("msg_export_deq_imm key disagrees with its message");
+                      return false;
+                    }
+                    const auto canonical_inbound = root_in_descriptors.find(message_hash);
+                    const auto canonical_transaction = inbound_message_transactions.find(message_hash);
+                    if (canonical_inbound == root_in_descriptors.end() ||
+                        canonical_transaction == inbound_message_transactions.end() ||
+                        canonical_inbound->second->get_hash() != dequeued.reimport->get_hash() ||
+                        canonical_transaction->second !=
+                            as_hash256(reimported.transaction->get_hash().as_bits256())) {
+                      remaining_status =
+                          td::Status::Error("msg_export_deq_imm is not bound to a canonical inbound transaction");
+                      return false;
+                    }
+                    OutboundQueueKey queue_key;
+                    if (!block::compute_out_msg_queue_key(dequeued.out_msg, queue_key) ||
+                        !complete_queue_deletions.emplace(queue_key, dequeued.out_msg).second) {
+                      remaining_status = td::Status::Error("invalid canonical msg_export_deq_imm queue deletion");
+                      return false;
+                    }
+                    if (!root_out_descriptors.emplace(message_hash, std::move(descriptor_cell)).second) {
+                      remaining_status = td::Status::Error("duplicate canonical target OutMsg descriptor");
+                      return false;
+                    }
+                    ++result.out_msg_descriptors_bound;
+                    return true;
+                  })) {
+            if (remaining_status.is_error()) {
+              return remaining_status;
+            }
+            return td::Status::Error("cannot enumerate uncovered target OutMsg descriptors");
+          }
+          if (root_out_descriptors.size() != target_out_count || remaining_count != complete_queue_deletions.size()) {
+            return td::Status::Error("canonical messages do not exactly cover the target OutMsg descriptors");
+          }
+          result.canonical_outbound_deq_imm_descriptors = complete_queue_deletions.size();
         }
         result.complete_message_descriptor_coverage = true;
       } else {
@@ -2557,14 +2660,13 @@ td::Result<ReplayResult> replay_transactions(
               return td::Status::Error("cannot scan target OutMsgQueue Merkle diff");
             }
           } else {
-            std::map<OutboundQueueKey, Ref<vm::Cell>> expected_deletions;
+            auto expected_deletions = complete_queue_deletions;
             for (const auto& context : coordinator_contexts) {
               if (context.outbound_queue_deletion) {
-                if (!context.inbound_descriptor ||
-                    !expected_deletions
-                         .emplace(context.outbound_queue_deletion.value(), context.inbound_descriptor->message_envelope)
-                         .second) {
-                  return td::Status::Error("invalid canonical OutMsgQueue deletion set");
+                const auto expected = expected_deletions.find(context.outbound_queue_deletion.value());
+                if (!context.inbound_descriptor || expected == expected_deletions.end() ||
+                    expected->second->get_hash() != context.inbound_descriptor->message_envelope->get_hash()) {
+                  return td::Status::Error("shadow coordinator OutMsgQueue deletion disagrees with full coverage");
                 }
               }
             }
@@ -2774,8 +2876,9 @@ td::Status validate_account_replay_batch(const ReplayResult& reference,
   TRY_STATUS(check_sum(&ReplayResult::canonical_payload_out_messages, "canonical_payload_out_messages"));
   TRY_STATUS(check_sum(&ReplayResult::canonical_outbound_registrations, "canonical_outbound_registrations"));
   TRY_STATUS(check_sum(&ReplayResult::canonical_inbound_fin_descriptors, "canonical_inbound_fin_descriptors"));
-  TRY_STATUS(
-      check_sum(&ReplayResult::canonical_outbound_deq_imm_descriptors, "canonical_outbound_deq_imm_descriptors"));
+  // Complete msg_export_deq_imm coverage is derived later from the target
+  // OutMsgDescr remainder, outside account_effects_only lane execution. The
+  // prepared full replay still compares this counter with the serial result.
   TRY_STATUS(check_sum(&ReplayResult::canonical_fee_augmentations_validated, "canonical_fee_augmentations_validated"));
   if (expect_global_effects) {
     TRY_STATUS(check_sum(&ReplayResult::basechain_limit_effects_applied, "basechain_limit_effects_applied"));
