@@ -3,6 +3,7 @@ from typing import ClassVar, override
 
 import nacl.signing
 from pytoniq_core import (
+    Address,
     Builder,
     Cell,
     CurrencyCollection,
@@ -88,6 +89,36 @@ class WalletV1(WalletV1View):
         await self.send(msg, seqno)
         # FIXME: Wait for an internal message to actually be delivered.
         return blueprint.materialize(self.provider)
+
+    async def transfer(
+        self,
+        destination: Address,
+        amount: CurrencyCollection,
+        *,
+        bounce: bool = False,
+        body: Cell | None = None,
+        seqno: int | None = None,
+    ) -> None:
+        msg = WalletMessage(
+            send_mode=3,
+            message=MessageAny(
+                info=InternalMsgInfo(
+                    ihr_disabled=True,
+                    bounce=bounce,
+                    bounced=False,
+                    src=self.address,
+                    dest=destination,
+                    value=amount,
+                    ihr_fee=0,
+                    fwd_fee=0,
+                    created_lt=0,
+                    created_at=0,
+                ),
+                init=None,
+                body=body or Cell.empty(),
+            ),
+        )
+        await self.send(msg, seqno)
 
 
 WALLET_V1_CODE = Cell.one_from_boc(

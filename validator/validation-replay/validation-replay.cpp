@@ -876,11 +876,48 @@ class ValidationReplayerImpl : public ValidationReplayer {
           parallel = std::make_unique<CollatePass>(co_await run_collate_pass(parallel_account_workers));
         }
         serial_time = serial->elapsed;
-        if (serial->candidate.id != parallel->candidate.id ||
-            serial->candidate.collated_file_hash != parallel->candidate.collated_file_hash ||
-            serial->candidate.data.as_slice() != parallel->candidate.data.as_slice() ||
-            serial->candidate.collated_data.as_slice() != parallel->candidate.collated_data.as_slice()) {
-          co_return td::Status::Error(PSTRING() << "serial/parallel candidate mismatch for " << block_id.id);
+        const bool id_match = serial->candidate.id == parallel->candidate.id;
+        const bool collated_hash_match =
+            serial->candidate.collated_file_hash == parallel->candidate.collated_file_hash;
+        const bool block_bytes_match = serial->candidate.data.as_slice() == parallel->candidate.data.as_slice();
+        const bool collated_bytes_match =
+            serial->candidate.collated_data.as_slice() == parallel->candidate.collated_data.as_slice();
+        if (!id_match || !collated_hash_match || !block_bytes_match || !collated_bytes_match) {
+          auto serial_root = vm::std_boc_deserialize(serial->candidate.data.as_slice()).ensure().move_as_ok();
+          auto parallel_root = vm::std_boc_deserialize(parallel->candidate.data.as_slice()).ensure().move_as_ok();
+          block::gen::Block::Record serial_block;
+          block::gen::Block::Record parallel_block;
+          CHECK(block::gen::unpack_cell(serial_root, serial_block));
+          CHECK(block::gen::unpack_cell(parallel_root, parallel_block));
+          block::gen::BlockExtra::Record serial_extra;
+          block::gen::BlockExtra::Record parallel_extra;
+          CHECK(block::gen::unpack_cell(serial_block.extra, serial_extra));
+          CHECK(block::gen::unpack_cell(parallel_block.extra, parallel_extra));
+          co_return td::Status::Error(
+              PSTRING() << "serial/parallel candidate mismatch for " << block_id.id << ": id=" << id_match
+                        << ", collated_hash=" << collated_hash_match << ", block_bytes=" << block_bytes_match
+                        << " (serial=" << serial->candidate.data.size() << "/"
+                        << td::sha256_bits256(serial->candidate.data.as_slice()).to_hex() << ", parallel="
+                        << parallel->candidate.data.size() << "/"
+                        << td::sha256_bits256(parallel->candidate.data.as_slice()).to_hex()
+                        << "), collated_bytes=" << collated_bytes_match << " (serial="
+                        << serial->candidate.collated_data.size() << "/"
+                        << td::sha256_bits256(serial->candidate.collated_data.as_slice()).to_hex() << ", parallel="
+                        << parallel->candidate.collated_data.size() << "/"
+                        << td::sha256_bits256(parallel->candidate.collated_data.as_slice()).to_hex()
+                        << "), component_match={info:"
+                        << (serial_block.info->get_hash() == parallel_block.info->get_hash()) << ", value_flow:"
+                        << (serial_block.value_flow->get_hash() == parallel_block.value_flow->get_hash())
+                        << ", state_update:"
+                        << (serial_block.state_update->get_hash() == parallel_block.state_update->get_hash())
+                        << ", extra:" << (serial_block.extra->get_hash() == parallel_block.extra->get_hash())
+                        << ", in_msg_descr:"
+                        << (serial_extra.in_msg_descr->get_hash() == parallel_extra.in_msg_descr->get_hash())
+                        << ", out_msg_descr:"
+                        << (serial_extra.out_msg_descr->get_hash() == parallel_extra.out_msg_descr->get_hash())
+                        << ", account_blocks:"
+                        << (serial_extra.account_blocks->get_hash() == parallel_extra.account_blocks->get_hash())
+                        << "}");
         }
         exact_candidate_match = true;
         selected = std::move(parallel);

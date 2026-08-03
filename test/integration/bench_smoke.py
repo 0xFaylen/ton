@@ -1,12 +1,13 @@
 """Smoke test: a single-node tontester network with simplex consensus.
 
 Verifies that one full node (plus a dht node) produces masterchain and
-workchain-0 blocks at the configured rate and processes transactions
-end-to-end, before the jetton TPS benchmark is built on top of it.
+workchain-0 blocks at the configured rate, processes a transaction end-to-end,
+and replays one block through the serial/parallel Collator plus ValidateQuery.
 """
 
 import asyncio
 import logging
+import os
 import shutil
 import sys
 import time
@@ -85,13 +86,43 @@ async def _deploy_wallet(network: Network, client: TonlibClient) -> None:
     print(f"wallet {new_wallet.address.to_str()} funded with {balance} nanotons")
 
 
+async def _run_parallel_replay(network: Network, node, client: TonlibClient) -> str:
+    mc_info = await client.get_masterchain_info()
+    assert mc_info.last is not None
+    shards = await client.get_shards(mc_info.last)
+    wc0_seqno = max(shard.seqno for shard in shards.shards if shard.workchain == 0)
+    command = (
+        "run --mode both --parallel-account-workers 4 "
+        f"(0,8000000000000000,{wc0_seqno})"
+    )
+    started = await node.engine_console.validation_replayer_command(command)
+    if not started.startswith("Started"):
+        raise RuntimeError(f"validation replay did not start: {started}")
+
+    async with asyncio.timeout(30):
+        while True:
+            status = await node.engine_console.validation_replayer_command("show")
+            if "Past runs" in status and "Current run" not in status:
+                break
+            await asyncio.sleep(0.1)
+
+    if "ERROR:" in status:
+        raise RuntimeError(f"validation replay failed:\n{status}")
+    if "exact_candidate_match=true" not in status or "Validate: time=" not in status:
+        raise RuntimeError(f"validation replay was incomplete:\n{status}")
+    print(f"validation replay target: wc0 seqno {wc0_seqno}")
+    print(status.rstrip())
+    return status
+
+
 async def main() -> int:
     repo_root = Path(__file__).resolve().parents[2]
-    working_dir = repo_root / "test/integration/.smoke"
+    working_dir = repo_root / "test/integration/.network/smoke"
     shutil.rmtree(working_dir, ignore_errors=True)
-    working_dir.mkdir(exist_ok=True)
+    working_dir.mkdir(parents=True, exist_ok=True)
 
-    install = Install(repo_root / "build", repo_root)
+    build_dir = Path(os.environ.get("TON_BUILD_DIR", repo_root / "build"))
+    install = Install(build_dir, repo_root)
     install.tonlibjson.client_set_verbosity_level(1)
 
     logging.basicConfig(
@@ -104,6 +135,7 @@ async def main() -> int:
     wc0_blocks = 0
     wc0_rate: float | None = None
     wallet_ok = False
+    replay_ok = False
     failure: str | None = None
 
     try:
@@ -134,6 +166,9 @@ async def main() -> int:
             await _deploy_wallet(network, client)
             wallet_ok = True
 
+            _ = await _run_parallel_replay(network, node, client)
+            replay_ok = True
+
             mc_info = await client.get_masterchain_info()
             assert mc_info.last is not None
             mc_blocks = mc_info.last.seqno
@@ -141,7 +176,13 @@ async def main() -> int:
         l.exception("smoke test failed")
         failure = repr(e)
 
-    passed = mc_blocks >= MIN_SEQNO and wc0_blocks >= MIN_SEQNO and wallet_ok and failure is None
+    passed = (
+        mc_blocks >= MIN_SEQNO
+        and wc0_blocks >= MIN_SEQNO
+        and wallet_ok
+        and replay_ok
+        and failure is None
+    )
     rate_str = f"{wc0_rate:.2f} blocks/s" if wc0_rate is not None else "not measured"
     print()
     print(f"=== bench_smoke {'PASS' if passed else 'FAIL'} ===")
@@ -149,6 +190,7 @@ async def main() -> int:
     print(f"  wc0 blocks observed:  {wc0_blocks}")
     print(f"  measured wc0 rate:    {rate_str}")
     print(f"  wallet deploy:        {'ok' if wallet_ok else 'FAILED'}")
+    print(f"  serial/parallel VRP:  {'ok' if replay_ok else 'FAILED'}")
     if failure is not None:
         print(f"  failure:              {failure}")
     return 0 if passed else 1

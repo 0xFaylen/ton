@@ -228,6 +228,7 @@ Collator::Collator(CollateParams params, td::actor::ActorId<ValidatorManager> ma
                     send_closure(manager, &ValidatorManager::add_perf_timer_stat, "collate", duration);
                   })
     , cancellation_token_(std::move(cancellation_token)) {
+  rand_seed_ = params_.in_rand_seed;
   if (params_.exact_tvm_hotpaths) {
     stats_.work_time.tvm_hotpath.enable_exact();
   }
@@ -4524,8 +4525,13 @@ td::Result<std::size_t> Collator::process_parallel_inbound_batch() {
     return std::size_t{0};
   }
 
+  auto account_root = account_dict->get_root_cell();
+  if (account_root.is_null()) {
+    return std::size_t{0};
+  }
+
   for (auto& prepared : batch) {
-    TRY_RESULT(account_usage, ParallelCellUsageContext::create(account_dict->get_root_cell()));
+    TRY_RESULT(account_usage, ParallelCellUsageContext::create(account_root));
     prepared->account_usage = std::move(account_usage);
     vm::AugmentedDictionary private_accounts(prepared->account_usage->worker_root(), 256,
                                              block::tlb::aug_ShardAccounts);
@@ -4535,8 +4541,9 @@ td::Result<std::size_t> Collator::process_parallel_inbound_batch() {
       if (!prepared->account->init_new(now_)) {
         return td::Status::Error("cannot initialize a parallel destination account");
       }
-    } else if (!prepared->account->unpack(std::move(account_entry.first), now_,
-                                          config_->is_special_smartcontract(prepared->account_address))) {
+    } else if (!prepared->account->unpack(
+                   std::move(account_entry.first), now_,
+                   is_masterchain() && config_->is_special_smartcontract(prepared->account_address))) {
       return td::Status::Error("cannot unpack a parallel destination account");
     }
     prepared->account->block_lt = start_lt;

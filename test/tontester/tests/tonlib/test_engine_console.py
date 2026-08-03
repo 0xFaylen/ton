@@ -126,6 +126,24 @@ async def test_request_synchronous(
 
 
 @pytest.mark.asyncio
+async def test_validation_replayer_command(
+    mock_tonlib: Mock, mock_event_loop: Mock, config: ton_api.EngineConsoleClient_config
+):
+    response_data = {"@type": "engine.validator.text", "text": "Started"}
+    mock_tonlib.response_get_response = Mock(return_value=json.dumps(response_data).encode())
+
+    with EngineConsoleClient(mock_tonlib, mock_event_loop, config) as client:
+        result = await client.validation_replayer_command("show")
+
+    assert result == "Started"
+    request = json.loads(mock_tonlib.engine_console_request.call_args.args[1])
+    assert request == {
+        "@type": "engine.validator.validationReplayerCommand",
+        "command": "show",
+    }
+
+
+@pytest.mark.asyncio
 async def test_request_asynchronous(
     mock_tonlib: Mock, mock_event_loop: Mock, config: ton_api.EngineConsoleClient_config
 ):

@@ -4,6 +4,7 @@ import functools
 import logging
 import os
 import shlex
+import shutil
 import signal
 import subprocess
 import types
@@ -251,15 +252,21 @@ class Network:
 
             match start_options.debug:
                 case None:
+                    kwargs = {
+                        "cwd": self._directory,
+                        "env": process_env,
+                        "stderr": asyncio.subprocess.PIPE,
+                    }
+                    if os.name != "nt":
+                        kwargs["pass_fds"] = start_options.pass_fds
                     self.__process = await asyncio.create_subprocess_exec(
                         executable,
                         *cmd_flags,
-                        cwd=self._directory,
-                        env=process_env,
-                        stderr=asyncio.subprocess.PIPE,
-                        pass_fds=start_options.pass_fds,
+                        **kwargs,
                     )
                 case "rr":
+                    if os.name == "nt":
+                        raise RuntimeError("rr recording is not supported on Windows")
                     l.info(f"Recording {self.name} with rr")
                     self.__process = await asyncio.create_subprocess_exec(
                         "rr",
@@ -638,8 +645,34 @@ class FullNode(Network.Node):
                     # Externally generated state: cells live in a pre-placed celldb,
                     # there is no static BoC file to serve.
                     continue
-                (static_dir / state.file_hash.hex().upper()).symlink_to(state.file)
+                target = static_dir / state.file_hash.hex().upper()
+                if os.name == "nt":
+                    shutil.copyfile(state.file, target)
+                else:
+                    target.symlink_to(state.file)
             self._static_populated = True
+
+        if os.name == "nt":
+            options, install = _get_install_and_options(
+                options,
+                self._network.install,
+                (
+                    "--initial-sync-delay",
+                    "5",
+                    "--session-logs",
+                    str(self.session_log_path),
+                    "--quic-flood-control",
+                    "-1",
+                ),
+                (),
+            )
+            await self._run(
+                install.validator_engine_exe,
+                self._local_config,
+                zerostate.as_validator_config(),
+                options,
+            )
+            return
 
         async with AsyncExitStack() as stack:
             ready_r, ready_w = os.pipe()

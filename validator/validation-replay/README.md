@@ -3,8 +3,9 @@
 The bounded source review for the single-shard execution track is kept in
 [`PARALLEL_EXECUTION_RESEARCH.md`](PARALLEL_EXECUTION_RESEARCH.md). Executable
 worker/coordinator contracts live in `validator/impl/parallel-*` and their
-regression tests live in `test/validator/test-parallel-*`. The implementation is
-not wired into the live collator yet.
+regression tests live in `test/validator/test-parallel-*`. The executable path
+is wired only into replay-created Collators and remains rejected for live
+collation.
 
 `ValidationReplayer` reruns collation, validation, or both against blocks and
 states already present in a C++ validator database. It is intended for
@@ -324,11 +325,26 @@ there is no speculative execution or parallel scheduling within one account.
 
 `--parallel-first` reverses the two pass order. Run matched serial-first and
 parallel-first samples before interpreting timings so storage and OS cache
-warming cannot be mistaken for executor speedup. No result from this gate is
-yet recorded here because the available Windows smoke database contains only
-genesis. It is not evidence of sustainable shard TPS until a copied mainnet
-validator database passes the exact-candidate and `ValidateQuery` gates across
-a representative block set.
+warming cannot be mistaken for executor speedup.
+
+An isolated one-validator `tontester` network now exercises this gate with real
+Collator and `ValidateQuery` instances. One synthetic block contained 16
+transfers into an initially empty basechain account dictionary; replay fell
+back to the serial coordinator, produced byte-identical block and collated-data
+BOCs, and passed validation. A later block contained 16 transfers to 13
+destination accounts, with four transfers targeting one account. Four-worker
+replay produced byte-identical candidates and passed validation in both
+serial-first and parallel-first order. The measured paired speedups were 0.655x
+and 1.139x respectively, demonstrating that this small workload is dominated
+by fixed overhead and cache order rather than providing a capacity result.
+
+The integration gate exposed two replay-only Collator defects before this pass:
+an empty `ShardAccounts` root was treated as a fatal proof-context error instead
+of a serial fallback, and basechain account preparation queried the
+masterchain-only special-contract dictionary. Both cases now preserve the
+serial path's behavior. This synthetic result is not evidence of sustainable
+shard TPS. A copied mainnet validator database must still pass exact-candidate
+and `ValidateQuery` gates across a representative saturated block set.
 
 The output also contains `single_shard_capacity`. It reads Config 23/29/30 from
 the state-bound masterchain proof and reports the exact archive block-file size.

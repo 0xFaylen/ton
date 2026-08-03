@@ -331,7 +331,8 @@ class BridgeImpl final : public IValidatorGroup {
         create_hash_tl_object<tl::dbId>(params_.session_id, params_.identity.is_validator(),
                                         params_.identity.short_id.value_or(PublicKeyHash::zero()).bits256_value(),
                                         params_.identity.adnl_id.bits256_value());
-    sb << params_.db_root << "/consensus/" << params_.shard.workchain << "." << params_.shard.shard << "."
+    sb << params_.db_root << TD_DIR_SLASH << "consensus" << TD_DIR_SLASH << params_.shard.workchain << "."
+       << params_.shard.shard << "."
        << params_.validator_set->get_catchain_seqno() << "." << hash.to_hex();
     return sb.as_cslice().str();
   }
