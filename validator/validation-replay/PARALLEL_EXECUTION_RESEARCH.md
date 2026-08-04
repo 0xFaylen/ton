@@ -730,6 +730,56 @@ Two findings keep this from being a success:
    Nothing in this section may be read as an equivalence result for
    limit-bound blocks.
 
+## Limit-estimate convergence - 2026-08-04 - 18/24, ONE RESIDUAL
+
+The stop-position hypothesis above was confirmed and mostly closed in two
+steps. First, `trans->update_limits` was reordered after the wrapper rebase:
+`add_proof(new_total_state)` classifies a retained old-state subtree as a
+proof boundary only when its wrapper belongs to the state usage tree, so
+worker-tree wrappers were descended into and deduplicated instead of being
+counted as per-account external references, and the parallel pass's
+block-size estimate drifted low by 6-18 KB. New replay-only stop telemetry
+(`REPLAY_INBOUND_STOP`, logged at every inbound-phase exit under `is_replay`)
+then showed byte-equal size estimates at every phase stop. Second, a
+deterministic boundary guard keeps the limit-adjacent region on the serial
+path (256 KiB byte and collated margins, 2M gas, 2000 lt against the
+`cl_normal` thresholds): the 64-entry lookahead materializes queue cells
+through the state usage tree before the serial pass would load them, and a
+phase that ended with touched-but-unprocessed entries left those cells in the
+collated proof, observed as a +1.5 KB collated-only mismatch on an otherwise
+byte-identical block.
+
+After both changes, 18 of 24 gate runs pass: limit-bound blocks of 672-682
+transactions produce byte-identical block and collated data and pass the
+ordinary `ValidateQuery`, with up to 377 of the block's transactions executed
+through the replay-only parallel path. The measured speedups remain mostly
+below 1.0 (0.68-1.41 across passing runs), so no performance claim changes.
+
+One residual defect remains possible. On one of four gated blocks in one
+corpus the serial pass stopped at 458 transactions and the parallel pass at
+457: the size estimates differed by only about 100 bytes in 1.05 MB, but that
+flipped one transaction exactly at the byte threshold. The residual comes
+from wrapper-topology differences between the passes: for a deduplicated cell
+the serial pass can retain a usage wrapper recorded on another account's
+path, while the rebased worker state carries its own path's wrapper, and the
+`external_refs` term of `add_proof` counts boundary encounters rather than
+unique cells. Closing it for good requires either wrapper-topology parity or
+a wrapper-independent size estimate; the latter would slightly change live
+block packing and needs an explicit decision before implementation.
+
+An independent reviewer audited all parallel-path changes and confirmed the
+live-collation isolation site by site (startup rejection, `is_replay`
+provenance, options provenance, zero-default watch account); the verdict was
+safe to push with no consensus-path findings. The one major replay-only
+finding - the rebase traversal visited a shared subtree once per path, which
+an adversarial DAG-ladder contract could blow up exponentially - is fixed
+with per-cell memoization. After that fix a fresh saturated corpus passed
+**24 of 24** gate runs (four blocks of 670-672 transactions, workers 2/4/8,
+both pass orders, byte-identical block and collated data, `ValidateQuery`
+green). One clean corpus does not retire the ~100-byte wrapper-topology
+residual: a boundary-adjacent block can still flip one transaction, and the
+gate will fail closed when it does.
+
 ## Replay-only Collator integration - implementation gate
 
 The Collator now contains a default-off, replay-only path for inbound internal

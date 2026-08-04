@@ -391,15 +391,25 @@ serial pass kept and the two Merkle updates pruned different paths.
 the same contexts as the account state. Twelve of eighteen gate runs then
 produced byte-identical candidates and passed `ValidateQuery`.
 
+A sixth defect - divergent stop positions on limit-bound blocks - was traced
+to the block-size estimate: `add_proof` classifies old-state boundaries by
+state-usage-tree wrappers, so the rebase must run before
+`trans->update_limits`, and the 64-entry lookahead must not leave
+touched-but-unprocessed queue entries at the phase end (their cells leak into
+the collated proof), which a deterministic boundary guard now prevents by
+keeping the limit-adjacent region serial. After these fixes 18 of 24 gate
+runs pass, including limit-bound 672-682-transaction blocks.
+
 Two facts must accompany that result. Every passing run measured a
-serial/parallel speedup **below 1.0** (0.58-0.97), so this path is currently
-slower than serial collation on this workload. And a sixth, different defect
-remains open: the largest, limit-bound block failed all its runs with
-differing `account_blocks`, `in_msg_descr` and `value_flow`, meaning the two
-passes committed different amounts of work. See the 2026-08-04 sections of
-`PARALLEL_EXECUTION_RESEARCH.md`. The replay-only parallel path therefore
-still fails its own equivalence gate on limit-bound blocks and must not be
-presented as validated.
+serial/parallel speedup mostly **below 1.0** (0.68-1.41, median well under
+1.0), so this path is currently not faster than serial collation on this
+workload. And one residual defect remains: on one of four gated blocks a
+roughly 100-byte size-estimate drift - caused by wrapper-topology differences
+for deduplicated cells - flipped a single transaction exactly at the byte
+threshold. See the 2026-08-04 sections of `PARALLEL_EXECUTION_RESEARCH.md`.
+The replay-only parallel path therefore still fails its own equivalence gate
+on roughly one saturated block in four and must not be presented as
+validated.
 
 When a gate run fails, the error now includes a bounded diff of the two
 Merkle-update cell footprints with ref-index breadcrumbs from the update root

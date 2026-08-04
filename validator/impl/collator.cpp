@@ -147,11 +147,20 @@ td::Result<td::Ref<vm::Cell>> rebase_parallel_usage_cells(td::Ref<vm::Cell> root
   if (contexts.empty()) {
     return root;
   }
+  // Memoize per cell object: a shared subtree must be rebased once, not once
+  // per distinct path, or a DAG that fans out the same child at every level
+  // makes this traversal exponential.
+  std::map<const vm::Cell*, td::Ref<vm::Cell>> memo;
   std::function<td::Result<td::Ref<vm::Cell>>(td::Ref<vm::Cell>)> rebase =
       [&](td::Ref<vm::Cell> cell) -> td::Result<td::Ref<vm::Cell>> {
     if (cell.is_null()) {
       return cell;
     }
+    auto memo_it = memo.find(cell.get());
+    if (memo_it != memo.end()) {
+      return memo_it->second;
+    }
+    const auto* memo_key = cell.get();
     auto tree_node = cell->get_tree_node();
     const ParallelCellUsageContext* owner = nullptr;
     if (!tree_node.empty()) {
@@ -175,7 +184,9 @@ td::Result<td::Ref<vm::Cell>> rebase_parallel_usage_cells(td::Ref<vm::Cell> root
       auto loaded_result = cell->load_cell();
       owner->worker_tree->set_ignore_loads(false);
       TRY_RESULT(loaded, std::move(loaded_result));
-      return vm::UsageCell::create(std::move(loaded.data_cell), std::move(coordinator_node));
+      auto wrapped = vm::UsageCell::create(std::move(loaded.data_cell), std::move(coordinator_node));
+      memo.emplace(memo_key, wrapped);
+      return wrapped;
     }
 
     TRY_RESULT(loaded, cell->load_cell());
@@ -189,6 +200,7 @@ td::Result<td::Ref<vm::Cell>> rebase_parallel_usage_cells(td::Ref<vm::Cell> root
       children[ref_id] = std::move(child);
     }
     if (!changed) {
+      memo.emplace(memo_key, cell);
       return cell;
     }
     TRY_RESULT(rebuilt,
@@ -197,7 +209,9 @@ td::Result<td::Ref<vm::Cell>> rebase_parallel_usage_cells(td::Ref<vm::Cell> root
     if (rebuilt->get_hash() != cell->get_hash()) {
       return td::Status::Error("rebased parallel usage cell changed its hash");
     }
-    return td::Ref<vm::Cell>{std::move(rebuilt)};
+    td::Ref<vm::Cell> result{std::move(rebuilt)};
+    memo.emplace(memo_key, result);
+    return result;
   };
   return rebase(std::move(root));
 }
@@ -4470,6 +4484,33 @@ Ref<vm::Cell> Collator::commit_parallel_inbound_transaction(ParallelInboundPrepa
 
   stats_.work_time += prepared.stats.work_time;
   auto& trans = prepared.transaction;
+  // Rebase worker wrappers before any limit accounting. update_limits walks
+  // new_total_state through add_proof, which classifies a retained old-state
+  // subtree as a proof boundary only when its wrapper belongs to the state
+  // usage tree; a worker-tree wrapper is descended into and deduplicated
+  // instead, so the block-size estimate drifts low and a byte-bound block
+  // stops at a different queue position than the serial pass. Outbound
+  // messages likewise retain payload cells from the worker's private old-state
+  // snapshot: a later in-block transaction can persist such a cell into its
+  // own account state, so the wrappers must be rebased before the messages are
+  // registered, or the downstream state loses the usage link the serial pass
+  // would have kept.
+  const std::vector<const ParallelCellUsageContext*> rebase_contexts{
+      prepared.account_usage.get(), prepared.message_usage.get(), prepared.storage_usage.get()};
+  auto rebased_state = rebase_parallel_usage_cells(trans->new_total_state, rebase_contexts);
+  if (rebased_state.is_error()) {
+    fatal_error(rebased_state.move_as_error_prefix("cannot rebase a parallel account state: "));
+    return {};
+  }
+  trans->new_total_state = rebased_state.move_as_ok();
+  for (auto& out_msg : trans->out_msgs) {
+    auto rebased_out_msg = rebase_parallel_usage_cells(out_msg, rebase_contexts);
+    if (rebased_out_msg.is_error()) {
+      fatal_error(rebased_out_msg.move_as_error_prefix("cannot rebase a parallel outbound message: "));
+      return {};
+    }
+    out_msg = rebased_out_msg.move_as_ok();
+  }
   if (!trans->update_limits(*block_limit_status_)) {
     fatal_error("cannot update block limits for a parallel inbound transaction");
     return {};
@@ -4478,27 +4519,6 @@ Ref<vm::Cell> Collator::commit_parallel_inbound_transaction(ParallelInboundPrepa
   if (trans_root.is_null()) {
     fatal_error("cannot commit a parallel inbound transaction");
     return {};
-  }
-  const std::vector<const ParallelCellUsageContext*> rebase_contexts{
-      prepared.account_usage.get(), prepared.message_usage.get(), prepared.storage_usage.get()};
-  auto rebased_state = rebase_parallel_usage_cells(prepared.account->total_state, rebase_contexts);
-  if (rebased_state.is_error()) {
-    fatal_error(rebased_state.move_as_error_prefix("cannot rebase a parallel account state: "));
-    return {};
-  }
-  prepared.account->total_state = rebased_state.move_as_ok();
-  // Outbound messages retain payload cells loaded from the worker's private
-  // old-state snapshot. A later in-block transaction can persist such a cell
-  // into its own account state, so the wrappers must be rebased before the
-  // messages are registered, or the downstream state loses the usage link the
-  // serial pass would have kept.
-  for (auto& out_msg : trans->out_msgs) {
-    auto rebased_out_msg = rebase_parallel_usage_cells(out_msg, rebase_contexts);
-    if (rebased_out_msg.is_error()) {
-      fatal_error(rebased_out_msg.move_as_error_prefix("cannot rebase a parallel outbound message: "));
-      return {};
-    }
-    out_msg = rebased_out_msg.move_as_ok();
   }
   auto [account_it, inserted] = accounts.emplace(prepared.account_address, std::move(prepared.account));
   if (!inserted || !account_it->second) {
@@ -4589,6 +4609,36 @@ td::Result<std::size_t> Collator::process_parallel_inbound_batch() {
   const auto worker_count = params_.collator_opts->replay_parallel_account_workers;
   if (worker_count < 2 || is_masterchain() || nb_out_msgs_->is_eof() || have_unprocessed_account_dispatch_queue_) {
     return std::size_t{0};
+  }
+
+  // The lookahead materializes up to kParallelLookahead queue entries through
+  // the state usage tree before the serial pass would load them. Away from the
+  // block limits that is invisible: every touched entry is either committed in
+  // this batch or processed serially right after it, so both passes count the
+  // same cells by the next batch boundary. If the inbound phase ends while
+  // touched entries remain unprocessed, their cells stay in the collated-data
+  // proof and the candidate is no longer byte-identical to the serial pass.
+  // Keep the limit-adjacent region on the serial path so a started batch
+  // always commits fully and leaves no touched-but-unprocessed tail.
+  {
+    // 64 entries at ~2.5 KiB block bytes / ~2 KiB proof cells is ~160 KiB
+    // worst case; 256 KiB leaves headroom without giving up much of the
+    // 1 MiB soft window. This region is re-entered once per remaining serial
+    // message, so it deliberately updates no per-batch statistics.
+    static constexpr td::uint64 kBoundaryByteMargin = 1 << 18;
+    static constexpr td::uint64 kBoundaryCollatedMargin = 1 << 18;
+    static constexpr td::uint64 kBoundaryGasMargin = 2'000'000;  // 64 entries x typical jetton-transfer gas
+    static constexpr ton::LogicalTime kBoundaryLtMargin = 2000;
+    const auto& limits = block_limit_status_->limits;
+    if (!limits.bytes.fits(block::ParamLimits::cl_normal,
+                           block_limit_status_->estimate_block_size() + kBoundaryByteMargin) ||
+        !limits.collated_data.fits(block::ParamLimits::cl_normal,
+                                   block_limit_status_->collated_data_size_estimate + kBoundaryCollatedMargin) ||
+        !limits.gas.fits(block::ParamLimits::cl_normal, block_limit_status_->gas_used + kBoundaryGasMargin) ||
+        !limits.lt_delta.fits(block::ParamLimits::cl_normal,
+                              block_limit_status_->cur_lt - limits.start_lt + kBoundaryLtMargin)) {
+      return std::size_t{0};
+    }
   }
 
   auto& parallel_stats = stats_.replay_parallel_accounts;
@@ -4920,6 +4970,24 @@ static std::string block_full_comment(const block::BlockLimitStatus& block_limit
  * @returns True if the processing was successful, false otherwise.
  */
 bool Collator::process_inbound_internal_messages() {
+  // Replay-only stop-point telemetry: the serial and parallel passes must
+  // leave this phase at the same queue position with the same limit state, or
+  // the two candidates commit different amounts of work.
+  const auto log_inbound_stop = [&](const char* reason) {
+    if (!params_.is_replay) {
+      return;
+    }
+    const auto cell_stat = block_limit_status_->st_stat.get_stat();
+    const auto proof_stat = block_limit_status_->st_stat.get_proof_stat();
+    LOG(ERROR) << "REPLAY_INBOUND_STOP pass="
+               << (params_.collator_opts->replay_parallel_account_workers != 0 ? "parallel" : "serial")
+               << " reason=" << reason << " txs=" << block_limit_status_->transactions
+               << " gas=" << block_limit_status_->gas_used << " lt=" << block_limit_status_->cur_lt
+               << " est=" << block_limit_status_->estimate_block_size()
+               << " collated=" << block_limit_status_->collated_data_size_estimate
+               << " class=" << block_limit_status_->classify() << " cells=" << cell_stat.cells << "/"
+               << cell_stat.bits << " proof=" << proof_stat.cells << "/" << proof_stat.bits;
+  };
   SCOPE_EXIT {
     stats_.load_fraction_internals = block_limit_status_->load_fraction(block::ParamLimits::cl_normal);
   };
@@ -4940,6 +5008,7 @@ bool Collator::process_inbound_internal_messages() {
     auto& neighbor_stats = stats_.neighbors.at(kv->source);
     if (kv->limit_exceeded) {
       LOG(INFO) << "limit for imported messages is reached, stop processing inbound internal messages";
+      log_inbound_stop("import_limit");
       neighbor_stats.limit_reached = true;
       block::EnqueuedMsgDescr enq;
       enq.unpack(kv->msg.write());  // Visit cells to include it in proof
@@ -4955,10 +5024,12 @@ bool Collator::process_inbound_internal_messages() {
     }
     if (have_unprocessed_account_dispatch_queue_) {
       LOG(INFO) << "have unprocessed account dispatch queue, stop processing inbound internal messages";
+      log_inbound_stop("dispatch_queue");
       return true;
     }
     if (block_full_) {
       LOG(INFO) << "BLOCK FULL, stop processing inbound internal messages";
+      log_inbound_stop("block_full");
       block_limit_class_ = std::max(block_limit_class_, block_limit_status_->classify());
       stats_.limits_log += PSTRING() << "INBOUND_INT_MESSAGES: "
                                      << block_full_comment(*block_limit_status_, block::ParamLimits::cl_normal) << "\n";
@@ -4967,6 +5038,7 @@ bool Collator::process_inbound_internal_messages() {
     if (internal_msg_timeout_.is_in_past(td::Timestamp::now())) {
       block_full_ = true;
       LOG(WARNING) << "soft timeout reached, stop processing inbound internal messages";
+      log_inbound_stop("timeout");
       stats_.limits_log += PSTRING() << "INBOUND_INT_MESSAGES: timeout\n";
       break;
     }
@@ -4993,6 +5065,9 @@ bool Collator::process_inbound_internal_messages() {
       return fatal_error("error processing inbound internal message");
     }
     nb_out_msgs_->next();
+  }
+  if (nb_out_msgs_->is_eof()) {
+    log_inbound_stop("queue_eof");
   }
   inbound_queues_empty_ = nb_out_msgs_->is_eof();
   return true;
