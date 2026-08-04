@@ -283,8 +283,28 @@ Every paired result was between 1.91x and 2.75x, with a 2.21x median. On this
 exact workload those medians correspond to 702 and 1,634 raw tx/s of offline
 replay throughput. The JSON exposes these as full-replay diagnostic rates and
 retains the serial-first/shared-cache warning. These observations came from a
-local copied-mainnet corpus; the corpus and raw run logs are not included in
-this repository.
+local copied-mainnet corpus; the timing corpus and raw run logs are not
+included in this repository.
+
+A compact correctness fixture for this gate is checked in under
+`test/validator/data/` and runs in CTest. `test-block-workload-fixture`
+verifies the transaction-kind classifier against two hash-pinned mainnet
+blocks: masterchain block `83536321` must contain exactly one ordinary, one
+tick, and one tock transaction, and basechain block `88028077` must contain
+138 ordinary transactions across 108 accounts; a malformed or null transaction
+fails closed. `tvm-replay-four-root-fixture` replays block `88028077` from the
+checked-in raw BOC, 108 predecessor-bound account proofs, the config proof,
+the predecessor `OutMsgQueueInfo` proof, and transitively closed library
+bodies, with `--account-workers 2` and `--offline-collator-workers 2`. The
+witness-mode replay is fail-closed, and the runner additionally requires
+`full_block` scope, 138/138 InMsg and 114/114 OutMsg bindings, and all four
+augmented dictionary roots in both the serial gate and the offline collator
+probe. The fixture keeps the hindsight-witness label
+(`predecessor_state_witness_source=target_block_state_update_hindsight`); it
+is a regression gate for replay correctness, not a performance benchmark, and
+its wall times must not be quoted as measurements. The masterchain fixture
+covers only classification: no masterchain account proofs are included, and a
+tick/tock block still fails closed in the offline collator probe.
 
 A separate single-sample worker sweep on the same corpus produced 225.5,
 120.7, 81.6, and 74.2 ms prepared-path walls for 1, 2, 4, and 8 workers. The

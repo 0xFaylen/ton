@@ -20,6 +20,7 @@ add_executable(tvm-replay-bundle
   ../validator/impl/parallel-transaction-payload.cpp
   ../validator/impl/parallel-worker-pool.cpp
   ../validator/impl/selective-split-state.cpp
+  ../validator/validation-replay/block-workload.cpp
   ../validator/db/fileref.cpp
   ../validator/db/package.cpp
 )

@@ -82,3 +82,27 @@ target_link_libraries(test-selective-split-state PRIVATE
 )
 target_include_directories(test-selective-split-state PRIVATE ${CMAKE_SOURCE_DIR}/validator)
 ton_test(test-selective-split-state)
+
+add_executable(test-block-workload-fixture
+    test-block-workload-fixture.cpp
+    ${CMAKE_SOURCE_DIR}/validator/validation-replay/block-workload.cpp
+)
+target_link_libraries(test-block-workload-fixture PRIVATE
+    td-test-main
+    tdutils
+    ton_crypto
+    ton_block
+)
+target_include_directories(test-block-workload-fixture PRIVATE ${CMAKE_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/validator)
+target_compile_definitions(test-block-workload-fixture PRIVATE
+    TON_REPLAY_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
+ton_test(test-block-workload-fixture)
+
+if(TARGET tvm-replay-bundle)
+  add_test(NAME tvm-replay-four-root-fixture
+    COMMAND ${CMAKE_COMMAND}
+      -DREPLAY_TOOL=$<TARGET_FILE:tvm-replay-bundle>
+      "-DFIXTURE_DIR=${CMAKE_CURRENT_SOURCE_DIR}/data/four-root-88028077"
+      -P "${CMAKE_CURRENT_SOURCE_DIR}/run-four-root-fixture.cmake")
+  add_dependencies(all-tests tvm-replay-bundle)
+endif()

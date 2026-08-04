@@ -1,0 +1,3 @@
+# Replay fixtures are raw BOC/TL bytes. Never apply text/eol conversion:
+# an inserted CR breaks the hash-pinned fixture on checkout.
+* binary

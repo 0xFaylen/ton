@@ -545,10 +545,13 @@ does not establish sustainable shard capacity. The raw sweep outputs are not
 published in this repository.
 
 The reusable pool, proof merger, canonical payload, coordinator, scheduler, and
-atomic root helpers have checked-in unit tests, but the complete orchestration
-path currently depends on the external copied-mainnet corpus for its positive
-integration test. A compact checked-in BOC/proof fixture remains a
-regression-coverage gate before live Collator integration.
+atomic root helpers have checked-in unit tests. Since 2026-08-04 the complete
+offline orchestration path also has a checked-in positive integration test: the
+`tvm-replay-four-root-fixture` CTest replays mainnet block `88028077` from a
+compact committed BOC/proof fixture and requires the full fail-closed four-root
+gate in both the serial replay and the offline collator probe. The external
+copied-mainnet corpus is still required for timing sweeps, but no longer for
+regression coverage of the correctness path.
 
 The corpus still lacks the target candidate's historical collated-data witness.
 A later block-bound OutMsgQueueInfo proof made a stricter hindsight gate
@@ -574,6 +577,31 @@ at every point. This still does not mutate a live Collator, create the candidate
 BOC, run ValidateQuery, or measure delivery. The direct next gate remains a
 copied mainnet validator database with byte-identical candidates and normal
 ValidateQuery; `mainnet_sustainable_raw_tps` remains null.
+
+## Checked-in four-root regression fixture - 2026-08-04
+
+The four-root replay gate no longer depends on an uncommitted local corpus for
+its positive test. `test/validator/data/four-root-88028077/` now contains the
+raw target-block BOC, all 108 predecessor-bound account proofs, the config
+proof, the predecessor `OutMsgQueueInfo` proof, and the transitively closed
+library bodies, 1.2 MiB in total. The `tvm-replay-four-root-fixture` CTest
+rebuilds the exact witness-mode command and requires `full_block` scope,
+138/138 InMsg and 114/114 OutMsg descriptor bindings, and
+`augmented_dictionary_roots_validated=4` from both the serial gate and the
+`--offline-collator-workers 2` probe; any narrowing of the replay scope fails
+the test. The block-workload classifier moved from the CLI into
+`validator/validation-replay/block-workload.{h,cpp}` so that
+`test-block-workload-fixture` can pin transaction kinds against two hash-pinned
+blocks: masterchain block `83536321` with exactly one ordinary, one tick, and
+one tock transaction, and the basechain fixture block with 138 ordinary
+transactions across 108 accounts. Malformed and null transactions fail closed.
+
+The masterchain fixture intentionally covers classification only. No
+masterchain account proofs are committed, a tick/tock block still fails closed
+in the offline collator probe, and separating tick/tock into a serial
+coordinator lane remains an open integration gate. Fixture wall times are not
+measurements; the timing corpus stays external, and
+`mainnet_sustainable_raw_tps` remains `null`.
 
 ## Replay-only Collator integration - implementation gate
 

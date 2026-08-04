@@ -60,6 +60,7 @@
 #include "validator/impl/parallel-worker-pool.h"
 #include "validator/impl/selective-split-state.h"
 #include "validator/interfaces/tvm-hotpath-stats.h"
+#include "validator/validation-replay/block-workload.h"
 #include "vm/boc.h"
 #include "vm/cells/CellUsageTree.h"
 #include "vm/cells/DataCell.h"
@@ -82,6 +83,10 @@ using ton::validator::parallel_inbound::InboundDescriptorContext;
 using ton::validator::parallel_inbound::inspect_transaction_payload;
 using ton::validator::parallel_inbound::OutboundQueueKey;
 using ton::validator::parallel_inbound::WorkItem;
+using ton::validator::replay::BlockWorkloadSummary;
+using ton::validator::replay::classify_and_count_transaction;
+using ton::validator::replay::summarize_account_blocks;
+using ton::validator::replay::TransactionKindCounts;
 
 Hash256 as_hash256(const td::Bits256& value) {
   Hash256 result{};
@@ -171,32 +176,6 @@ struct ReplayAccountArtifacts {
   std::vector<ton::validator::parallel_inbound::AccountDictionaryDelta> account_dictionary_deltas;
   std::map<Hash256, Hash256> inbound_message_transactions;
   std::map<Hash256, Hash256> outbound_message_transactions;
-};
-
-struct TransactionKindCounts {
-  std::size_t ordinary{0};
-  std::size_t tick{0};
-  std::size_t tock{0};
-  std::size_t storage{0};
-  std::size_t split_prepare{0};
-  std::size_t split_install{0};
-  std::size_t merge_prepare{0};
-  std::size_t merge_install{0};
-
-  void add(const TransactionKindCounts& other) {
-    ordinary += other.ordinary;
-    tick += other.tick;
-    tock += other.tock;
-    storage += other.storage;
-    split_prepare += other.split_prepare;
-    split_install += other.split_install;
-    merge_prepare += other.merge_prepare;
-    merge_install += other.merge_install;
-  }
-
-  std::size_t total() const {
-    return ordinary + tick + tock + storage + split_prepare + split_install + merge_prepare + merge_install;
-  }
 };
 
 struct ReplayResult {
@@ -350,16 +329,6 @@ td::Status collect_library_refs(Ref<vm::Cell> cell, std::set<vm::Cell::Hash>& vi
                                 int depth = 1024);
 std::string join_library_hashes(const std::set<td::Bits256>& libraries);
 
-struct BlockWorkloadSummary {
-  std::size_t distinct_accounts{0};
-  std::size_t raw_transactions{0};
-  std::size_t max_account_transactions{0};
-  TransactionKindCounts transaction_kinds;
-};
-
-td::Result<BlockWorkloadSummary> summarize_account_blocks(const BlockContext& block_context);
-td::Result<TvmHotpathStats::ExecutionKind> classify_and_count_transaction(Ref<vm::Cell> transaction,
-                                                                          TransactionKindCounts& counts);
 std::string transaction_kinds_json(const TransactionKindCounts& counts);
 
 td::Status write_new_file(td::CSlice path, td::Slice data) {
@@ -508,7 +477,7 @@ td::Result<std::string> list_archive_blocks(const std::string& archive) {
             return;
           }
           auto loaded = context.move_as_ok();
-          auto workload = summarize_account_blocks(loaded);
+          auto workload = summarize_account_blocks(loaded.account_blocks);
           if (workload.is_error()) {
             scan_status = workload.move_as_error_prefix("cannot summarize archive block: ");
             return;
@@ -701,52 +670,6 @@ td::Result<BlockContext> load_intermediate_block(const std::string& archive, con
   return it->second;
 }
 
-td::Result<TvmHotpathStats::ExecutionKind> classify_and_count_transaction(Ref<vm::Cell> transaction,
-                                                                          TransactionKindCounts& counts) {
-  if (transaction.is_null()) {
-    return td::Status::Error("cannot classify a null transaction");
-  }
-  block::gen::Transaction::Record record;
-  if (!tlb::unpack_cell(transaction, record)) {
-    return td::Status::Error("cannot unpack transaction while classifying its kind");
-  }
-  const auto tag = block::gen::t_TransactionDescr.get_tag(vm::load_cell_slice(record.description));
-  switch (tag) {
-    case block::gen::TransactionDescr::trans_ord:
-      ++counts.ordinary;
-      return TvmHotpathStats::ExecutionKind::ordinary;
-    case block::gen::TransactionDescr::trans_tick_tock: {
-      block::gen::TransactionDescr::Record_trans_tick_tock tick_tock;
-      if (!tlb::unpack_cell(record.description, tick_tock)) {
-        return td::Status::Error("cannot unpack tick-tock transaction description while classifying its kind");
-      }
-      if (tick_tock.is_tock) {
-        ++counts.tock;
-      } else {
-        ++counts.tick;
-      }
-      return TvmHotpathStats::ExecutionKind::tick_tock;
-    }
-    case block::gen::TransactionDescr::trans_storage:
-      ++counts.storage;
-      return TvmHotpathStats::ExecutionKind::other;
-    case block::gen::TransactionDescr::trans_split_prepare:
-      ++counts.split_prepare;
-      return TvmHotpathStats::ExecutionKind::other;
-    case block::gen::TransactionDescr::trans_split_install:
-      ++counts.split_install;
-      return TvmHotpathStats::ExecutionKind::other;
-    case block::gen::TransactionDescr::trans_merge_prepare:
-      ++counts.merge_prepare;
-      return TvmHotpathStats::ExecutionKind::other;
-    case block::gen::TransactionDescr::trans_merge_install:
-      ++counts.merge_install;
-      return TvmHotpathStats::ExecutionKind::other;
-    default:
-      return td::Status::Error("unknown transaction description tag while classifying its kind");
-  }
-}
-
 std::string transaction_kinds_json(const TransactionKindCounts& counts) {
   td::StringBuilder out;
   out << "{\"total\":" << counts.total() << ",\"ordinary\":" << counts.ordinary << ",\"tick\":" << counts.tick
@@ -754,65 +677,6 @@ std::string transaction_kinds_json(const TransactionKindCounts& counts) {
       << ",\"split_prepare\":" << counts.split_prepare << ",\"split_install\":" << counts.split_install
       << ",\"merge_prepare\":" << counts.merge_prepare << ",\"merge_install\":" << counts.merge_install << "}";
   return out.as_cslice().str();
-}
-
-td::Result<BlockWorkloadSummary> summarize_account_blocks(const BlockContext& block_context) {
-  vm::AugmentedDictionary account_blocks{vm::load_cell_slice_ref(block_context.account_blocks), 256,
-                                         block::tlb::aug_ShardAccountBlocks};
-  BlockWorkloadSummary result;
-  td::Status scan_status = td::Status::OK();
-  const bool accounts_ok = account_blocks.check_for_each_extra(
-      [&](Ref<vm::CellSlice> account_block_slice, Ref<vm::CellSlice>, td::ConstBitPtr key, int key_len) {
-        if (key_len != 256) {
-          scan_status = td::Status::Error("invalid account block key length");
-          return false;
-        }
-        const StdSmcAddress address = key;
-        block::gen::AccountBlock::Record account_block;
-        if (!tlb::csr_unpack(std::move(account_block_slice), account_block) || account_block.account_addr != address) {
-          scan_status = td::Status::Error("cannot unpack AccountBlock");
-          return false;
-        }
-
-        std::size_t account_transactions = 0;
-        vm::AugmentedDictionary transactions{vm::DictNonEmpty(), std::move(account_block.transactions), 64,
-                                             block::tlb::aug_AccountTransactions};
-        const bool transactions_ok = transactions.check_for_each_extra(
-            [&](Ref<vm::CellSlice> transaction_slice, Ref<vm::CellSlice>, td::ConstBitPtr, int tx_key_len) {
-              auto transaction = transaction_slice->prefetch_ref();
-              if (tx_key_len != 64 || transaction.is_null()) {
-                scan_status = td::Status::Error("invalid transaction entry in AccountBlock");
-                return false;
-              }
-              auto kind = classify_and_count_transaction(std::move(transaction), result.transaction_kinds);
-              if (kind.is_error()) {
-                scan_status = kind.move_as_error();
-                return false;
-              }
-              ++account_transactions;
-              return true;
-            });
-        if (!transactions_ok) {
-          if (scan_status.is_ok()) {
-            scan_status = td::Status::Error("cannot scan AccountBlock transactions");
-          }
-          return false;
-        }
-        ++result.distinct_accounts;
-        result.raw_transactions += account_transactions;
-        result.max_account_transactions = std::max(result.max_account_transactions, account_transactions);
-        return true;
-      });
-  if (!accounts_ok) {
-    if (scan_status.is_ok()) {
-      scan_status = td::Status::Error("cannot scan AccountBlocks dictionary");
-    }
-    return scan_status;
-  }
-  if (result.transaction_kinds.total() != result.raw_transactions) {
-    return td::Status::Error("transaction kind counts do not cover the complete block workload");
-  }
-  return result;
 }
 
 td::Result<LoadedState> load_state_boc_unchecked(const std::string& path, td::Slice description) {
@@ -3408,7 +3272,7 @@ td::Result<ParallelAccountReplayProbe> run_parallel_account_replay_probe(
 td::Result<std::string> inspect_json(const BlockContext& target, int split_depth) {
   TRY_RESULT(prefixes, collect_account_prefixes(target, split_depth));
   TRY_RESULT(accounts, collect_accounts(target));
-  TRY_RESULT(workload, summarize_account_blocks(target));
+  TRY_RESULT(workload, summarize_account_blocks(target.account_blocks));
   TRY_RESULT(state_update_views, extract_state_update_raw_views(target));
   td::StringBuilder out;
   out << "{\"schema_version\":1,\"mode\":\"inspect\",\"block_id\":\"" << target.id.to_str()
