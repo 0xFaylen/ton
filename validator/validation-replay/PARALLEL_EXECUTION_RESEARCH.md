@@ -603,6 +603,57 @@ coordinator lane remains an open integration gate. Fixture wall times are not
 measurements; the timing corpus stays external, and
 `mainnet_sustainable_raw_tps` remains `null`.
 
+## Saturated jetton corpus gate - 2026-08-04 - REJECTED
+
+The replay-only parallel Collator path was run for the first time against a
+saturated jetton workload, and the byte-equality gate correctly rejected every
+run. This section records a real open defect, not a passed milestone.
+
+Setup: the jetton TPS benchmark tooling now runs on Windows. `td::mkpath`
+accepts `/`-joined paths on Windows (it previously split only on `\`, so
+benchmark tools silently failed to create directories), `bench_jetton.py`
+gained `--build-dir`, an optional `choom` wrapper, and a `--vrp-workers` gate
+phase that replays the most transaction-heavy wc0 blocks through
+`vrp run --mode both --parallel-account-workers N` on the same tontester node
+that produced them. `bench-state-gen self-test` passes on Windows; a
+100,000-wallet-pair state (800,056 cells, 113 MB celldb) boots the network and
+serves spam.
+
+Workload: 27,000 wallet-v5 externals at 600/s for 45 s; 23,814 were included
+within the measurement window, 1,304 included raw tx/s and 434 jetton
+transfers/s as a local Windows diagnostic only. The three gated blocks carried
+674-684 raw transactions at 1.30-1.32 MB serialized, past the 1 MiB Config 23
+soft byte threshold.
+
+Result: all 18 gate runs (blocks 10/14/58, workers 2/4/8, serial-first and
+parallel-first) failed with the same deterministic signature:
+`id=false, block_bytes=false, state_update:false`, while `value_flow`,
+`extra`, `in_msg_descr`, `out_msg_descr`, `account_blocks`,
+`collated_hash`, and `collated_bytes` all matched byte-for-byte. The parallel
+candidate was 17,501 and 13,238 bytes smaller on blocks 58 and 10 and 2,536
+bytes larger on block 14. The committed transaction set and all descriptor
+roots are identical; only the Merkle-update cell-usage footprint diverges, in
+both directions, reproducibly per block.
+
+Interpretation: the worker cell-usage journal rebase does not reproduce the
+serial pass's prev-state usage set under deep-inbound-queue jetton cascades.
+The earlier synthetic corpora (independent compute messages, empty-body
+transfers) did not exercise whatever path leaks or adds these reads. Because
+collated data matches while the state update differs, the divergence is
+specific to the usage set consumed by `MerkleUpdate` generation rather than to
+the collated-proof builder. The executable path remains rejected for live
+collation, and this defect must be root-caused before any further executor
+claim. `mainnet_sustainable_raw_tps` remains `null`.
+
+Repro artifacts: the node database containing blocks 10/14/58 is preserved
+locally (969 MB) together with `vrp-gate.log`, `results.json`, and
+`blocks.csv`; none of it is committed. The state is regenerable from seed
+`ab..ab` with `--v5-count 100000`, but block byte-identity across regenerated
+networks is not expected. Next step: extend the mismatch error path to diff
+the two state-update BOCs' pruned-cell sets and report a bounded sample of
+cells present in one usage footprint and absent from the other, then fix the
+journal/rebase gap the diff identifies.
+
 ## Replay-only Collator integration - implementation gate
 
 The Collator now contains a default-off, replay-only path for inbound internal

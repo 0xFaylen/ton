@@ -12,9 +12,11 @@ via tonlib as the first integration gate.
 
 import argparse
 import asyncio
+import csv
 import datetime
 import json
 import logging
+import re
 import shlex
 import shutil
 import subprocess
@@ -58,6 +60,7 @@ class BenchParams:
     manifest: Path
     net_dir: Path
     celldb_checkpoint_dir: Path | None
+    build_dir: Path | None
     rate: float
     duration: int
     warmup: int
@@ -71,6 +74,9 @@ class BenchParams:
     node_verbosity: int
     engine_args: tuple[str, ...]
     spam_args: tuple[str, ...]
+    vrp_workers: tuple[int, ...]
+    vrp_blocks: int
+    vrp_samples: int
 
 
 def _parse_args(argv: list[str] | None = None) -> BenchParams:
@@ -141,14 +147,52 @@ def _parse_args(argv: list[str] | None = None) -> BenchParams:
         dest="spam_args",
         help="extra bench-spam CLI arg (repeatable), e.g. --spam-arg=--connections=8",
     )
+    _ = parser.add_argument(
+        "--build-dir",
+        type=Path,
+        default=None,
+        help="CMake build directory with the TON binaries (default: <repo root>/build)",
+    )
+    _ = parser.add_argument(
+        "--vrp-workers",
+        default="",
+        help=(
+            "comma-separated parallel-account worker counts (e.g. 2,4,8); when non-empty, "
+            "after the spam phase the most transaction-heavy wc0 blocks are replayed through "
+            "the replay-only parallel Collator gate (vrp run --mode both) and every run must "
+            "produce a byte-identical candidate and pass ValidateQuery"
+        ),
+    )
+    _ = parser.add_argument(
+        "--vrp-blocks",
+        type=int,
+        default=3,
+        help="number of most transaction-heavy wc0 blocks to gate (default: 3)",
+    )
+    _ = parser.add_argument(
+        "--vrp-samples",
+        type=int,
+        default=2,
+        help=(
+            "paired samples per (block, workers); sample order alternates serial-first and "
+            "parallel-first so cache warming cannot masquerade as executor speedup (default: 2)"
+        ),
+    )
     args = parser.parse_args(argv)
     celldb_checkpoint_dir = cast(Path | None, args.celldb_checkpoint_dir)
+    build_dir = cast(Path | None, args.build_dir)
+    vrp_workers_raw = cast(str, args.vrp_workers).strip()
+    vrp_workers = tuple(int(w) for w in vrp_workers_raw.split(",") if w) if vrp_workers_raw else ()
+    for w in vrp_workers:
+        if w < 2 or w > 64:
+            parser.error("--vrp-workers entries must be between 2 and 64")
     return BenchParams(
         manifest=cast(Path, args.manifest).absolute(),
         net_dir=cast(Path, args.net_dir).absolute(),
         celldb_checkpoint_dir=(
             celldb_checkpoint_dir.absolute() if celldb_checkpoint_dir is not None else None
         ),
+        build_dir=build_dir.absolute() if build_dir is not None else None,
         rate=cast(float, args.rate),
         duration=cast(int, args.duration),
         warmup=cast(int, args.warmup),
@@ -162,6 +206,9 @@ def _parse_args(argv: list[str] | None = None) -> BenchParams:
         node_verbosity=cast(int, args.node_verbosity),
         engine_args=tuple(cast(list[str], args.engine_args)),
         spam_args=tuple(cast(list[str], args.spam_args)),
+        vrp_workers=vrp_workers,
+        vrp_blocks=cast(int, args.vrp_blocks),
+        vrp_samples=cast(int, args.vrp_samples),
     )
 
 
@@ -182,12 +229,19 @@ def _git_rev(repo_root: Path) -> str:
     ).stdout.strip()
 
 
-async def _run_choomed(cmd: list[str]) -> None:
-    """Run a heavy subprocess under `choom -n 1000 --`, inheriting stdout/stderr.
+def _bench_exe(build_dir: Path, name: str) -> str:
+    suffix = ".exe" if sys.platform == "win32" else ""
+    return str(build_dir / f"benchmark/{name}{suffix}")
 
-    Inherited stderr means e.g. bench-spam progress lines stream to the console.
+
+async def _run_choomed(cmd: list[str]) -> None:
+    """Run a heavy subprocess, inheriting stdout/stderr.
+
+    On Linux the process runs under `choom -n 1000 --`; where choom does not
+    exist (Windows, macOS) it runs directly. Inherited stderr means e.g.
+    bench-spam progress lines stream to the console.
     """
-    full_cmd = ["choom", "-n", "1000", "--", *cmd]
+    full_cmd = ["choom", "-n", "1000", "--", *cmd] if shutil.which("choom") else cmd
     l.info(f"running: {shlex.join(full_cmd)}")
     started = time.monotonic()
     process = await asyncio.create_subprocess_exec(*full_cmd)
@@ -257,7 +311,7 @@ async def _run_spam(install: Install, repo_root: Path, node: FullNode, params: B
 
     await _run_choomed(
         [
-            str(install.build_dir / "benchmark/bench-spam"),
+            _bench_exe(install.build_dir, "bench-spam"),
             "--manifest",
             str(params.manifest),
             "--contracts-dir",
@@ -297,9 +351,124 @@ async def _run_spam(install: Install, repo_root: Path, node: FullNode, params: B
     return 0
 
 
+_VRP_POLL_INTERVAL = 0.5
+_VRP_RUN_TIMEOUT = 300.0
+# Key=value pairs in `vrp show` status text, e.g. `speedup=1.741` or
+# `exact_candidate_match=true`.
+_VRP_KV_RE = re.compile(r"(\w+)=([0-9.eE+-]+|true|false)")
+
+
+def _top_wc0_blocks(blocks_csv: Path, count: int) -> list[tuple[int, int]]:
+    """Return [(seqno, n_txs)] of the most transaction-heavy wc0 blocks."""
+    rows: list[tuple[int, int]] = []
+    with blocks_csv.open() as f:
+        for row in csv.DictReader(f):
+            rows.append((int(row["seqno"]), int(row["n_txs"])))
+    rows.sort(key=lambda r: (-r[1], r[0]))
+    return rows[:count]
+
+
+async def _vrp_wait_idle(node: FullNode) -> str:
+    """Poll `vrp show` until no run is active; return the final show output."""
+    deadline = time.monotonic() + _VRP_RUN_TIMEOUT
+    while True:
+        show = await node.engine_console.validation_replayer_command("show")
+        if "Current run" not in show and "Runs in queue" not in show:
+            return show
+        if time.monotonic() > deadline:
+            raise RuntimeError(f"vrp run did not finish within {_VRP_RUN_TIMEOUT}s:\n{show}")
+        await asyncio.sleep(_VRP_POLL_INTERVAL)
+
+
+def _vrp_last_run_status(show: str) -> tuple[int, str]:
+    """Extract (idx, status text) of the newest past run from `vrp show` output."""
+    starts = [m for m in re.finditer(r"^  #(\d+): ", show, re.MULTILINE)]
+    if not starts:
+        raise RuntimeError(f"no past runs in vrp show output:\n{show}")
+    last = starts[-1]
+    return int(last.group(1)), show[last.start() :]
+
+
+async def _run_vrp_gate(node: FullNode, params: BenchParams) -> int:
+    """Replay the most transaction-heavy wc0 blocks through the replay-only
+    parallel Collator gate. Every run must produce a byte-identical candidate
+    and pass ValidateQuery; any ERROR status fails the benchmark run."""
+    blocks_csv = params.net_dir / "spam" / "blocks.csv"
+    if not blocks_csv.exists():
+        l.error(f"vrp gate: {blocks_csv} does not exist")
+        return 1
+    targets = _top_wc0_blocks(blocks_csv, params.vrp_blocks)
+    if not targets:
+        l.error("vrp gate: no wc0 blocks in blocks.csv")
+        return 1
+    l.info(f"vrp gate: blocks {[(s, n) for s, n in targets]}, workers {list(params.vrp_workers)}")
+
+    results: list[dict[str, JSONSerializable]] = []
+    raw_log: list[str] = []
+    failures = 0
+    for seqno, n_txs in targets:
+        for workers in params.vrp_workers:
+            for sample in range(params.vrp_samples):
+                parallel_first = sample % 2 == 1
+                command = (
+                    f"run --mode both --parallel-account-workers {workers}"
+                    + (" --parallel-first" if parallel_first else "")
+                    + f" (0,8000000000000000,{seqno})"
+                )
+                l.info(f"vrp gate: {command}")
+                started = await node.engine_console.validation_replayer_command(command)
+                if "Started" not in started:
+                    raise RuntimeError(f"unexpected vrp run response: {started}")
+                show = await _vrp_wait_idle(node)
+                run_idx, status = _vrp_last_run_status(show)
+                raw_log.append(f"=== seqno={seqno} workers={workers} sample={sample} ===\n{status}")
+                ok = "ERROR" not in status and "exact_candidate_match=true" in status
+                failures += not ok
+                parsed: dict[str, JSONSerializable] = {}
+                for line in status.splitlines():
+                    stripped = line.strip()
+                    for prefix, section in (
+                        ("Collate:", "collate"),
+                        ("Block workload:", "workload"),
+                        ("Parallel account replay:", "replay"),
+                        ("Parallel account actual:", "actual"),
+                        ("Validate:", "validate"),
+                    ):
+                        if stripped.startswith(prefix):
+                            parsed[section] = dict(_VRP_KV_RE.findall(stripped))
+                results.append(
+                    {
+                        "seqno": seqno,
+                        "n_txs": n_txs,
+                        "workers": workers,
+                        "sample": sample,
+                        "pass_order": "parallel-first" if parallel_first else "serial-first",
+                        "run_idx": run_idx,
+                        "ok": ok,
+                        "status_fields": parsed,
+                    }
+                )
+                if not ok:
+                    l.error(f"vrp gate FAILED for {seqno} workers={workers}:\n{status}")
+                # Free retained hotpath results so 16-run history pressure does
+                # not evict runs we still want to inspect manually.
+                _ = await node.engine_console.validation_replayer_command(f"forget {run_idx}")
+
+    params.out_dir.mkdir(parents=True, exist_ok=True)
+    _ = (params.out_dir / "vrp-gate.json").write_text(
+        json.dumps({"failures": failures, "runs": results}, indent=2) + "\n"
+    )
+    _ = (params.out_dir / "vrp-gate.log").write_text("\n".join(raw_log))
+    if failures:
+        l.error(f"vrp gate: {failures} failed runs (see vrp-gate.log)")
+        return 1
+    l.info(f"vrp gate: all {len(results)} runs byte-identical and validated")
+    return 0
+
+
 async def _amain(params: BenchParams) -> int:
     repo_root = Path(__file__).resolve().parents[1]
-    install = Install(repo_root / "build", repo_root)
+    install = Install(params.build_dir or repo_root / "build", repo_root)
     install.tonlibjson.client_set_verbosity_level(1)
 
     external = ExternalBasechainState.from_manifest(params.manifest)
@@ -343,7 +512,7 @@ async def _amain(params: BenchParams) -> int:
             celldb_dst = params.celldb_checkpoint_dir
         await _run_choomed(
             [
-                str(install.build_dir / "benchmark/bench-state-gen"),
+                _bench_exe(install.build_dir, "bench-state-gen"),
                 "checkpoint",
                 "--src",
                 str(celldb_src),
@@ -367,7 +536,10 @@ async def _amain(params: BenchParams) -> int:
 
         if params.smoke:
             return await _smoke_probe(node, params.probe_addr)
-        return await _run_spam(install, repo_root, node, params)
+        spam_result = await _run_spam(install, repo_root, node, params)
+        if spam_result != 0 or not params.vrp_workers:
+            return spam_result
+        return await _run_vrp_gate(node, params)
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -379,7 +379,17 @@ basechain account preparation queried the masterchain-only special-contract
 dictionary, worker `UsageCell` paths were published without rebasing them onto
 the coordinator proof anchor, and a partial prepared batch could not express a
 safe block-limit stop. The current path falls back or preserves a continuous
-canonical prefix for these cases. This synthetic result is not evidence of
+canonical prefix for these cases.
+
+A fifth defect is currently open. On a saturated jetton corpus (674-684
+transactions per 1.3 MB block from 100k wallet-v5/jetton-wallet pairs), all 18
+`--parallel-account-workers` gate runs were rejected: transactions,
+descriptors, value flow, and collated data are byte-identical, but the block
+`state_update` differs deterministically, so the Merkle-update cell-usage
+footprint of the parallel pass does not match the serial pass. See the
+2026-08-04 jetton-corpus section of `PARALLEL_EXECUTION_RESEARCH.md`. Until
+this is root-caused and fixed, the replay-only parallel path must be treated
+as failing its own equivalence gate on representative workloads. This synthetic result is not evidence of
 sustainable shard TPS. The report intentionally keeps
 `mainnet_sustainable_raw_tps=null`. A copied mainnet validator database must
 still pass the same exact-candidate and `ValidateQuery` gates across a

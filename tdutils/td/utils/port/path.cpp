@@ -76,7 +76,12 @@ Status mkpath(CSlice path, int32 mode) {
   Status first_error = Status::OK();
   Status last_error = Status::OK();
   for (size_t i = 1; i < path.size(); i++) {
-    if (path[i] == TD_DIR_SLASH) {
+    bool is_separator = path[i] == TD_DIR_SLASH;
+#if TD_PORT_WINDOWS
+    // Windows APIs accept '/' in paths, so callers legitimately join with it.
+    is_separator = is_separator || path[i] == '/';
+#endif
+    if (is_separator) {
       last_error = mkdir(PSLICE() << path.substr(0, i), mode);
       if (last_error.is_error() && first_error.is_ok()) {
         first_error = last_error.clone();
