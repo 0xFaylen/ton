@@ -776,9 +776,30 @@ an adversarial DAG-ladder contract could blow up exponentially - is fixed
 with per-cell memoization. After that fix a fresh saturated corpus passed
 **24 of 24** gate runs (four blocks of 670-672 transactions, workers 2/4/8,
 both pass orders, byte-identical block and collated data, `ValidateQuery`
-green). One clean corpus does not retire the ~100-byte wrapper-topology
-residual: a boundary-adjacent block can still flip one transaction, and the
-gate will fail closed when it does.
+green).
+
+## Wrapper-topology residual closed - 2026-08-04
+
+New replay-only telemetry (`REPLAY_LIMIT_DELTA`, enabled by the vrp gate for
+both passes) logs the per-transaction `st_stat` delta around
+`trans->update_limits`, making the two passes comparable point by point. On
+two saturated blocks the sequences diverged at exactly **one transaction per
+block**: same account, same serial call site, but `dext=2` in the serial pass
+versus `dext=0` in the parallel pass, with the retained old subtree counted
+as ~17 extra proof cells (~924 estimate bytes) - precisely the observed
+drift. The account was one that had already received a parallel-committed
+transaction: its in-memory `code`/`data` fields kept worker-tree wrappers
+(the reviewer's section-C observation), so a later serial transaction on the
+same account executed through them and its retained cells lost the state-tree
+linkage that `add_proof` uses to find old-state boundaries.
+
+`commit_parallel_inbound_transaction` now rebases `new_code`, `new_data`,
+and `new_library` alongside `new_total_state` and the outbound messages.
+With the fix, per-transaction delta parity is exact: **zero** differences
+across 686- and 682-transaction blocks, and the gate passes. The estimate
+drift is closed at its source rather than masked by margins; the boundary
+guard remains as the defense against lookahead-tail proof leakage, which is
+a separate mechanism.
 
 ## Replay-only Collator integration - implementation gate
 

@@ -48,7 +48,8 @@ td::Status write_new_file(td::CSlice path, td::Slice data) {
 
 td::Ref<CollatorOptions> clone_collator_options(const td::Ref<CollatorOptions>& source,
                                                 td::uint32 replay_parallel_account_workers,
-                                                const td::Bits256& replay_watch_account) {
+                                                const td::Bits256& replay_watch_account,
+                                                bool replay_log_limit_deltas) {
   auto target = td::Ref<CollatorOptions>{true};
   auto& mutable_target = target.write();
   if (source.not_null()) {
@@ -66,6 +67,7 @@ td::Ref<CollatorOptions> clone_collator_options(const td::Ref<CollatorOptions>& 
   }
   mutable_target.replay_parallel_account_workers = replay_parallel_account_workers;
   mutable_target.replay_watch_account = replay_watch_account;
+  mutable_target.replay_log_limit_deltas = replay_log_limit_deltas;
   return target;
 }
 
@@ -1023,7 +1025,8 @@ class ValidationReplayerImpl : public ValidationReplayer {
                 .prev = unpacked.prev,
                 .creator = unpacked.creator,
                 .validator_set = validator_set,
-                .collator_opts = clone_collator_options(opts_->get_collator_options(), workers, watch_account),
+                .collator_opts = clone_collator_options(opts_->get_collator_options(), workers, watch_account,
+                                                        parallel_account_workers != 0),
                 .utime = (double)unpacked.gen_utime,
                 .hard_timeout = td::Timestamp::in(10.0),
                 .is_replay = true,

@@ -400,16 +400,20 @@ the collated proof), which a deterministic boundary guard now prevents by
 keeping the limit-adjacent region serial. After these fixes 18 of 24 gate
 runs pass, including limit-bound 672-682-transaction blocks.
 
-Two facts must accompany that result. Every passing run measured a
+The last known equivalence defect - a roughly 100-byte size-estimate drift
+that could flip one transaction exactly at the byte threshold - was traced
+with per-transaction limit-delta telemetry to the in-memory `code`/`data`
+fields of parallel-committed accounts keeping worker-tree wrappers, so a
+later serial transaction on the same account lost the state-tree boundary
+that `add_proof` relies on. Those fields are now rebased at commit, and the
+per-transaction delta sequences of the two passes match exactly.
+
+One fact must accompany the correctness result: every passing run measured a
 serial/parallel speedup mostly **below 1.0** (0.68-1.41, median well under
 1.0), so this path is currently not faster than serial collation on this
-workload. And one residual defect remains: on one of four gated blocks a
-roughly 100-byte size-estimate drift - caused by wrapper-topology differences
-for deduplicated cells - flipped a single transaction exactly at the byte
-threshold. See the 2026-08-04 sections of `PARALLEL_EXECUTION_RESEARCH.md`.
-The replay-only parallel path therefore still fails its own equivalence gate
-on roughly one saturated block in four and must not be presented as
-validated.
+workload, and no throughput claim may be made from it. Equivalence has been
+demonstrated only on this synthetic Windows corpus; matched runs on copied
+mainnet validator state remain a required gate.
 
 When a gate run fails, the error now includes a bounded diff of the two
 Merkle-update cell footprints with ref-index breadcrumbs from the update root

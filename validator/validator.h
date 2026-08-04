@@ -83,6 +83,9 @@ struct CollatorOptions : public td::CntObject {
   // Replay-only diagnostics: log every collator access to this account.
   // Zero disables the watch.
   td::Bits256 replay_watch_account = td::Bits256::zero();
+  // Replay-only diagnostics: log the per-transaction block-limit stat delta,
+  // so a serial and a parallel pass can be compared point by point.
+  bool replay_log_limit_deltas = false;
 };
 
 struct CollatorsList : public td::CntObject {

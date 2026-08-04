@@ -3659,10 +3659,23 @@ Ref<vm::Cell> Collator::create_ordinary_transaction(Ref<vm::Cell> msg_root,
   }
   std::unique_ptr<block::transaction::Transaction> trans = res.move_as_ok();
 
+  const bool log_limit_delta = params_.collator_opts->replay_log_limit_deltas && params_.is_replay;
+  const auto limit_stat_before =
+      log_limit_delta ? block_limit_status_->st_stat.get_total_stat() : vm::NewCellStorageStat::Stat{};
   if (!trans->update_limits(*block_limit_status_,
                             /* with_gas = */ !(is_special_tx && compute_phase_cfg_.special_gas_full))) {
     fatal_error("cannot update block limit status to include the new transaction");
     return {};
+  }
+  if (log_limit_delta) {
+    const auto after = block_limit_status_->st_stat.get_total_stat();
+    LOG(ERROR) << "REPLAY_LIMIT_DELTA pass="
+               << (params_.collator_opts->replay_parallel_account_workers != 0 ? "parallel" : "serial")
+               << " site=serial_tx idx=" << block_limit_status_->transactions << " account=" << addr.to_hex()
+               << " dcells=" << after.cells - limit_stat_before.cells
+               << " dbits=" << after.bits - limit_stat_before.bits
+               << " dint=" << after.internal_refs - limit_stat_before.internal_refs
+               << " dext=" << after.external_refs - limit_stat_before.external_refs;
   }
   auto trans_root = trans->commit(*acc);
   if (trans_root.is_null()) {
@@ -4511,9 +4524,34 @@ Ref<vm::Cell> Collator::commit_parallel_inbound_transaction(ParallelInboundPrepa
     }
     out_msg = rebased_out_msg.move_as_ok();
   }
+  // The committed account object stays in memory and a later serial
+  // transaction on the same account executes against these fields. If they
+  // keep worker wrappers, that transaction's retained cells lose their
+  // state-tree linkage and its add_proof walk finds no old-state boundary,
+  // which reintroduces the size-estimate drift one account at a time.
+  for (auto* new_state_field : {&trans->new_code, &trans->new_data, &trans->new_library}) {
+    auto rebased_field = rebase_parallel_usage_cells(*new_state_field, rebase_contexts);
+    if (rebased_field.is_error()) {
+      fatal_error(rebased_field.move_as_error_prefix("cannot rebase a parallel account state field: "));
+      return {};
+    }
+    *new_state_field = rebased_field.move_as_ok();
+  }
+  const bool log_limit_delta = params_.collator_opts->replay_log_limit_deltas && params_.is_replay;
+  const auto limit_stat_before =
+      log_limit_delta ? block_limit_status_->st_stat.get_total_stat() : vm::NewCellStorageStat::Stat{};
   if (!trans->update_limits(*block_limit_status_)) {
     fatal_error("cannot update block limits for a parallel inbound transaction");
     return {};
+  }
+  if (log_limit_delta) {
+    const auto after = block_limit_status_->st_stat.get_total_stat();
+    LOG(ERROR) << "REPLAY_LIMIT_DELTA pass=parallel site=parallel_commit idx=" << block_limit_status_->transactions
+               << " account=" << prepared.account_address.to_hex()
+               << " dcells=" << after.cells - limit_stat_before.cells
+               << " dbits=" << after.bits - limit_stat_before.bits
+               << " dint=" << after.internal_refs - limit_stat_before.internal_refs
+               << " dext=" << after.external_refs - limit_stat_before.external_refs;
   }
   auto trans_root = trans->commit(*prepared.account);
   if (trans_root.is_null()) {
