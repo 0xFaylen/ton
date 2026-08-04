@@ -3076,6 +3076,12 @@ block::Account* Collator::lookup_account(td::ConstBitPtr addr) const {
  */
 td::Result<block::Account*> Collator::make_account(td::ConstBitPtr addr, bool force_create) {
   auto found = lookup_account(addr);
+  const auto& watch = params_.collator_opts->replay_watch_account;
+  if (!watch.is_zero() && !td::bitstring::bits_memcmp(watch.cbits(), addr, 256)) {
+    LOG(ERROR) << "WATCH_ACCOUNT make_account pass="
+               << (params_.collator_opts->replay_parallel_account_workers != 0 ? "parallel" : "serial")
+               << " in_memory=" << (found != nullptr) << " force_create=" << force_create;
+  }
   if (found) {
     return found;
   }
@@ -4388,6 +4394,33 @@ Ref<vm::Cell> Collator::commit_parallel_inbound_transaction(ParallelInboundPrepa
   }
 
   set_current_tx_storage_dict(*prepared.account);
+  if (!params_.collator_opts->replay_watch_account.is_zero() &&
+      params_.collator_opts->replay_watch_account == prepared.account_address) {
+    const auto journal_size = [](const std::unique_ptr<ParallelCellUsageContext>& context, bool storage) -> size_t {
+      if (!context) {
+        return 0;
+      }
+      const auto& journal = storage ? context->storage_journal : context->ordinary_journal;
+      return journal ? journal->entries().size() : 0;
+    };
+    LOG(ERROR) << "WATCH_ACCOUNT parallel_commit account_j=" << journal_size(prepared.account_usage, false) << "/"
+               << journal_size(prepared.account_usage, true)
+               << " message_j=" << journal_size(prepared.message_usage, false) << "/"
+               << journal_size(prepared.message_usage, true)
+               << " storage_j=" << journal_size(prepared.storage_usage, false) << "/"
+               << journal_size(prepared.storage_usage, true) << " account_anchor="
+               << (prepared.account_usage && !prepared.account_usage->coordinator_anchor.empty());
+    if (prepared.account_usage && prepared.account_usage->ordinary_journal) {
+      for (const auto& entry : prepared.account_usage->ordinary_journal->entries()) {
+        td::StringBuilder path;
+        for (auto ref_id : entry.ref_path) {
+          path << "/" << static_cast<unsigned>(ref_id);
+        }
+        LOG(ERROR) << "WATCH_ACCOUNT journal_entry path=" << (entry.ref_path.empty() ? "root" : path.as_cslice().str())
+                   << " hash=" << entry.cell_hash.to_hex();
+      }
+    }
+  }
   auto replay_journal = [&](const std::unique_ptr<ParallelCellUsageContext>& context, bool storage) -> bool {
     auto status = replay_parallel_cell_usage_context(context, storage);
     if (status.is_error()) {
@@ -4475,6 +4508,11 @@ Ref<vm::Cell> Collator::commit_parallel_inbound_transaction(ParallelInboundPrepa
 
 td::Status Collator::flush_parallel_account_continuation(const ton::StdSmcAddress& address) {
   auto continuation_it = replay_parallel_account_continuations_.find(address);
+  if (!params_.collator_opts->replay_watch_account.is_zero() &&
+      params_.collator_opts->replay_watch_account == address) {
+    LOG(ERROR) << "WATCH_ACCOUNT flush_continuation present="
+               << (continuation_it != replay_parallel_account_continuations_.end());
+  }
   if (continuation_it == replay_parallel_account_continuations_.end()) {
     return td::Status::OK();
   }
@@ -4609,6 +4647,11 @@ td::Result<std::size_t> Collator::process_parallel_inbound_batch() {
     vm::AugmentedDictionary private_accounts(prepared->account_usage->worker_root(), 256,
                                              block::tlb::aug_ShardAccounts);
     auto account_entry = private_accounts.lookup_extra(prepared->account_address.cbits(), 256);
+    if (!params_.collator_opts->replay_watch_account.is_zero() &&
+        params_.collator_opts->replay_watch_account == prepared->account_address) {
+      LOG(ERROR) << "WATCH_ACCOUNT parallel_prepare found=" << account_entry.first.not_null()
+                 << " anchor=" << !prepared->account_usage->coordinator_anchor.empty();
+    }
     prepared->account = std::make_unique<block::Account>(workchain(), prepared->account_address.cbits());
     if (account_entry.first.is_null()) {
       if (!prepared->account->init_new(now_)) {
@@ -4769,6 +4812,13 @@ td::Result<std::size_t> Collator::process_parallel_inbound_batch() {
         // this canonical prefix cannot advance ProcessedUpto across a hole.
         ++parallel_stats.boundary_stops;
         parallel_stats.discarded_prepared += batch.size() - committed;
+        if (!params_.collator_opts->replay_watch_account.is_zero()) {
+          for (std::size_t discarded = committed; discarded < batch.size(); ++discarded) {
+            if (params_.collator_opts->replay_watch_account == batch[discarded]->account_address) {
+              LOG(ERROR) << "WATCH_ACCOUNT discarded_prepared position=" << discarded << " committed=" << committed;
+            }
+          }
+        }
         break;
       }
       if (!check_cancelled()) {

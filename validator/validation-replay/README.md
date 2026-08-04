@@ -386,10 +386,23 @@ transactions per 1.3 MB block from 100k wallet-v5/jetton-wallet pairs), all 18
 `--parallel-account-workers` gate runs were rejected: transactions,
 descriptors, value flow, and collated data are byte-identical, but the block
 `state_update` differs deterministically, so the Merkle-update cell-usage
-footprint of the parallel pass does not match the serial pass. See the
-2026-08-04 jetton-corpus section of `PARALLEL_EXECUTION_RESEARCH.md`. Until
-this is root-caused and fixed, the replay-only parallel path must be treated
-as failing its own equivalence gate on representative workloads. This synthetic result is not evidence of
+footprint of the parallel pass does not match the serial pass. Each block
+diverges on exactly two cells: one old-state `ShardAccounts` leaf of an
+account that has a transaction in the block, and one shared 80-bit new-state
+cell that the parallel pass holds as a plain cell where the serial pass holds
+a usage-tracked one. See the 2026-08-04 sections of
+`PARALLEL_EXECUTION_RESEARCH.md`. Until this is root-caused and fixed, the
+replay-only parallel path must be treated as failing its own equivalence gate
+on representative workloads.
+
+When a gate run fails, the error now includes a bounded diff of the two
+Merkle-update cell footprints with ref-index breadcrumbs from the update root
+(`0/...` old state, `1/...` new state) and, for accounts subtree cells, the
+decoded address plus whether that account has a transaction in the block.
+`vrp run --watch-account <64 hex digits>` logs every collator access to one
+account in both passes, including the worker's cell-usage journal entries.
+Both are replay-only diagnostics: the watch option changes no collation
+behavior and is inert when unset. This synthetic result is not evidence of
 sustainable shard TPS. The report intentionally keeps
 `mainnet_sustainable_raw_tps=null`. A copied mainnet validator database must
 still pass the same exact-candidate and `ValidateQuery` gates across a

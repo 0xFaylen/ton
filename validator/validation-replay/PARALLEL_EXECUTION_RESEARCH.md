@@ -649,10 +649,47 @@ Repro artifacts: the node database containing blocks 10/14/58 is preserved
 locally (969 MB) together with `vrp-gate.log`, `results.json`, and
 `blocks.csv`; none of it is committed. The state is regenerable from seed
 `ab..ab` with `--v5-count 100000`, but block byte-identity across regenerated
-networks is not expected. Next step: extend the mismatch error path to diff
-the two state-update BOCs' pruned-cell sets and report a bounded sample of
-cells present in one usage footprint and absent from the other, then fix the
-journal/rebase gap the diff identifies.
+networks is not expected.
+
+## State-update divergence localization - 2026-08-04 - STILL OPEN
+
+The mismatch path now diffs the two candidates' Merkle-update cell footprints.
+It walks both `state_update` BOCs, records every materialized cell with its
+ref-index breadcrumb from the update root (`0/...` is the pruned old state,
+`1/...` the new state), and reports cells one pass materialized while the
+other pruned them. Diverged cells under the accounts subtree are decoded to an
+account address and probed against the block's `AccountBlocks`. A new
+replay-only `vrp run --watch-account <hex>` option then logs every collator
+access to that account in both passes, including the worker's complete
+cell-usage journal.
+
+Measurement across three saturated jetton blocks and 18 gate runs is stable
+and symmetric: each block diverges on exactly **two** cells, never more.
+
+1. `path=0/...` (old state): one cell per block that the serial pass
+   materialized and the parallel pass pruned. It decodes to a
+   `ShardAccounts` leaf for an account that **does** have a committed
+   transaction in the same block, and its hash differs per block.
+2. `path=1/...` (new state): the same single cell `BEB0683E...`
+   (80 bits, 1 ref) in every block and every worker count, materialized by
+   the parallel pass and pruned by the serial one.
+
+These two are one phenomenon seen from both sides. `MerkleUpdate::generate_raw`
+prunes a new-state cell only when it is still a `UsageCell` carried over from
+the previous state, and marks that path so the old side expands it. The
+parallel pass therefore holds a **plain** cell where the serial pass holds a
+usage-tracked one, so the new side keeps the body and the old side loses the
+marked path. The watch trace shows the shared cell reached at two distinct
+paths inside one worker journal, so a deduplicated cell reachable from several
+trie positions is the prime suspect.
+
+One candidate fix was implemented and rejected by measurement: rebasing
+`total_state` wrappers from the message and storage contexts in addition to
+the account context. It changed nothing (18/18 still failed, identical
+footprint counts), so it was reverted rather than left in a consensus-critical
+path as an unverified change. The diagnostics were kept. The defect is
+therefore still open, and no parallel-executor claim may be made from this
+workload.
 
 ## Replay-only Collator integration - implementation gate
 

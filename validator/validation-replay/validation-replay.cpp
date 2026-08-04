@@ -16,8 +16,11 @@
 */
 #include <deque>
 #include <map>
+#include <set>
+#include <vector>
 
 #include "impl/parallel-inbound-scheduler.h"
+#include "td/utils/format.h"
 #include "td/utils/port/FileFd.h"
 #include "ton/ton-io.hpp"
 
@@ -44,7 +47,8 @@ td::Status write_new_file(td::CSlice path, td::Slice data) {
 }
 
 td::Ref<CollatorOptions> clone_collator_options(const td::Ref<CollatorOptions>& source,
-                                                td::uint32 replay_parallel_account_workers) {
+                                                td::uint32 replay_parallel_account_workers,
+                                                const td::Bits256& replay_watch_account) {
   auto target = td::Ref<CollatorOptions>{true};
   auto& mutable_target = target.write();
   if (source.not_null()) {
@@ -61,6 +65,7 @@ td::Ref<CollatorOptions> clone_collator_options(const td::Ref<CollatorOptions>& 
     mutable_target.ignore_collated_data_limits = source->ignore_collated_data_limits;
   }
   mutable_target.replay_parallel_account_workers = replay_parallel_account_workers;
+  mutable_target.replay_watch_account = replay_watch_account;
   return target;
 }
 
@@ -178,6 +183,118 @@ struct RunInfo {
   std::optional<double> collate_wall_seconds;
 };
 
+struct StateUpdateFootprint {
+  struct MaterializedCell {
+    std::string description;
+    Ref<vm::Cell> cell;
+  };
+  // Virtual (level-0) hash of every materialized cell, with a short shape hint.
+  std::map<td::Bits256, MaterializedCell> materialized;
+  // Virtual hashes referenced by pruned branches: cells the pass did not load.
+  std::set<td::Bits256> pruned;
+};
+
+// A diverged cell under the accounts subtree is usually a ShardAccounts leaf:
+// label + DepthBalance augmentation + ShardAccount whose single reference is
+// the Account cell. Extracting its address identifies the divergent access,
+// and probing the block's AccountBlocks shows whether that account also has a
+// committed transaction or was only read.
+std::string try_describe_account_leaf(const Ref<vm::Cell>& cell, const Ref<vm::Cell>& account_blocks) {
+  vm::CellSlice cs{vm::NoVm{}, cell};
+  if (cs.is_special() || cs.size_refs() != 1) {
+    return {};
+  }
+  auto account_cell = cs.prefetch_ref();
+  block::gen::Account::Record_account record;
+  if (!tlb::unpack_cell(account_cell, record)) {
+    return {};
+  }
+  WorkchainId workchain = workchainInvalid;
+  StdSmcAddress address = StdSmcAddress::zero();
+  if (!block::tlb::t_MsgAddressInt.extract_std_address(record.addr, workchain, address)) {
+    return {};
+  }
+  std::string transactions = "lookup_failed";
+  if (account_blocks.not_null()) {
+    vm::AugmentedDictionary blocks_dict{vm::load_cell_slice_ref(account_blocks), 256,
+                                        block::tlb::aug_ShardAccountBlocks};
+    auto entry = blocks_dict.lookup(address.cbits(), 256);
+    transactions = entry.not_null() ? "yes" : "no";
+  }
+  return PSTRING() << " account=" << workchain << ":" << address.to_hex() << " has_transaction=" << transactions;
+}
+
+StateUpdateFootprint collect_state_update_footprint(Ref<vm::Cell> root) {
+  StateUpdateFootprint result;
+  std::set<vm::Cell::Hash> visited;
+  // The ref-index path from the Merkle-update root identifies the state
+  // subsystem: "0/..." is the pruned old state, "1/..." the new state; within
+  // a ShardStateUnsplit, ref 0 is OutMsgQueueInfo and ref 1 is ShardAccounts.
+  std::vector<std::pair<Ref<vm::Cell>, std::string>> stack;
+  stack.emplace_back(std::move(root), "");
+  while (!stack.empty()) {
+    auto [cell, path] = std::move(stack.back());
+    stack.pop_back();
+    if (cell.is_null() || !visited.insert(cell->get_hash()).second) {
+      continue;
+    }
+    vm::CellSlice cs{vm::NoVm{}, cell};
+    const td::Bits256 virtual_hash = cell->get_hash(0).bits();
+    if (cs.is_special() && cs.special_type() == vm::Cell::SpecialType::PrunnedBranch) {
+      result.pruned.insert(virtual_hash);
+      continue;
+    }
+    const unsigned tag_bits = std::min<unsigned>(8, cs.size());
+    const auto tag = tag_bits != 0 ? static_cast<unsigned>(cs.prefetch_ulong(tag_bits) << (8 - tag_bits)) : 0u;
+    result.materialized.emplace(
+        virtual_hash,
+        StateUpdateFootprint::MaterializedCell{PSTRING() << "path=" << (path.empty() ? "root" : path)
+                                                         << " bits=" << cs.size() << " refs=" << cs.size_refs()
+                                                         << " tag=0x" << td::format::as_hex(td::uint8(tag)),
+                                               cell});
+    for (unsigned i = 0; i < cs.size_refs(); ++i) {
+      constexpr std::size_t max_path_length = 48;
+      std::string child_path = path.size() >= max_path_length
+                                   ? path
+                                   : (path.empty() ? PSTRING() << i : PSTRING() << path << "/" << i);
+      stack.emplace_back(cs.prefetch_ref(i), std::move(child_path));
+    }
+  }
+  return result;
+}
+
+// Reports which cells one collation pass loaded from the previous state while
+// the other pass pruned them. This is the exact cell-usage divergence that
+// makes two otherwise identical candidates serialize different Merkle updates.
+void append_state_update_divergence(td::StringBuilder& out, const StateUpdateFootprint& serial,
+                                    const StateUpdateFootprint& parallel, const Ref<vm::Cell>& account_blocks) {
+  const auto describe = [&](const char* label, const StateUpdateFootprint& from, const StateUpdateFootprint& other) {
+    constexpr std::size_t max_samples = 8;
+    std::size_t usage_diverged = 0;
+    std::size_t absent_from_other = 0;
+    std::size_t shown = 0;
+    for (const auto& [hash, entry] : from.materialized) {
+      if (other.materialized.count(hash) != 0) {
+        continue;
+      }
+      if (other.pruned.count(hash) != 0) {
+        ++usage_diverged;
+        if (shown < max_samples) {
+          out << "\n  " << label << " " << hash.to_hex() << " " << entry.description
+              << try_describe_account_leaf(entry.cell, account_blocks);
+          ++shown;
+        }
+      } else {
+        ++absent_from_other;
+      }
+    }
+    out << "\n  " << label << " totals: usage_diverged=" << usage_diverged
+        << ", absent_from_other=" << absent_from_other;
+  };
+  describe("serial_loaded_parallel_pruned", serial, parallel);
+  describe("parallel_loaded_serial_pruned", parallel, serial);
+}
+
 class ValidationReplayerImpl : public ValidationReplayer {
  public:
   static constexpr std::size_t max_stored_runs = 16;
@@ -266,6 +383,7 @@ class ValidationReplayerImpl : public ValidationReplayer {
       bool exact_tvm_hotpaths = false;
       td::uint32 parallel_account_workers = 0;
       bool parallel_first = false;
+      td::Bits256 watch_account = td::Bits256::zero();
       std::optional<std::string> collated_data_output;
       std::vector<std::string> params;
       while (!eoln()) {
@@ -280,6 +398,11 @@ class ValidationReplayerImpl : public ValidationReplayer {
           parallel_account_workers = CO_TRY(td::to_integer_safe<td::uint32>(CO_TRY(next())));
         } else if (token == "--parallel-first") {
           parallel_first = true;
+        } else if (token == "--watch-account") {
+          auto hex = CO_TRY(next());
+          if (watch_account.from_hex(hex) != 256 || watch_account.is_zero()) {
+            co_return td::Status::Error("--watch-account requires 64 non-zero hex digits");
+          }
         } else if (token == "--export-collated-data") {
           if (collated_data_output) {
             co_return td::Status::Error("--export-collated-data may be specified only once");
@@ -317,7 +440,7 @@ class ValidationReplayerImpl : public ValidationReplayer {
         block_ids.push_back(CO_TRY(BlockId::from_str(s)));
       }
       command_run(std::move(block_ids), mode, log_work_time, exact_tvm_hotpaths, parallel_account_workers,
-                  parallel_first, std::move(collated_data_output))
+                  parallel_first, watch_account, std::move(collated_data_output))
           .start()
           .detach_silent();
       co_return "Started. `vrp show` to see results.";
@@ -487,7 +610,7 @@ class ValidationReplayerImpl : public ValidationReplayer {
 
   td::actor::Task<> command_run(std::vector<BlockId> block_ids, ReplayMode mode, bool log_work_time,
                                 bool exact_tvm_hotpaths, td::uint32 parallel_account_workers, bool parallel_first,
-                                std::optional<std::string> collated_data_output) {
+                                td::Bits256 watch_account, std::optional<std::string> collated_data_output) {
     std::string description;
     CHECK(!block_ids.empty());
     if (block_ids.size() == 1) {
@@ -505,9 +628,13 @@ class ValidationReplayerImpl : public ValidationReplayer {
       description += PSTRING() << ", parallel_account_workers=" << parallel_account_workers
                                << ", pass_order=" << (parallel_first ? "parallel-first" : "serial-first");
     }
+    if (!watch_account.is_zero()) {
+      description += PSTRING() << ", watch_account=" << watch_account.to_hex();
+    }
     co_await run_start(description);
     auto result = co_await command_run_inner(std::move(block_ids), mode, log_work_time, exact_tvm_hotpaths,
-                                             parallel_account_workers, parallel_first, std::move(collated_data_output))
+                                             parallel_account_workers, parallel_first, watch_account,
+                                             std::move(collated_data_output))
                       .wrap();
     if (result.is_error()) {
       LOG(ERROR) << "ERROR run #" << current_run_.idx << ": " << result.error();
@@ -520,7 +647,7 @@ class ValidationReplayerImpl : public ValidationReplayer {
 
   td::actor::Task<> command_run_inner(std::vector<BlockId> block_ids, ReplayMode mode, bool log_work_time,
                                       bool exact_tvm_hotpaths, td::uint32 parallel_account_workers, bool parallel_first,
-                                      std::optional<std::string> collated_data_output) {
+                                      td::Bits256 watch_account, std::optional<std::string> collated_data_output) {
     auto cancellation_token = cancellation_.get_cancellation_token();
     ProcessBlockResult total;
     size_t processed_ok = 0;
@@ -529,7 +656,7 @@ class ValidationReplayerImpl : public ValidationReplayer {
       auto handle = co_await get_block_by_id(manager_, block_id);
       current_run_.status = "Processing block " + block_id.to_str();
       auto R = co_await process_block(handle, mode, exact_tvm_hotpaths, collated_data_output, parallel_account_workers,
-                                      parallel_first)
+                                      parallel_first, watch_account)
                    .wrap();
       if (R.is_ok()) {
         total += R.ok();
@@ -829,7 +956,8 @@ class ValidationReplayerImpl : public ValidationReplayer {
   td::actor::Task<ProcessBlockResult> process_block(ConstBlockHandle handle, ReplayMode mode, bool exact_tvm_hotpaths,
                                                     const std::optional<std::string>& collated_data_output,
                                                     td::uint32 parallel_account_workers = 0,
-                                                    bool parallel_first = false) {
+                                                    bool parallel_first = false,
+                                                    td::Bits256 watch_account = td::Bits256::zero()) {
     Ref<BlockData> block = co_await td::actor::ask(manager_, &ValidatorManager::get_block_data_from_db, handle);
     ProcessBlockResult result;
     result.block_size = (double)block->data().size();
@@ -868,7 +996,7 @@ class ValidationReplayerImpl : public ValidationReplayer {
                 .prev = unpacked.prev,
                 .creator = unpacked.creator,
                 .validator_set = validator_set,
-                .collator_opts = clone_collator_options(opts_->get_collator_options(), workers),
+                .collator_opts = clone_collator_options(opts_->get_collator_options(), workers, watch_account),
                 .utime = (double)unpacked.gen_utime,
                 .hard_timeout = td::Timestamp::in(10.0),
                 .is_replay = true,
@@ -917,6 +1045,12 @@ class ValidationReplayerImpl : public ValidationReplayer {
           block::gen::BlockExtra::Record parallel_extra;
           CHECK(block::gen::unpack_cell(serial_block.extra, serial_extra));
           CHECK(block::gen::unpack_cell(parallel_block.extra, parallel_extra));
+          td::StringBuilder divergence;
+          if (serial_block.state_update->get_hash() != parallel_block.state_update->get_hash()) {
+            append_state_update_divergence(divergence, collect_state_update_footprint(serial_block.state_update),
+                                           collect_state_update_footprint(parallel_block.state_update),
+                                           serial_extra.account_blocks);
+          }
           co_return td::Status::Error(
               PSTRING()
               << "serial/parallel candidate mismatch for " << block_id.id << ": id=" << id_match
@@ -936,7 +1070,8 @@ class ValidationReplayerImpl : public ValidationReplayer {
               << ", out_msg_descr:"
               << (serial_extra.out_msg_descr->get_hash() == parallel_extra.out_msg_descr->get_hash())
               << ", account_blocks:"
-              << (serial_extra.account_blocks->get_hash() == parallel_extra.account_blocks->get_hash()) << "}");
+              << (serial_extra.account_blocks->get_hash() == parallel_extra.account_blocks->get_hash()) << "}"
+              << divergence.as_cslice());
         }
         exact_candidate_match = true;
         selected = std::move(parallel);

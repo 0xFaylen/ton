@@ -80,6 +80,9 @@ struct CollatorOptions : public td::CntObject {
 
   // Replay-only experiment. Live collation rejects non-zero values.
   td::uint32 replay_parallel_account_workers = 0;
+  // Replay-only diagnostics: log every collator access to this account.
+  // Zero disables the watch.
+  td::Bits256 replay_watch_account = td::Bits256::zero();
 };
 
 struct CollatorsList : public td::CntObject {

@@ -450,6 +450,24 @@ async def _run_vrp_gate(node: FullNode, params: BenchParams) -> int:
                 )
                 if not ok:
                     l.error(f"vrp gate FAILED for {seqno} workers={workers}:\n{status}")
+                    watch = re.search(r"account=-?\d+:([0-9A-F]{64})", status)
+                    if watch is not None:
+                        # Rerun the same block with the collator watching the
+                        # divergent account so the node log records every
+                        # access to it in both passes.
+                        watch_command = command.replace(
+                            " --parallel-account-workers",
+                            f" --watch-account {watch.group(1)} --parallel-account-workers",
+                        )
+                        l.info(f"vrp gate: {watch_command}")
+                        _ = await node.engine_console.validation_replayer_command(watch_command)
+                        watch_show = await _vrp_wait_idle(node)
+                        watch_idx, watch_status = _vrp_last_run_status(watch_show)
+                        raw_log.append(
+                            f"=== watch seqno={seqno} workers={workers} "
+                            f"account={watch.group(1)} ===\n{watch_status}"
+                        )
+                        _ = await node.engine_console.validation_replayer_command(f"forget {watch_idx}")
                 # Free retained hotpath results so 16-run history pressure does
                 # not evict runs we still want to inspect manually.
                 _ = await node.engine_console.validation_replayer_command(f"forget {run_idx}")
@@ -459,6 +477,11 @@ async def _run_vrp_gate(node: FullNode, params: BenchParams) -> int:
         json.dumps({"failures": failures, "runs": results}, indent=2) + "\n"
     )
     _ = (params.out_dir / "vrp-gate.log").write_text("\n".join(raw_log))
+    watch_lines = [
+        line for line in node.log_path.read_text(errors="replace").splitlines() if "WATCH_ACCOUNT" in line
+    ]
+    if watch_lines:
+        _ = (params.out_dir / "vrp-watch.log").write_text("\n".join(watch_lines) + "\n")
     if failures:
         l.error(f"vrp gate: {failures} failed runs (see vrp-gate.log)")
         return 1
