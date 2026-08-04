@@ -381,19 +381,25 @@ the coordinator proof anchor, and a partial prepared batch could not express a
 safe block-limit stop. The current path falls back or preserves a continuous
 canonical prefix for these cases.
 
-A fifth defect is currently open. On a saturated jetton corpus (674-684
-transactions per 1.3 MB block from 100k wallet-v5/jetton-wallet pairs), all 18
-`--parallel-account-workers` gate runs were rejected: transactions,
-descriptors, value flow, and collated data are byte-identical, but the block
-`state_update` differs deterministically, so the Merkle-update cell-usage
-footprint of the parallel pass does not match the serial pass. Each block
-diverges on exactly two cells: one old-state `ShardAccounts` leaf of an
-account that has a transaction in the block, and one shared 80-bit new-state
-cell that the parallel pass holds as a plain cell where the serial pass holds
-a usage-tracked one. See the 2026-08-04 sections of
-`PARALLEL_EXECUTION_RESEARCH.md`. Until this is root-caused and fixed, the
-replay-only parallel path must be treated as failing its own equivalence gate
-on representative workloads.
+A fifth defect was found and fixed on a saturated jetton corpus (672-684
+transactions per 1.3 MB block from 100k wallet-v5/jetton-wallet pairs). A
+worker's outbound message payload retains cells loaded from that worker's
+private old-state snapshot, and those wrappers were published unrebased, so a
+later in-block transaction that persisted such a cell lost the usage link the
+serial pass kept and the two Merkle updates pruned different paths.
+`commit_parallel_inbound_transaction` now rebases `trans->out_msgs` through
+the same contexts as the account state. Twelve of eighteen gate runs then
+produced byte-identical candidates and passed `ValidateQuery`.
+
+Two facts must accompany that result. Every passing run measured a
+serial/parallel speedup **below 1.0** (0.58-0.97), so this path is currently
+slower than serial collation on this workload. And a sixth, different defect
+remains open: the largest, limit-bound block failed all its runs with
+differing `account_blocks`, `in_msg_descr` and `value_flow`, meaning the two
+passes committed different amounts of work. See the 2026-08-04 sections of
+`PARALLEL_EXECUTION_RESEARCH.md`. The replay-only parallel path therefore
+still fails its own equivalence gate on limit-bound blocks and must not be
+presented as validated.
 
 When a gate run fails, the error now includes a bounded diff of the two
 Merkle-update cell footprints with ref-index breadcrumbs from the update root

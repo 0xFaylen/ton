@@ -687,9 +687,48 @@ One candidate fix was implemented and rejected by measurement: rebasing
 `total_state` wrappers from the message and storage contexts in addition to
 the account context. It changed nothing (18/18 still failed, identical
 footprint counts), so it was reverted rather than left in a consensus-critical
-path as an unverified change. The diagnostics were kept. The defect is
-therefore still open, and no parallel-executor claim may be made from this
-workload.
+path as an unverified change. The diagnostics were kept.
+
+## Outbound-message wrapper rebase - 2026-08-04 - PARTIAL FIX
+
+Adding the account owner to the footprint diff showed the shared new-state
+cell `BEB0683E...` sitting inside an account that is *not* the one whose
+old-state leaf diverged. A worker's outbound message payload retains cells
+loaded from that worker's private old-state snapshot; the payload was
+published to `register_new_msgs` without rebasing, so when a later in-block
+transaction persisted such a cell into its own account state, the coordinator
+lost the usage link the serial pass kept.
+
+`commit_parallel_inbound_transaction` now rebases `trans->out_msgs` through
+the same account/message/storage contexts as `total_state`, before the
+messages are registered. On a fresh saturated corpus this closed the original
+divergence: **12 of 18 gate runs now produce byte-identical block and collated
+data and pass the ordinary `ValidateQuery`**, including all six runs on two
+blocks of 672 transactions each (445 and 419 of them executed through the
+replay-only parallel path, gas 4.38M and 4.31M, `internal_load` 0.954 and
+0.906, zero discarded prepared results).
+
+Two findings keep this from being a success:
+
+1. **Measured slowdown.** Every passing run has a serial/parallel speedup
+   below 1.0: 0.58-0.97, median about 0.79, with no trend favouring more
+   workers (2, 4 and 8 workers are indistinguishable inside that band). On
+   this workload the replay-only parallel path is *slower* than serial
+   collation. Prepare/worker/commit accounting must be decomposed before any
+   executor gain is claimed; the earlier synthetic 1.19-1.74x numbers do not
+   transfer to a saturated jetton block.
+2. **A second, different defect remains.** The 684-transaction block failed
+   all six of its runs with an unrelated signature: `account_blocks`,
+   `in_msg_descr`, `out_msg_descr` and `value_flow` all differ, and the
+   parallel candidate is 21,104 bytes *larger*. The two passes committed
+   different amounts of work rather than pruning the same work differently,
+   and the surviving footprint divergences sit under `path=0/0/...`
+   (`OutMsgQueueInfo`), not under the accounts subtree. The untested
+   hypothesis is that block-limit estimation via
+   `update_account_dict_estimation`/`add_proof` diverges once a block reaches
+   the byte boundary, so the two passes stop at different queue positions.
+   Nothing in this section may be read as an equivalence result for
+   limit-bound blocks.
 
 ## Replay-only Collator integration - implementation gate
 

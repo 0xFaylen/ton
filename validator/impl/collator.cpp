@@ -129,29 +129,51 @@ td::Status replay_parallel_cell_usage_context(const std::unique_ptr<ParallelCell
 }
 
 td::Result<td::Ref<vm::Cell>> rebase_parallel_usage_cells(td::Ref<vm::Cell> root,
-                                                          const std::unique_ptr<ParallelCellUsageContext>& context) {
-  if (root.is_null() || !context || !context->worker_tree || context->coordinator_anchor.empty()) {
+                                                          std::vector<const ParallelCellUsageContext*> contexts) {
+  if (root.is_null()) {
     return root;
   }
-  auto* worker_tree = context->worker_tree.get();
+  // Worker artifacts can retain old-state cells loaded through any private
+  // context (account, inbound message, storage dictionary). Every wrapper must
+  // be rebased onto its own coordinator anchor: a dropped wrapper silently
+  // unlinks the retained old subtree from the state usage tree, and the serial
+  // and parallel Merkle updates then prune different old-state paths.
+  contexts.erase(std::remove_if(contexts.begin(), contexts.end(),
+                                [](const ParallelCellUsageContext* context) {
+                                  return context == nullptr || !context->worker_tree ||
+                                         context->coordinator_anchor.empty();
+                                }),
+                 contexts.end());
+  if (contexts.empty()) {
+    return root;
+  }
   std::function<td::Result<td::Ref<vm::Cell>>(td::Ref<vm::Cell>)> rebase =
       [&](td::Ref<vm::Cell> cell) -> td::Result<td::Ref<vm::Cell>> {
     if (cell.is_null()) {
       return cell;
     }
     auto tree_node = cell->get_tree_node();
-    if (!tree_node.empty() && tree_node.is_from_tree(worker_tree)) {
+    const ParallelCellUsageContext* owner = nullptr;
+    if (!tree_node.empty()) {
+      for (const auto* context : contexts) {
+        if (tree_node.is_from_tree(context->worker_tree.get())) {
+          owner = context;
+          break;
+        }
+      }
+    }
+    if (owner != nullptr) {
       auto path = tree_node.path();
       if (!path) {
         return td::Status::Error("parallel usage cell has no worker-tree path");
       }
-      auto coordinator_node = context->coordinator_anchor;
+      auto coordinator_node = owner->coordinator_anchor;
       for (auto ref_id : *path) {
         coordinator_node = coordinator_node.create_child(ref_id);
       }
-      context->worker_tree->set_ignore_loads(true);
+      owner->worker_tree->set_ignore_loads(true);
       auto loaded_result = cell->load_cell();
-      context->worker_tree->set_ignore_loads(false);
+      owner->worker_tree->set_ignore_loads(false);
       TRY_RESULT(loaded, std::move(loaded_result));
       return vm::UsageCell::create(std::move(loaded.data_cell), std::move(coordinator_node));
     }
@@ -4457,12 +4479,27 @@ Ref<vm::Cell> Collator::commit_parallel_inbound_transaction(ParallelInboundPrepa
     fatal_error("cannot commit a parallel inbound transaction");
     return {};
   }
-  auto rebased_state = rebase_parallel_usage_cells(prepared.account->total_state, prepared.account_usage);
+  const std::vector<const ParallelCellUsageContext*> rebase_contexts{
+      prepared.account_usage.get(), prepared.message_usage.get(), prepared.storage_usage.get()};
+  auto rebased_state = rebase_parallel_usage_cells(prepared.account->total_state, rebase_contexts);
   if (rebased_state.is_error()) {
     fatal_error(rebased_state.move_as_error_prefix("cannot rebase a parallel account state: "));
     return {};
   }
   prepared.account->total_state = rebased_state.move_as_ok();
+  // Outbound messages retain payload cells loaded from the worker's private
+  // old-state snapshot. A later in-block transaction can persist such a cell
+  // into its own account state, so the wrappers must be rebased before the
+  // messages are registered, or the downstream state loses the usage link the
+  // serial pass would have kept.
+  for (auto& out_msg : trans->out_msgs) {
+    auto rebased_out_msg = rebase_parallel_usage_cells(out_msg, rebase_contexts);
+    if (rebased_out_msg.is_error()) {
+      fatal_error(rebased_out_msg.move_as_error_prefix("cannot rebase a parallel outbound message: "));
+      return {};
+    }
+    out_msg = rebased_out_msg.move_as_ok();
+  }
   auto [account_it, inserted] = accounts.emplace(prepared.account_address, std::move(prepared.account));
   if (!inserted || !account_it->second) {
     fatal_error("cannot publish a parallel inbound account state");

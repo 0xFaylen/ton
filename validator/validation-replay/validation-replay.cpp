@@ -190,16 +190,15 @@ struct StateUpdateFootprint {
   };
   // Virtual (level-0) hash of every materialized cell, with a short shape hint.
   std::map<td::Bits256, MaterializedCell> materialized;
-  // Virtual hashes referenced by pruned branches: cells the pass did not load.
-  std::set<td::Bits256> pruned;
+  // Virtual hashes referenced by pruned branches, with the first path at which
+  // the pruned branch occurs.
+  std::map<td::Bits256, std::string> pruned;
 };
 
-// A diverged cell under the accounts subtree is usually a ShardAccounts leaf:
-// label + DepthBalance augmentation + ShardAccount whose single reference is
-// the Account cell. Extracting its address identifies the divergent access,
-// and probing the block's AccountBlocks shows whether that account also has a
-// committed transaction or was only read.
-std::string try_describe_account_leaf(const Ref<vm::Cell>& cell, const Ref<vm::Cell>& account_blocks) {
+// A cell under the accounts subtree whose single reference unpacks as an
+// Account is a ShardAccounts leaf: label + DepthBalance augmentation +
+// ShardAccount. Extracting its address identifies the divergent access.
+std::string try_account_leaf_address(const Ref<vm::Cell>& cell) {
   vm::CellSlice cs{vm::NoVm{}, cell};
   if (cs.is_special() || cs.size_refs() != 1) {
     return {};
@@ -214,14 +213,28 @@ std::string try_describe_account_leaf(const Ref<vm::Cell>& cell, const Ref<vm::C
   if (!block::tlb::t_MsgAddressInt.extract_std_address(record.addr, workchain, address)) {
     return {};
   }
-  std::string transactions = "lookup_failed";
-  if (account_blocks.not_null()) {
-    vm::AugmentedDictionary blocks_dict{vm::load_cell_slice_ref(account_blocks), 256,
-                                        block::tlb::aug_ShardAccountBlocks};
-    auto entry = blocks_dict.lookup(address.cbits(), 256);
-    transactions = entry.not_null() ? "yes" : "no";
+  return PSTRING() << workchain << ":" << address.to_hex();
+}
+
+// Probing the block's AccountBlocks shows whether the diverged account also
+// has a committed transaction or was only read.
+std::string try_describe_account_leaf(const Ref<vm::Cell>& cell, const Ref<vm::Cell>& account_blocks) {
+  auto address_text = try_account_leaf_address(cell);
+  if (address_text.empty()) {
+    return {};
   }
-  return PSTRING() << " account=" << workchain << ":" << address.to_hex() << " has_transaction=" << transactions;
+  std::string transactions = "lookup_failed";
+  const auto colon = address_text.find(':');
+  if (account_blocks.not_null() && colon != std::string::npos) {
+    StdSmcAddress address = StdSmcAddress::zero();
+    if (address.from_hex(address_text.substr(colon + 1)) == 256) {
+      vm::AugmentedDictionary blocks_dict{vm::load_cell_slice_ref(account_blocks), 256,
+                                          block::tlb::aug_ShardAccountBlocks};
+      auto entry = blocks_dict.lookup(address.cbits(), 256);
+      transactions = entry.not_null() ? "yes" : "no";
+    }
+  }
+  return PSTRING() << " account=" << address_text << " has_transaction=" << transactions;
 }
 
 StateUpdateFootprint collect_state_update_footprint(Ref<vm::Cell> root) {
@@ -230,10 +243,16 @@ StateUpdateFootprint collect_state_update_footprint(Ref<vm::Cell> root) {
   // The ref-index path from the Merkle-update root identifies the state
   // subsystem: "0/..." is the pruned old state, "1/..." the new state; within
   // a ShardStateUnsplit, ref 0 is OutMsgQueueInfo and ref 1 is ShardAccounts.
-  std::vector<std::pair<Ref<vm::Cell>, std::string>> stack;
-  stack.emplace_back(std::move(root), "");
+  // Cells below a ShardAccounts leaf additionally carry the owning account.
+  struct PendingCell {
+    Ref<vm::Cell> cell;
+    std::string path;
+    std::string account;
+  };
+  std::vector<PendingCell> stack;
+  stack.push_back({std::move(root), "", ""});
   while (!stack.empty()) {
-    auto [cell, path] = std::move(stack.back());
+    auto [cell, path, account] = std::move(stack.back());
     stack.pop_back();
     if (cell.is_null() || !visited.insert(cell->get_hash()).second) {
       continue;
@@ -241,23 +260,30 @@ StateUpdateFootprint collect_state_update_footprint(Ref<vm::Cell> root) {
     vm::CellSlice cs{vm::NoVm{}, cell};
     const td::Bits256 virtual_hash = cell->get_hash(0).bits();
     if (cs.is_special() && cs.special_type() == vm::Cell::SpecialType::PrunnedBranch) {
-      result.pruned.insert(virtual_hash);
+      result.pruned.emplace(virtual_hash, path.empty() ? "root" : path);
       continue;
+    }
+    if (account.empty()) {
+      auto leaf_address = try_account_leaf_address(cell);
+      if (!leaf_address.empty()) {
+        account = std::move(leaf_address);
+      }
     }
     const unsigned tag_bits = std::min<unsigned>(8, cs.size());
     const auto tag = tag_bits != 0 ? static_cast<unsigned>(cs.prefetch_ulong(tag_bits) << (8 - tag_bits)) : 0u;
     result.materialized.emplace(
         virtual_hash,
-        StateUpdateFootprint::MaterializedCell{PSTRING() << "path=" << (path.empty() ? "root" : path)
-                                                         << " bits=" << cs.size() << " refs=" << cs.size_refs()
-                                                         << " tag=0x" << td::format::as_hex(td::uint8(tag)),
-                                               cell});
+        StateUpdateFootprint::MaterializedCell{
+            PSTRING() << "path=" << (path.empty() ? "root" : path) << " bits=" << cs.size()
+                      << " refs=" << cs.size_refs() << " tag=0x" << td::format::as_hex(td::uint8(tag))
+                      << (account.empty() ? "" : PSTRING() << " in_account=" << account),
+            cell});
     for (unsigned i = 0; i < cs.size_refs(); ++i) {
       constexpr std::size_t max_path_length = 48;
       std::string child_path = path.size() >= max_path_length
                                    ? path
                                    : (path.empty() ? PSTRING() << i : PSTRING() << path << "/" << i);
-      stack.emplace_back(cs.prefetch_ref(i), std::move(child_path));
+      stack.push_back({cs.prefetch_ref(i), std::move(child_path), account});
     }
   }
   return result;
@@ -277,11 +303,12 @@ void append_state_update_divergence(td::StringBuilder& out, const StateUpdateFoo
       if (other.materialized.count(hash) != 0) {
         continue;
       }
-      if (other.pruned.count(hash) != 0) {
+      auto pruned_it = other.pruned.find(hash);
+      if (pruned_it != other.pruned.end()) {
         ++usage_diverged;
         if (shown < max_samples) {
           out << "\n  " << label << " " << hash.to_hex() << " " << entry.description
-              << try_describe_account_leaf(entry.cell, account_blocks);
+              << " other_pruned_at=" << pruned_it->second << try_describe_account_leaf(entry.cell, account_blocks);
           ++shown;
         }
       } else {
