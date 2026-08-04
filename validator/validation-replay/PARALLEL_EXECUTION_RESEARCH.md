@@ -842,23 +842,46 @@ cheaper, about 3.1 GB per 100k-block slice directory.
 
 Two findings change the plan:
 
-1. **The basechain has split.** Epochs `81237737` through `83363951` archive
-   a single shard `8000000000000000`. The newest epoch archives
-   `4000000000000000` and `c000000000000000`, eight account parts each, and
-   the newest package slice contains per-shard archives for all three shard
-   identities. The single-shard premise that this research has used since the
-   first measurement no longer holds on current mainnet, and any capacity
-   statement must say which shard topology it describes.
+1. **The archived epoch caught a load-driven split.** Epochs `81237737`
+   through `83363951` archive a single shard `8000000000000000`; the newest
+   epoch archives `4000000000000000` and `c000000000000000` with eight
+   account parts each, and the newest package slice contains per-shard
+   archives for all three shard identities. This is ordinary TON behaviour,
+   not a change of premise: the basechain splits under load and merges back,
+   so the steady state at average load remains one shard. It matters here in
+   two ways. Operationally, a corpus fixture must record which topology its
+   blocks came from, and a copy of a split epoch needs parts for the specific
+   shard being replayed. Substantively, the split threshold is the research
+   target itself: raising single-shard throughput is what moves the load
+   level at which the basechain has to split, so the interesting quantity is
+   the TPS at which the split triggers, measured on one shard.
 2. **A full epoch does not fit locally.** The working disk has 67.5 GiB free
    against a 60.6 GB epoch, and importing that into a validator database
    needs comparable space again. Copying one whole epoch is therefore not
-   viable without another disk. The selective path - masterchain state plus
-   only the account parts covering the target blocks' touched prefixes - is
-   the practical option, and `SelectiveSplitStateAssembler` already exists
-   for the offline tool but is not wired into the database import path.
+   viable without another disk.
 
-No data was copied and the node was not loaded; this section records sizes
-and a decision, not an action.
+### Prefix-selective import does not help a saturated block
+
+The obvious saving - copy only the account parts covering a target block's
+touched prefixes, using the existing `SelectiveSplitStateAssembler` - was
+tested against the checked-in mainnet fixture before any code was written.
+Block `88028077` touches 108 accounts, and their address prefixes cover
+**all 16** nibbles at the archive's split depth (counts 3 to 11 per nibble).
+A saturated block spreads across the whole address space by construction, so
+prefix selection selects everything. The saving is zero exactly where the
+gate needs it, and it would only help on small or synthetic blocks, which do
+not need a mainnet corpus in the first place.
+
+What remains genuinely selective is coarser: replay one shard, not the whole
+epoch. For the newest archived epoch that is the 9.21 GB masterchain state
+plus the eight account parts of one shard, about 34.9 GB, and the parts can
+be imported one at a time and deleted as they are consumed so the peak
+footprint stays near one part plus the growing database. Whether the
+resulting database then fits in the remaining space is unmeasured, and a
+second disk remains the clean answer.
+
+No data was copied and the node was not loaded; this section records sizes,
+a measurement that rejected an approach, and a decision, not an action.
 
 ## Replay-only Collator integration - implementation gate
 
