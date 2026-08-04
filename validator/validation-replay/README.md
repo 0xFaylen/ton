@@ -408,12 +408,21 @@ later serial transaction on the same account lost the state-tree boundary
 that `add_proof` relies on. Those fields are now rebased at commit, and the
 per-transaction delta sequences of the two passes match exactly.
 
-One fact must accompany the correctness result: every passing run measured a
-serial/parallel speedup mostly **below 1.0** (0.68-1.41, median well under
-1.0), so this path is currently not faster than serial collation on this
-workload, and no throughput claim may be made from it. Equivalence has been
-demonstrated only on this synthetic Windows corpus; matched runs on copied
-mainnet validator state remain a required gate.
+Phase-boundary flushes of retained worker journals were quadratic in the
+number of parallel accounts, because every committed account's journal was
+replayed again at each flush. Journals keep growing after commit when a later
+serial transaction reads through a retained worker wrapper, so the flush is
+now versioned by journal entry count and replays only when new entries
+appeared; skipping repeats unconditionally fails the gate.
+
+One fact must accompany the correctness result: passing runs still measure a
+serial/parallel speedup mostly **below 1.0** (0.69-1.38, median 0.94 after
+the flush fix, up from 0.73), so this path is not faster than serial
+collation on this workload and no throughput claim may be made from it. The
+residue is the ordinary commit path, not worker scheduling, which is why 2, 4
+and 8 workers behave the same. Equivalence has been demonstrated only on this
+synthetic corpus; matched runs on copied mainnet validator state remain a
+required gate.
 
 When a gate run fails, the error now includes a bounded diff of the two
 Merkle-update cell footprints with ref-index breadcrumbs from the update root

@@ -289,6 +289,13 @@ struct ParallelAccountContinuation {
   std::unique_ptr<ParallelCellUsageContext> account_usage;
   std::unique_ptr<ParallelCellUsageContext> message_usage;
   std::unique_ptr<ParallelCellUsageContext> storage_usage;
+  // Journals only ever append, and replaying an already-replayed entry is a
+  // no-op that still resolves its path from the root. Phase-boundary flushes
+  // walk every committed account, so without this the cost is quadratic in the
+  // number of parallel accounts. The recorded entry count is the journal
+  // version: a later serial transaction reading through a retained worker
+  // wrapper appends new entries, and those must still be replayed.
+  std::size_t replayed_journal_entries = 0;
 };
 
 Collator::~Collator() = default;
@@ -4615,6 +4622,20 @@ td::Status Collator::flush_parallel_account_continuation(const ton::StdSmcAddres
   if (!account || !continuation_it->second) {
     return td::Status::Error("parallel account proof context has no committed account");
   }
+  const auto journal_entry_total = [](const ParallelAccountContinuation& value) {
+    std::size_t total = 0;
+    for (const auto* context : {value.account_usage.get(), value.message_usage.get(), value.storage_usage.get()}) {
+      if (context) {
+        total += context->ordinary_journal ? context->ordinary_journal->entries().size() : 0;
+        total += context->storage_journal ? context->storage_journal->entries().size() : 0;
+      }
+    }
+    return total;
+  };
+  const auto pending_entries = journal_entry_total(*continuation_it->second);
+  if (pending_entries == continuation_it->second->replayed_journal_entries) {
+    return td::Status::OK();
+  }
 
   auto* previous_storage_dict = current_tx_storage_dict_;
   SCOPE_EXIT {
@@ -4632,6 +4653,7 @@ td::Status Collator::flush_parallel_account_continuation(const ton::StdSmcAddres
     TRY_STATUS(replay_parallel_cell_usage_context(continuation.message_usage, true));
     TRY_STATUS(replay_parallel_cell_usage_context(continuation.storage_usage, true));
   }
+  continuation.replayed_journal_entries = journal_entry_total(continuation);
   return td::Status::OK();
 }
 

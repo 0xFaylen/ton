@@ -801,6 +801,65 @@ drift is closed at its source rather than masked by margins; the boundary
 guard remains as the defense against lookahead-tail proof leakage, which is
 a separate mechanism.
 
+## Where the parallel path loses time - 2026-08-04
+
+With equivalence holding, the gate's own counters decompose the parallel
+pass. On 670-680-transaction blocks the worker phase is negligible: prepare
+7-13 ms and worker execution 7-24 ms for 277-388 parallel transactions, while
+the serial commit of those same transactions costs 84-130 ms. The batch
+portion is therefore already faster than serial execution of the same
+messages, yet whole-block collation was slower, so the loss was outside the
+measured prepare/worker/commit scopes.
+
+It was the phase-boundary flush. Committed accounts stay in
+`replay_parallel_account_continuations_` for the whole collation, and every
+`flush_parallel_account_continuations()` call replayed every retained
+journal again, resolving each recorded path from the root - quadratic in the
+number of parallel accounts. Skipping the repeat outright is wrong: the gate
+rejected 6 of 18 runs, proving journals still grow after commit when a later
+serial transaction reads through a worker wrapper that the account fields no
+longer expose but other retained state still does. Versioning the flush by
+journal entry count instead - replay only when new entries appeared - is both
+correct (18 of 18 pass) and effective: the median serial/parallel speedup
+moved from 0.73 to 0.94 (0.69-1.38 range), with 2 workers at 0.97.
+
+The path is still not faster than serial collation on this workload. The
+remaining serial residue is the ordinary commit path itself, not worker
+scheduling, so adding workers changes nothing (2, 4 and 8 workers stay inside
+the same band). Any further gain has to come from the commit/serialization
+side, which is exactly what the W6 serialize-tail design targets.
+
+## Mainnet corpus sizing - 2026-08-04 - read-only survey
+
+A read-only listing of the archive node (no copy, no restart, no database
+scan) establishes what a mainnet-database gate would actually cost.
+
+The archive holds 311 GB of persistent states across six epochs. The newest,
+masterchain seqno `83668373` from 2026-08-03, is 60.6 GB: a 9.21 GB
+masterchain state plus 16 basechain account parts of about 3.2 GB each, plus
+two zero-length split markers. Archive block packages are separate and much
+cheaper, about 3.1 GB per 100k-block slice directory.
+
+Two findings change the plan:
+
+1. **The basechain has split.** Epochs `81237737` through `83363951` archive
+   a single shard `8000000000000000`. The newest epoch archives
+   `4000000000000000` and `c000000000000000`, eight account parts each, and
+   the newest package slice contains per-shard archives for all three shard
+   identities. The single-shard premise that this research has used since the
+   first measurement no longer holds on current mainnet, and any capacity
+   statement must say which shard topology it describes.
+2. **A full epoch does not fit locally.** The working disk has 67.5 GiB free
+   against a 60.6 GB epoch, and importing that into a validator database
+   needs comparable space again. Copying one whole epoch is therefore not
+   viable without another disk. The selective path - masterchain state plus
+   only the account parts covering the target blocks' touched prefixes - is
+   the practical option, and `SelectiveSplitStateAssembler` already exists
+   for the offline tool but is not wired into the database import path.
+
+No data was copied and the node was not loaded; this section records sizes
+and a decision, not an action.
+
 ## Replay-only Collator integration - implementation gate
 
 The Collator now contains a default-off, replay-only path for inbound internal
