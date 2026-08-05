@@ -939,6 +939,37 @@ fewer blocks reach a soft limit at the same offered load, and the honest
 measurement is offered load versus overload-history weight, not a single TPS
 number.
 
+### Split cycling after the 2026-08-03 mandatory update
+
+The 2026-08-03 11:00 UTC mandatory validator update was expected to end the
+premature splits under non-peak load that followed the protocol-v2
+activation. The archive's per-slice shard packs give a free split timeline:
+a 100-block masterchain slice whose directory contains packs for shard
+identities other than `8000000000000000` had a split basechain.
+
+Fraction of slices with a split basechain, per 100k-mc-block directory:
+before the update, `arch0830..0836` run 8%, 25%, 12%, 24%, 21%, 41%, 21%.
+After it, `arch0837..0841` run **60%, 54%, 69%, 42%, 59%** (the last
+directory partial, through midday 2026-08-05). On this node's data the
+basechain spends a larger share of time split after the update than before
+it.
+
+The split observed directly on 2026-08-05 at about 12:02 UTC ended shard
+`8000000000000000` at seqno ~88615500 while the sampled blocks of the
+preceding ~350-block window carried 0-18 transactions (8-47 KB). No byte- or
+gas-load burst is visible anywhere near the history window. If the split was
+technically justified, it was through the non-load overload bits - outbound
+queue backlog, collation time, dispatch-queue time - which are exactly the
+symptomatic triggers of the v2 regression. Cross-shard latency was not
+measured here and may well have improved; but premature splitting under
+near-zero load demonstrably continued two days after the update.
+
+For this research the consequence is stable either way: the overload history
+is fed by soft-limit hits, timing, and queue backlog, so an executor that
+cuts collation wall time and drains queues faster attacks the split trigger
+directly, and the honest bench measurement remains offered load versus
+overload-history pressure with and without the parallel path.
+
 ## Replay-only Collator integration - implementation gate
 
 The Collator now contains a default-off, replay-only path for inbound internal
