@@ -968,6 +968,29 @@ symptomatic triggers of the v2 regression. Cross-shard latency was not
 measured here and may well have improved; but premature splitting under
 near-zero load demonstrably continued two days after the update.
 
+Correction to the update framing: the release that shipped is `2026.07`
+(2026-08-03, node target `bb935a8`), and it **retains** the legacy broadcast
+while improving the new one - not the legacy-broadcast shutdown a prior
+status post had described. The masterchain block rate, measured here from
+block header timestamps, confirms `2026.07` worked on the axis it targeted:
+2.204 blk/s on 07-31 (the v2 regression, below the reported 2.30), rising
+2.328 (08-02), 2.416 (08-04), 2.481 (08-05) back to the ~2.47 norm. So
+cadence recovered, while the basechain still spent 60-69% of the post-update
+window split. The two are consistent: the broadcast fix restored masterchain
+cadence, but the split machinery's sensitivity to the timing/queue bits
+persists, pending the neighbor-reduction changes (#2512/#2513) still in
+testnet. This directly reinforces the executor's relevance: cadence is
+restorable by fixing broadcast, but the timing component of split pressure is
+attacked by making collation itself faster.
+
+Live Config 30 on 2026-08-05 carries `simplex_config_v2` with
+`protocol_version` 0 (masterchain) and 1 (shard); the "set protocol to stable
+version" vote that raises it is still in progress, so the parameter this
+research assumes is the pre-stable one. The archive node used for these
+read-only measurements is a liteserver, not a validator (no `validator`
+config block), so it neither votes nor collates - it only serves the
+finalized data the validator set produced.
+
 For this research the consequence is stable either way: the overload history
 is fed by soft-limit hits, timing, and queue backlog, so an executor that
 cuts collation wall time and drains queues faster attacks the split trigger
