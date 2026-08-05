@@ -970,6 +970,59 @@ cuts collation wall time and drains queues faster attacks the split trigger
 directly, and the honest bench measurement remains offered load versus
 overload-history pressure with and without the parallel path.
 
+## Offered load versus split pressure - 2026-08-05 - measured
+
+`benchmark/overload_curve.py` runs the jetton bench at a ladder of external
+rates, one fresh single-shard network per rate with mainnet-parity limits and
+`max_split=0`, and scrapes every basechain `check_block_overload` decision
+from the validator log. The parallel path is replay-only, so this is the
+serial collator's baseline curve.
+
+| ext/s | blocks | overloaded | byte-limit bits | slow-collation bits | want_split blocks | first want_split | median size est |
+|------:|------:|----------:|---------------:|--------------------:|------------------:|-----------------:|----------------:|
+|   100 |   143 |        5% |              0 |                   7 |                 0 |        never | 232 KB |
+|   200 |    68 |       47% |              0 |                  32 |                 3 |           65 | 482 KB |
+|   300 |    24 |       33% |              1 |                   7 |                 0 |        never | 710 KB |
+|   450 |   132 |       73% |             59 |                  38 |                94 |           39 | 1,007 KB |
+|   600 |   132 |       73% |             70 |                  27 |                92 |           41 | 1,057 KB |
+|   900 |    68 |       71% |             46 |                   2 |                27 |           42 | 1,177 KB |
+
+Findings, in order of importance:
+
+1. **The byte soft limit is the split trigger under jetton load.** Byte-class
+   overload bits go 0/0/1/59/70/46 as the median size estimate crosses the
+   1 MiB Config 23 soft threshold between 300 and 450 ext/s. Gas never
+   exceeded 4.5M against a 10M soft limit, and the outbound queue never
+   approached the 4096 force-split threshold: on this workload the byte axis
+   binds first, and by a wide margin.
+2. **Sustained split demand begins between 300 and 450 ext/s offered**, about
+   650-975 included raw tx/s at the measured 2.17 raw-transactions-per-
+   external chain ratio. From 450 ext/s upward the shard requests a split
+   within about 40 blocks of spam start and keeps requesting it. This is the
+   stand's single-shard capacity boundary on mainnet-parity limits: past it,
+   the protocol's designed answer is sharding, and no executor changes that,
+   because the boundary is made of bytes, not compute.
+3. **Timing bits alone can fire splits, reproducing the July failure class in
+   miniature.** At 200 ext/s - zero byte pressure, 482 KB median blocks -
+   32 of 35 overload bits came from "collation takes too long" and briefly
+   drove `want_split` with no load worth splitting for. On this laptop-class
+   stand those bits fire earlier than they would on server hardware, which is
+   a stand caveat and simultaneously the demonstration: whenever collation
+   wall time degrades for any reason, the split machinery fires without real
+   load. This is where a faster executor genuinely moves the curve - it
+   removes the timing component of split pressure below the byte boundary.
+4. **Real mainnet load sits below the pressure region.** The busiest archived
+   mainnet block (394 KB, 191 tx) corresponds to the stand's 200-300 ext/s
+   regime, where byte pressure is zero. Current mainnet splits therefore
+   cannot be byte-driven; they are timing/queue-driven, consistent with the
+   post-update split cycling recorded above.
+
+Caveats: the 300 ext/s point captured only 24 blocks and the 200/900 points
+68 each (bench-harness truncations on this stand); the slow-collation bit
+threshold is hardware-relative; and included-TPS at each rung was not
+separately recorded (the ext/s to raw-tx/s ratio is taken from the earlier
+600 ext/s measurement). The shape of the curve is robust to all three.
+
 ## Replay-only Collator integration - implementation gate
 
 The Collator now contains a default-off, replay-only path for inbound internal
