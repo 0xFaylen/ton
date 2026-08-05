@@ -883,6 +883,62 @@ second disk remains the clean answer.
 No data was copied and the node was not loaded; this section records sizes,
 a measurement that rejected an approach, and a decision, not an action.
 
+## What actually limits a mainnet basechain block - 2026-08-05
+
+A Linux build was not needed after all. The archive node runs a liteserver, so
+the existing Windows `lite-client` and `tvm-replay-bundle` can characterize
+real mainnet blocks directly with a handful of small read-only queries. Archive
+pack sizes locate the busy periods for free: the largest single-shard pack in
+the archive is `archive.83605800.0_8000000000000000.pack` at 24.4 MB.
+
+The busiest basechain block sampled from that period, `88103235`, is
+**394,829 bytes with 191 transactions across 133 accounts**, all ordinary, at
+most 20 transactions on one account. That is **18.8% of the 2 MiB candidate
+cap** and about 2,067 bytes per transaction.
+
+Two consequences:
+
+1. **Real mainnet blocks are nowhere near byte-saturated.** The earlier
+   fixture block `88028077` sat at 17.88% of the cap and was treated as an
+   unsaturated sample; the busiest block in the whole retained archive is at
+   18.8%. Byte capacity is not what bounds mainnet basechain blocks today, so
+   projections from the byte cap describe a ceiling the network does not
+   currently approach.
+2. **The synthetic jetton corpus is harder than mainnet.** Its blocks carry
+   672 transactions in about 1.3 MB, roughly 3.5x the transaction count and
+   3.3x the bytes of the busiest real block. The parallel-executor gate is
+   therefore being verified against a workload denser than anything mainnet
+   has produced in the retained window.
+
+### The split is not triggered by instantaneous load
+
+Sampling around the shard split that ended shard `8000000000000000`, the last
+blocks before it were nearly empty: seqno `88615400` carried 11 transactions
+in 32 KB and `88615500` carried 3 transactions in 8 KB. Load at the moment of
+the split was negligible, so "the shard splits at N TPS" is not a statement
+the data supports as written.
+
+`Collator::check_block_overload` explains why. Each block shifts a 64-bit
+`overload_history_`, sets the low bit when the block hit a soft block-limit
+class, took too long to collate, or spent too long on the dispatch queue, and
+also sets it when `out_msg_queue_size_ >= FORCE_SPLIT_QUEUE_SIZE` (4096)
+regardless of that block's own load. `want_split` then follows
+`history_weight`, which weights the last 16 blocks by 3, the previous 16 by 2
+and the 16 before that by 1, against a fixed threshold. The decision is
+therefore a hysteretic function of roughly the last 48 blocks plus the
+outbound queue backlog, not of the current block. A split lands after the
+burst that caused it has already passed, which is exactly what the samples
+show.
+
+The research question "at what TPS does the basechain split" therefore needs
+restating before it can be measured: the quantity that drives splitting is
+sustained overload weight - blocks repeatedly reaching a soft limit or
+exceeding collation time - and the outbound queue backlog, accumulated over
+tens of blocks. Raising single-shard throughput moves that threshold by making
+fewer blocks reach a soft limit at the same offered load, and the honest
+measurement is offered load versus overload-history weight, not a single TPS
+number.
+
 ## Replay-only Collator integration - implementation gate
 
 The Collator now contains a default-off, replay-only path for inbound internal
