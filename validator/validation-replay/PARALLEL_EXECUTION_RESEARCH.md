@@ -983,13 +983,16 @@ testnet. This directly reinforces the executor's relevance: cadence is
 restorable by fixing broadcast, but the timing component of split pressure is
 attacked by making collation itself faster.
 
-Live Config 30 on 2026-08-05 carries `simplex_config_v2` with
-`protocol_version` 0 (masterchain) and 1 (shard); the "set protocol to stable
-version" vote that raises it is still in progress, so the parameter this
-research assumes is the pre-stable one. The archive node used for these
-read-only measurements is a liteserver, not a validator (no `validator`
-config block), so it neither votes nor collates - it only serves the
-finalized data the validator set produced.
+Config 8 global version on 2026-08-05 is **15** with capabilities 1006 -
+this is the TON protocol v2 that the 2026-07-22 vote activated, and it is
+live. Config 30 is a separate parameter: its `simplex_config_v2` carries
+`protocol_version` 0 (masterchain) and 1 (shard), and the "set protocol to
+stable version" vote that raises Config 30 is a distinct, later ballot still
+in progress. The two must not be conflated - "the network is on v2" refers to
+Config 8=15 (done); the pending vote is the Config 30 stable-protocol step.
+The archive node used for these read-only measurements is a liteserver, not a
+validator (no `validator` config block), so it neither votes nor collates -
+it only serves the finalized data the validator set produced.
 
 For this research the consequence is stable either way: the overload history
 is fed by soft-limit hits, timing, and queue backlog, so an executor that
@@ -1059,6 +1062,57 @@ Caveats: the 300 ext/s point captured only 24 blocks and the 200/900 points
 threshold is hardware-relative; and included-TPS at each rung was not
 separately recorded (the ext/s to raw-tx/s ratio is taken from the earlier
 600 ext/s measurement). The shape of the curve is robust to all three.
+
+## Where the collation wall actually goes - 2026-08-05 - Amdahl profile
+
+The gate now passes `--log-work-time` to `vrp`, so the parallel pass reports
+its 15-phase `CollationStats::WorkTimeStats` CPU breakdown. On a 678-executed
+-transaction jetton block (382 ms CPU total):
+
+| phase | ms | share | parallelizable |
+|-------|---:|------:|:--:|
+| `trx_tvm` (per-account execution) | 126 | 33% | yes |
+| `create_collated_data` (proof build) | 37 | 10% | no (single candidate) |
+| `trx_other` (per-tx non-TVM) | 32 | 8% | yes |
+| `combine_account_transactions` | 30 | 8% | no |
+| `create_shard_state` | 22 | 6% | no |
+| `create_block_candidate` | 20 | 5% | no |
+| `trx_storage_stat` | 8.5 | 2% | yes |
+| `create_block` | 6 | 2% | no |
+| remainder (preinit, queues, final stat) | ~1 | <1% | no |
+
+Grouping by whether the work is per-account (parallelizable) or whole-block
+finalization (inherently serial): the parallelizable fraction is
+`(126+32+8.5)/(sum) = 166/281 ≈ 0.59`. Amdahl's law then bounds the executor
+at 1.79x with 4 workers, 2.06x with 8, and 2.44x in the limit - *before* any
+orchestration cost.
+
+Two conclusions set the executor's real ceiling and the next target:
+
+1. **The theoretical ceiling is modest, and orchestration erases it.** A 0.59
+   parallelizable fraction can never exceed 2.44x, and the measured
+   serial/parallel speedup is about 0.9-1.0. The gap between 1.79x (4-worker
+   Amdahl) and the observed ~0.9 is the cost of the parallel path's own
+   machinery: preparing per-account journals, rebasing worker cells onto the
+   coordinator, and replaying journals at commit. Optimizing execution
+   further is pointless while orchestration overhead exceeds the execution it
+   saves; the next executor work is reducing that overhead, not adding
+   workers. This also retires the W2-DESIGN expectation of "3-4x on the
+   execution portion" for this workload: execution is only a third of the
+   collation CPU, so even a free 4x on it yields at most ~1.3x overall.
+2. **The largest serial finalization phase is proof construction.**
+   `create_collated_data` at 10% is the biggest non-parallelizable cost and
+   is exactly what the W6 serialize-tail overlap design targets: building the
+   candidate's collated-data proof while later work proceeds. On this
+   workload, overlapping proof construction is worth more than any additional
+   execution parallelism. `combine_account_transactions` (building the
+   `AccountBlocks` augmented dictionary) and the `create_shard_state` /
+   `create_block` / `create_block_candidate` finalization chain are the next
+   serial targets.
+
+The measurement is CPU time, not wall; the point is the parallelizable-versus-
+serial split, which wall timing only makes more adverse (execution overlaps
+across workers while finalization does not).
 
 ## Replay-only Collator integration - implementation gate
 

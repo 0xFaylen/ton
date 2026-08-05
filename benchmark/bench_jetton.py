@@ -411,7 +411,7 @@ async def _run_vrp_gate(node: FullNode, params: BenchParams) -> int:
             for sample in range(params.vrp_samples):
                 parallel_first = sample % 2 == 1
                 command = (
-                    f"run --mode both --parallel-account-workers {workers}"
+                    f"run --mode both --log-work-time --parallel-account-workers {workers}"
                     + (" --parallel-first" if parallel_first else "")
                     + f" (0,8000000000000000,{seqno})"
                 )
