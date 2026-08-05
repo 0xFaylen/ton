@@ -952,7 +952,11 @@ before the update, `arch0830..0836` run 8%, 25%, 12%, 24%, 21%, 41%, 21%.
 After it, `arch0837..0841` run **60%, 54%, 69%, 42%, 59%** (the last
 directory partial, through midday 2026-08-05). On this node's data the
 basechain spends a larger share of time split after the update than before
-it.
+it. This documents the state as of the measurement date, not a claim that
+the fix effort failed: the neighbor-reduction changes (#2512/#2513) were
+still in testnet at the time of the mandatory update, and the pre-2026-07-22
+baseline - before the protocol-v2 activation - is the normal state this
+regression is being walked back to.
 
 The split observed directly on 2026-08-05 at about 12:02 UTC ended shard
 `8000000000000000` at seqno ~88615500 while the sampled blocks of the
@@ -998,10 +1002,20 @@ Findings, in order of importance:
 2. **Sustained split demand begins between 300 and 450 ext/s offered**, about
    650-975 included raw tx/s at the measured 2.17 raw-transactions-per-
    external chain ratio. From 450 ext/s upward the shard requests a split
-   within about 40 blocks of spam start and keeps requesting it. This is the
-   stand's single-shard capacity boundary on mainnet-parity limits: past it,
-   the protocol's designed answer is sharding, and no executor changes that,
-   because the boundary is made of bytes, not compute.
+   within about 40 blocks of spam start and keeps requesting it.
+
+   The byte boundary is coupled to collation speed, and the coupling matters
+   more than the ceiling. Per-block bytes are offered load divided by block
+   cadence: a collator that keeps the 400 ms target cadence hits the 1 MiB
+   soft limit only at the true protocol ceiling (~2.5 MiB/s of payload,
+   roughly 1,100+ raw tx/s at this workload's 2.2 KB/tx), while a collator
+   that falls behind produces fewer, fatter blocks and reaches the same
+   limit at a lower offered load. The 900 ext/s rung demonstrates this on
+   the stand: cadence halved (68 blocks where 450-600 produced 132) and the
+   median size estimate swelled to 1,177 KB. A faster executor therefore
+   pushes the split threshold up toward the protocol ceiling - by holding
+   cadence, not by shrinking content - and only past that ceiling is
+   sharding the sole answer.
 3. **Timing bits alone can fire splits, reproducing the July failure class in
    miniature.** At 200 ext/s - zero byte pressure, 482 KB median blocks -
    32 of 35 overload bits came from "collation takes too long" and briefly
