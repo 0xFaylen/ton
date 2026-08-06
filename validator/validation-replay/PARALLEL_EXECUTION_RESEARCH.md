@@ -1149,6 +1149,48 @@ assembly, shard-state and candidate creation. Further executor speedup
 requires overlapping or restructuring that tail (the W6 serialize-tail
 direction), not more workers and not more orchestration tuning.
 
+## W6 target located, and one W6 approach ruled out - 2026-08-05
+
+`create_collated_data` is the largest serial finalization phase, so it was
+instrumented before any restructuring. Its three independent
+`MerkleProof::generate` walks now have their own timers. On 678-transaction
+blocks, `create_collated_data` costs 57-63 ms, split as:
+
+| subphase | ms | note |
+|----------|---:|------|
+| previous-state Merkle proof | 32-38 | one walk over the whole prev state |
+| neighbor out-queue proofs | 0.02-0.04 | negligible |
+| account storage-dict proofs | ~0.00 | none on this workload |
+| remainder (`prepare_proofs` + continuation flush) | ~20-25 | dictionary diff scans |
+
+**The obvious W6 approach is dead.** Parallelizing the independent proof
+generations across roots - prev state, neighbor queues, storage dicts - buys
+nothing, because on this workload everything except the previous-state proof
+is free. Any real gain has to come from the single prev-state walk or from
+`prepare_proofs`.
+
+That reshapes the remaining options honestly:
+
+1. **Incremental proof construction.** Inclusion in the proof is monotonic: a
+   cell that gets loaded during execution is in the final proof, and unloaded
+   branches are pruned. In principle the proof tree can be built as loads
+   happen instead of by a full walk afterwards, which is what would truly
+   overlap this cost with execution. This touches the cell-loading hot path
+   of every collation, so it is a large, risky change that must not be
+   attempted without the byte-identity gate proving equivalence on every
+   step - which now exists.
+2. **`prepare_proofs` diff scans.** `old_account_dict->scan_diff(*account_dict)`
+   and the out-queue `scan_diff` walk both dictionary versions to touch the
+   changed paths. At ~20-25 ms this is comparable to the proof walk itself and
+   is plain serial work whose result the parallel path already partly knows:
+   the coordinator committed each account and each queue mutation and could
+   record the changed keys as it went, instead of rediscovering them by a full
+   diff afterwards. This is a smaller, better-contained change than (1).
+
+No implementation was attempted in this pass; the measurement exists to stop
+the wrong one from being built. The next executor work should be option 2,
+with option 1 left as a separate, explicitly gated project.
+
 ## Replay-only Collator integration - implementation gate
 
 The Collator now contains a default-off, replay-only path for inbound internal

@@ -7282,6 +7282,7 @@ bool Collator::create_collated_data() {
     }
 
     state_usage_tree_->set_use_mark_for_is_loaded(false);
+    td::ScopedRealCpuTimer prev_state_proof_timer{stats_.work_time.collated_prev_state_proof};
     auto r_state_proof = vm::MerkleProof::generate(
         prev_state_root_, [&](const Ref<vm::Cell>& c) { return !collated_data_stat.is_loaded(c->get_hash()); });
     if (r_state_proof.is_error()) {
@@ -7303,6 +7304,7 @@ bool Collator::create_collated_data() {
     }
   }
   // 4. Proofs for message queues
+  td::ScopedRealCpuTimer neighbor_proof_timer{stats_.work_time.collated_neighbor_proofs};
   for (auto& [block_id, mpb] : neighbor_proof_builders_) {
     if (prev_block_idx(block_id) != -1) {
       // This was already generated in "3. Previous state proof"
@@ -7324,11 +7326,14 @@ bool Collator::create_collated_data() {
     }
   }
 
+  neighbor_proof_timer.pause();
+
   for (auto& p : proofs) {
     collated_roots_.push_back(std::move(p.second));
   }
 
   // 5. Proofs for account storage dicts
+  td::ScopedRealCpuTimer storage_dict_proof_timer{stats_.work_time.collated_storage_dict_proofs};
   for (auto& [_, dict] : account_storage_dicts_) {
     if (!dict.add_to_collated_data) {
       continue;

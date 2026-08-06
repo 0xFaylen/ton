@@ -188,6 +188,12 @@ struct CollationStats {
     td::RealCpuTimer::Time create_shard_state;
     td::RealCpuTimer::Time create_block;
     td::RealCpuTimer::Time create_collated_data;
+    // Subphases of create_collated_data: the previous-state Merkle proof, the
+    // neighbor out-queue proofs, and the per-account storage-dict proofs are
+    // independent generate() walks over different roots.
+    td::RealCpuTimer::Time collated_prev_state_proof;
+    td::RealCpuTimer::Time collated_neighbor_proofs;
+    td::RealCpuTimer::Time collated_storage_dict_proofs;
     td::RealCpuTimer::Time create_block_candidate;
 
     std::string to_str(bool is_cpu) const {
@@ -202,6 +208,9 @@ struct CollationStats {
                        << " create_shard_state=" << create_shard_state.get(is_cpu)
                        << " create_block=" << create_block.get(is_cpu)
                        << " create_collated_data=" << create_collated_data.get(is_cpu)
+                       << " collated_prev_state_proof=" << collated_prev_state_proof.get(is_cpu)
+                       << " collated_neighbor_proofs=" << collated_neighbor_proofs.get(is_cpu)
+                       << " collated_storage_dict_proofs=" << collated_storage_dict_proofs.get(is_cpu)
                        << " create_block_candidate=" << create_block_candidate.get(is_cpu)
                        << " tvm_hotpath=" << tvm_hotpath.to_str(is_cpu);
     }
@@ -222,6 +231,9 @@ struct CollationStats {
       create_shard_state += r.create_shard_state;
       create_block += r.create_block;
       create_collated_data += r.create_collated_data;
+      collated_prev_state_proof += r.collated_prev_state_proof;
+      collated_neighbor_proofs += r.collated_neighbor_proofs;
+      collated_storage_dict_proofs += r.collated_storage_dict_proofs;
       create_block_candidate += r.create_block_candidate;
       tvm_hotpath.merge(r.tvm_hotpath);
       return *this;
@@ -242,6 +254,9 @@ struct CollationStats {
       create_shard_state *= r;
       create_block *= r;
       create_collated_data *= r;
+      collated_prev_state_proof *= r;
+      collated_neighbor_proofs *= r;
+      collated_storage_dict_proofs *= r;
       create_block_candidate *= r;
       tvm_hotpath.scale(r);
       return *this;
