@@ -3426,6 +3426,38 @@ bool Collator::combine_account_transactions() {
       shard_accounts->print_rec(sb);
     };
   }
+  if (params_.is_replay) {
+    // Overlap budget for incremental AccountBlocks assembly: accounts whose
+    // last transaction happened in an earlier phase could have been combined
+    // while later phases were still executing.
+    struct PhaseCount {
+      std::size_t accounts{0};
+      std::size_t transactions{0};
+    };
+    std::array<PhaseCount, 5> by_phase{};
+    PhaseCount unknown;
+    for (const auto& entry : accounts) {
+      const auto& account = *entry.second;
+      if (account.transactions.empty()) {
+        continue;
+      }
+      auto it = replay_last_tx_phase_.find(entry.first);
+      auto& bucket = it == replay_last_tx_phase_.end() ? unknown : by_phase[static_cast<std::size_t>(it->second)];
+      ++bucket.accounts;
+      bucket.transactions += account.transactions.size();
+    }
+    const auto& inbound = by_phase[static_cast<std::size_t>(TvmHotpathStats::AccountWorkPhase::inbound_internal)];
+    const auto& external = by_phase[static_cast<std::size_t>(TvmHotpathStats::AccountWorkPhase::external)];
+    const auto& new_or_deferred = by_phase[static_cast<std::size_t>(TvmHotpathStats::AccountWorkPhase::new_or_deferred)];
+    const auto& special = by_phase[static_cast<std::size_t>(TvmHotpathStats::AccountWorkPhase::special)];
+    LOG(ERROR) << "REPLAY_COMBINE_PHASES pass="
+               << (params_.collator_opts->replay_parallel_account_workers != 0 ? "parallel" : "serial")
+               << " last_inbound=" << inbound.accounts << "/" << inbound.transactions
+               << " last_external=" << external.accounts << "/" << external.transactions
+               << " last_new=" << new_or_deferred.accounts << "/" << new_or_deferred.transactions
+               << " last_special=" << special.accounts << "/" << special.transactions
+               << " last_unknown=" << unknown.accounts << "/" << unknown.transactions;
+  }
   return true;
 }
 
@@ -3711,6 +3743,9 @@ Ref<vm::Cell> Collator::create_ordinary_transaction(Ref<vm::Cell> msg_root,
   update_max_lt(acc->last_trans_end_lt_);
   value_flow_.burned += trans->blackhole_burned;
   ++stats_.transactions;
+  if (params_.is_replay) {
+    replay_last_tx_phase_[addr] = account_work_phase;
+  }
   return trans_root;
 }
 
@@ -4610,6 +4645,9 @@ Ref<vm::Cell> Collator::commit_parallel_inbound_transaction(ParallelInboundPrepa
   update_max_lt(account_it->second->last_trans_end_lt_);
   value_flow_.burned += trans->blackhole_burned;
   ++stats_.transactions;
+  if (params_.is_replay) {
+    replay_last_tx_phase_[prepared.account_address] = TvmHotpathStats::AccountWorkPhase::inbound_internal;
+  }
   return trans_root;
 }
 

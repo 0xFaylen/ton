@@ -1376,6 +1376,18 @@ here is a performance forecast for TON.
   (default since node v1.60, 2025-11) folds per-transaction certification
   into consensus blocks, removing serial certificate aggregation
   ([blog.sui.io/mysticeti-v2-sui-consensus](https://blog.sui.io/mysticeti-v2-sui-consensus/)).
+- **Solana slot-time reduction** ([SIMD-0525](https://simd.mixy.one/simd/0525-reduce-slot-times/)):
+  400ms -> 200ms in four feature-gated 50ms steps (350ms on testnet as of
+  2026-08; first mainnet step targeted 2026-08-17 with Agave v4.2). The SIMD
+  explicitly credits prior Turbine/Replay overhead reductions as the enabler:
+  the slot was cut only after per-slot fixed costs shrank. By itself the
+  change is roughly TPS-neutral (half the budget, twice the rate) - it is a
+  latency upgrade. The TON-relevant reading: per-block fixed serial costs
+  bound how short a block can be. TON's measured ~150ms finalization tail is
+  37% of the 400ms target cadence and would be 75% of a hypothetical 200ms
+  one - tail reduction is the precondition both for throughput at the current
+  cadence and for any future cadence decrease, which is exactly the
+  pipelined-finalization direction chosen below.
 - **Monad** (mainnet 2025-11-24) executes all block transactions
   speculatively in parallel and merges read/write sets serially in block
   order, re-executing on conflict; the design bet is that re-execution is
@@ -1473,6 +1485,22 @@ line up behind one direction:
 - The split-pressure measurements make collation wall time the lever that
   moves the shard-split threshold: holding 0.4s cadence pushes the byte
   boundary toward the ~2.5 MiB/s protocol ceiling.
+
+The overlap budget is now measured, not assumed. Replay-only telemetry
+(`REPLAY_COMBINE_PHASES`, the collation phase of each account's last
+committed transaction, logged at `combine_account_transactions`) on three
+saturated mixed-corpus blocks (3/3 byte-identical, serial and parallel
+histograms equal): 141/186/222 accounts closed their chains in the inbound
+phase versus 504/461/418 in the externals phase, and **zero** accounts had
+their last transaction in the new/deferred phase - at saturation freshly
+generated internals are deferred through the queue, so no account reopens
+after the externals phase. Consequences: (a) 22-35% of `AccountBlocks` can
+be combined while the externals phase is still executing; (b) every
+external-phase account received exactly one transaction on this workload and
+was never touched again, so a speculative streaming combine - build each
+account's block when its transaction commits, invalidate and recombine on a
+later touch - would cover nearly 100% of the 44-46ms combine cost, with the
+adversarial worst case bounded by recombining only re-touched accounts.
 
 The chosen project is **pipelined finalization**: overlap the tail phases
 with the execution window instead of running them as a monolithic post-phase.

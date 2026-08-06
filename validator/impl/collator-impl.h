@@ -162,6 +162,10 @@ class Collator final : public td::actor::Actor {
   std::unique_ptr<block::OutputQueueMerger> replay_shadow_out_msgs_;
   std::unique_ptr<parallel_inbound::ReusableWorkerPool> replay_parallel_worker_pool_;
   std::map<ton::StdSmcAddress, std::unique_ptr<ParallelAccountContinuation>> replay_parallel_account_continuations_;
+  // Replay-only overlap-budget telemetry: the collation phase of each
+  // account's last committed ordinary transaction. Logged by
+  // combine_account_transactions to size incremental AccountBlocks assembly.
+  std::map<ton::StdSmcAddress, TvmHotpathStats::AccountWorkPhase> replay_last_tx_phase_;
   std::vector<ton::StdSmcAddress> special_smcs;
   Ref<vm::Cell> prev_block_root;
   Ref<vm::Cell> prev_state_root_, prev_state_root_pure_;
