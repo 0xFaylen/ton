@@ -82,17 +82,34 @@ td::Status CellUsageJournal::replay_into(const td::Ref<vm::Cell>& pure_root,
 
   std::vector<vm::LoadedCell> resolved_cells;
   resolved_cells.reserve(entries_.size());
+  // Entries are recorded in traversal order, so consecutive paths share long
+  // prefixes. Keep the resolved chain and restart from the longest common
+  // prefix: walking from the root for every entry costs O(entries * depth)
+  // cell loads and dominates the coordinator's commit phase. Cells on a
+  // cached prefix were already validated when they were first resolved.
+  std::vector<td::uint8> cached_path;
+  std::vector<td::Ref<vm::Cell>> chain;
+  chain.push_back(pure_root);
   for (const auto& entry : entries_) {
-    td::Ref<vm::Cell> current = pure_root;
-    for (auto ref_id : entry.ref_path) {
+    std::size_t common = 0;
+    while (common < cached_path.size() && common < entry.ref_path.size() &&
+           cached_path[common] == entry.ref_path[common]) {
+      ++common;
+    }
+    cached_path.resize(common);
+    chain.resize(common + 1);
+    td::Ref<vm::Cell> current = chain.back();
+    for (std::size_t i = common; i < entry.ref_path.size(); ++i) {
       if (!current->get_tree_node().empty()) {
         return td::Status::Error("cell-usage journal path entered a mutable usage tree");
       }
       TRY_RESULT(loaded, current->load_cell());
-      current = loaded.data_cell->get_ref(ref_id);
+      current = loaded.data_cell->get_ref(entry.ref_path[i]);
       if (current.is_null()) {
         return td::Status::Error("cell-usage journal path is absent from the coordinator root");
       }
+      cached_path.push_back(entry.ref_path[i]);
+      chain.push_back(current);
     }
 
     if (!current->get_tree_node().empty()) {
@@ -106,10 +123,24 @@ td::Status CellUsageJournal::replay_into(const td::Ref<vm::Cell>& pure_root,
     resolved_cells.push_back(std::move(loaded));
   }
 
+  // The coordinator-node walk has the same prefix structure; cache it too.
+  std::vector<td::uint8> cached_node_path;
+  std::vector<vm::CellUsageTree::NodePtr> node_chain;
+  node_chain.push_back(coordinator_anchor);
   for (std::size_t i = 0; i < entries_.size(); ++i) {
-    auto coordinator_node = coordinator_anchor;
-    for (auto ref_id : entries_[i].ref_path) {
-      coordinator_node = coordinator_node.create_child(ref_id);
+    const auto& ref_path = entries_[i].ref_path;
+    std::size_t common = 0;
+    while (common < cached_node_path.size() && common < ref_path.size() &&
+           cached_node_path[common] == ref_path[common]) {
+      ++common;
+    }
+    cached_node_path.resize(common);
+    node_chain.resize(common + 1);
+    auto coordinator_node = node_chain.back();
+    for (std::size_t j = common; j < ref_path.size(); ++j) {
+      coordinator_node = coordinator_node.create_child(ref_path[j]);
+      cached_node_path.push_back(ref_path[j]);
+      node_chain.push_back(coordinator_node);
     }
     resolved_cells[i].tree_node = coordinator_node;
     if (!coordinator_node.on_load(resolved_cells[i])) {

@@ -4486,18 +4486,21 @@ Ref<vm::Cell> Collator::commit_parallel_inbound_transaction(ParallelInboundPrepa
     return true;
   };
 
-  if (!replay_journal(prepared.account_usage, false) || !replay_journal(prepared.message_usage, false) ||
-      !replay_journal(prepared.storage_usage, false)) {
-    current_tx_storage_dict_ = nullptr;
-    return {};
-  }
   {
-    block::StorageStatCalculationContext storage_context{true};
-    block::StorageStatCalculationContext::Guard guard{&storage_context};
-    if (!replay_journal(prepared.account_usage, true) || !replay_journal(prepared.message_usage, true) ||
-        !replay_journal(prepared.storage_usage, true)) {
+    td::ScopedRealCpuTimer journal_timer{stats_.replay_parallel_accounts.journal_replay_time};
+    if (!replay_journal(prepared.account_usage, false) || !replay_journal(prepared.message_usage, false) ||
+        !replay_journal(prepared.storage_usage, false)) {
       current_tx_storage_dict_ = nullptr;
       return {};
+    }
+    {
+      block::StorageStatCalculationContext storage_context{true};
+      block::StorageStatCalculationContext::Guard guard{&storage_context};
+      if (!replay_journal(prepared.account_usage, true) || !replay_journal(prepared.message_usage, true) ||
+          !replay_journal(prepared.storage_usage, true)) {
+        current_tx_storage_dict_ = nullptr;
+        return {};
+      }
     }
   }
   current_tx_storage_dict_ = nullptr;
@@ -4517,6 +4520,7 @@ Ref<vm::Cell> Collator::commit_parallel_inbound_transaction(ParallelInboundPrepa
   // would have kept.
   const std::vector<const ParallelCellUsageContext*> rebase_contexts{
       prepared.account_usage.get(), prepared.message_usage.get(), prepared.storage_usage.get()};
+  td::ScopedRealCpuTimer rebase_timer{stats_.replay_parallel_accounts.rebase_time};
   auto rebased_state = rebase_parallel_usage_cells(trans->new_total_state, rebase_contexts);
   if (rebased_state.is_error()) {
     fatal_error(rebased_state.move_as_error_prefix("cannot rebase a parallel account state: "));
@@ -4544,6 +4548,7 @@ Ref<vm::Cell> Collator::commit_parallel_inbound_transaction(ParallelInboundPrepa
     }
     *new_state_field = rebased_field.move_as_ok();
   }
+  rebase_timer.pause();
   const bool log_limit_delta = params_.collator_opts->replay_log_limit_deltas && params_.is_replay;
   const auto limit_stat_before =
       log_limit_delta ? block_limit_status_->st_stat.get_total_stat() : vm::NewCellStorageStat::Stat{};

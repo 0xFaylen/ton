@@ -93,6 +93,12 @@ struct CollationStats {
     td::RealCpuTimer::Time prepare_time;
     td::RealCpuTimer::Time worker_time;
     td::RealCpuTimer::Time commit_time;
+    // Subphases of commit_time that exist only because execution ran in a
+    // worker: replaying the recorded cell-usage journals into the coordinator
+    // tree, and rebasing worker cell wrappers onto coordinator anchors. The
+    // remainder of commit_time is ordinary serial commit work.
+    td::RealCpuTimer::Time journal_replay_time;
+    td::RealCpuTimer::Time rebase_time;
 
     ReplayParallelAccountStats& operator+=(const ReplayParallelAccountStats& other) {
       attempts += other.attempts;
@@ -105,6 +111,8 @@ struct CollationStats {
       prepare_time += other.prepare_time;
       worker_time += other.worker_time;
       commit_time += other.commit_time;
+      journal_replay_time += other.journal_replay_time;
+      rebase_time += other.rebase_time;
       return *this;
     }
   };

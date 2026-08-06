@@ -953,7 +953,9 @@ class ValidationReplayerImpl : public ValidationReplayer {
              << ", discarded_prepared=" << Fixed((double)actual.discarded_prepared / n, 2)
              << ", prepare_time=" << Fixed(actual.prepare_time.real / n, 6)
              << ", worker_time=" << Fixed(actual.worker_time.real / n, 6)
-             << ", commit_time=" << Fixed(actual.commit_time.real / n, 6);
+             << ", commit_time=" << Fixed(actual.commit_time.real / n, 6)
+             << ", journal_replay_time=" << Fixed(actual.journal_replay_time.real / n, 6)
+             << ", rebase_time=" << Fixed(actual.rebase_time.real / n, 6);
         }
         if (log_work_time) {
           auto wt = collate->work_time;

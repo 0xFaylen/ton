@@ -1114,6 +1114,41 @@ The measurement is CPU time, not wall; the point is the parallelizable-versus-
 serial split, which wall timing only makes more adverse (execution overlaps
 across workers while finalization does not).
 
+## Orchestration overhead measured and trimmed - 2026-08-05
+
+`commit_time` was a black box mixing coordinator-only work with ordinary
+serial commit. Two subtimers now split it: `journal_replay_time` (replaying
+worker cell-usage journals into the coordinator tree) and `rebase_time`
+(rebasing worker wrappers onto coordinator anchors). On 283-290-transaction
+parallel batches the split was commit 95-128 ms, of which journal replay
+26-32 ms (25-27%), rebase 4-5 ms (4%), and 65-91 ms ordinary serial commit.
+
+`CellUsageJournal::replay_into` re-resolved every entry's path from the root,
+costing O(entries x depth) `load_cell` calls, although entries are recorded in
+traversal order and share long prefixes. Both the cell walk and the
+coordinator-node walk now cache the resolved chain and restart from the
+longest common prefix. Journal replay dropped from a 26-32 ms range to a
+17.9 ms median, roughly -40% on that phase, with the four-root unit tests and
+an 18-of-18 gate run (three blocks, workers 2/4/8, both pass orders) all
+green.
+
+The honest outcome is that this barely moved the headline: the median
+serial/parallel speedup went from 0.94 to 0.97 (range 0.67-1.48). Journal
+replay was about 15% of commit and commit is itself only part of the pass, so
+a 40% cut there is worth a few percent overall. What the measurement settles
+is where the remaining time is *not*: after this change, coordinator-only
+orchestration is roughly 22 ms (18 journal + 4 rebase) against about 108 ms of
+commit, so orchestration is no longer the dominant overhead. The rest of
+commit is ordinary serial work that a serial pass also pays.
+
+Combined with the Amdahl profile, the conclusion for the executor is now
+concrete: per-account execution is 59% of collation CPU and already runs
+concurrently; orchestration is trimmed to a small residue; and the ceiling is
+set by the serial finalization tail - proof construction, `AccountBlocks`
+assembly, shard-state and candidate creation. Further executor speedup
+requires overlapping or restructuring that tail (the W6 serialize-tail
+direction), not more workers and not more orchestration tuning.
+
 ## Replay-only Collator integration - implementation gate
 
 The Collator now contains a default-off, replay-only path for inbound internal
