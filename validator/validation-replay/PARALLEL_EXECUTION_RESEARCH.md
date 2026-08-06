@@ -1517,6 +1517,54 @@ re-admission) stays queued behind this: it improves goodput under
 over-saturation but does not move collation wall time, which is what both
 the split threshold and the executor ceiling are bound by.
 
+## W7 roadmap: the streaming collator - 2026-08-06
+
+The synthesis of every measurement and the survey. Three TON-unique
+properties no peer stack has: the conflict unit is free and exact
+(destination account - no declared access lists, no speculation); a large
+share of block N+1's workload (inbound internals) is deterministically known
+in canonical (lt, hash) order the moment block N's execution ends, because
+the queue is persistent state; and full collated data makes the candidate
+self-sufficient, so candidate production is the only latency-critical
+artifact. Today the collator discards property two entirely: every block
+pays `execution (~330ms) + serial tail (~150ms)` in sequence.
+
+Target: cadence bound by max(execution, tail) instead of their sum, then
+tail approaching zero.
+
+- **Phase A - streaming tail inside the block** (started; overlap budget
+  measured above): speculative incremental AccountBlocks, incremental
+  prev-state proof, per-lane state serialization. Expectation: tail 150ms ->
+  ~50ms. Solana's SIMD-0525 sequence (shrink per-slot fixed costs first, cut
+  the slot after) is the working precedent.
+- **Phase B - cross-block pipeline**: execute block N+1's inbound phase
+  while block N's tail serializes in the background. N's post-state is fixed
+  at execution end, not serialization end. This is a scope-limited
+  reactivation of optimistic collation (the Accelerator-class path removed
+  in the Simplex transition), restricted to the execution phase on the
+  collator's own candidate - a natural fit for PR #2523's dedicated
+  collators producing consecutive blocks. Expectation: the serial tail
+  leaves the critical path; the "collation takes too long" split-trigger
+  bits - the dominant premature-split cause today - stop firing.
+- **Phase C - block-transcending account lanes**: lanes do not stop at the
+  block boundary; the boundary is a seal point (multi-frontier commit:
+  queue/account/gas/byte/lt frontiers checked at ordered commit) while
+  execution streams on. An account untouched in block N executes its N+1
+  queue message with zero speculation - its state is already final. Monad
+  needs speculation for this; Solana has no queue-as-state at all.
+
+Honest ceiling math: the single-shard protocol ceiling is the byte envelope,
+~2.5 MiB/s payload = ~2,300 raw tx/s = ~1,000+ jetton operations/s at a held
+400ms cadence. The current split threshold sits at 650-975 raw tx/s and is
+timing/soft-byte-driven. Hard-cap blocks need ~5,750 tx/s of execution
+bandwidth; serial replay already measures 3.1k and account-parallel workers
+cover the rest. A+B+C therefore target the protocol ceiling - roughly 3.5x
+the current split threshold and 7x observed jetton TPS - with no protocol,
+block-format, or consensus change. Sustaining that is also the engineering
+prerequisite for a Config 23 soft-limit vote (1 MiB -> 2 MiB), which would
+double the ceiling again toward the 1,500-2,500 jetton-ops/s target band.
+Every step lands under the existing byte-identity + ValidateQuery gate.
+
 ## Replay-only Collator integration - implementation gate
 
 The Collator now contains a default-off, replay-only path for inbound internal
