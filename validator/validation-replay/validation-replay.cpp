@@ -239,7 +239,7 @@ std::string try_describe_account_leaf(const Ref<vm::Cell>& cell, const Ref<vm::C
   return PSTRING() << " account=" << address_text << " has_transaction=" << transactions;
 }
 
-StateUpdateFootprint collect_state_update_footprint(Ref<vm::Cell> root) {
+StateUpdateFootprint collect_state_update_footprint(Ref<vm::Cell> root, std::string path_prefix = "") {
   StateUpdateFootprint result;
   std::set<vm::Cell::Hash> visited;
   // The ref-index path from the Merkle-update root identifies the state
@@ -252,7 +252,7 @@ StateUpdateFootprint collect_state_update_footprint(Ref<vm::Cell> root) {
     std::string account;
   };
   std::vector<PendingCell> stack;
-  stack.push_back({std::move(root), "", ""});
+  stack.push_back({std::move(root), std::move(path_prefix), ""});
   while (!stack.empty()) {
     auto [cell, path, account] = std::move(stack.back());
     stack.pop_back();
@@ -287,6 +287,25 @@ StateUpdateFootprint collect_state_update_footprint(Ref<vm::Cell> root) {
                                    : (path.empty() ? PSTRING() << i : PSTRING() << path << "/" << i);
       stack.push_back({cs.prefetch_ref(i), std::move(child_path), account});
     }
+  }
+  return result;
+}
+
+// Collated data is a multi-root BOC (prev-state/queue Merkle proofs plus
+// auxiliary cells). Collect one merged footprint across all roots, with the
+// root index as the path prefix, so a collated-only mismatch can be localized
+// the same way as a state-update mismatch.
+StateUpdateFootprint collect_collated_footprint(td::Slice collated_data) {
+  StateUpdateFootprint result;
+  auto roots_result = vm::std_boc_deserialize_multi(collated_data);
+  if (roots_result.is_error()) {
+    return result;
+  }
+  auto roots = roots_result.move_as_ok();
+  for (std::size_t i = 0; i < roots.size(); ++i) {
+    auto part = collect_state_update_footprint(roots[i], PSTRING() << "r" << i);
+    result.materialized.insert(part.materialized.begin(), part.materialized.end());
+    result.pruned.insert(part.pruned.begin(), part.pruned.end());
   }
   return result;
 }
@@ -1081,6 +1100,13 @@ class ValidationReplayerImpl : public ValidationReplayer {
           if (serial_block.state_update->get_hash() != parallel_block.state_update->get_hash()) {
             append_state_update_divergence(divergence, collect_state_update_footprint(serial_block.state_update),
                                            collect_state_update_footprint(parallel_block.state_update),
+                                           serial_extra.account_blocks);
+          }
+          if (!collated_bytes_match) {
+            divergence << "\n collated-data footprint:";
+            append_state_update_divergence(divergence,
+                                           collect_collated_footprint(serial->candidate.collated_data.as_slice()),
+                                           collect_collated_footprint(parallel->candidate.collated_data.as_slice()),
                                            serial_extra.account_blocks);
           }
           co_return td::Status::Error(

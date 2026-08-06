@@ -396,9 +396,26 @@ to the block-size estimate: `add_proof` classifies old-state boundaries by
 state-usage-tree wrappers, so the rebase must run before
 `trans->update_limits`, and the 64-entry lookahead must not leave
 touched-but-unprocessed queue entries at the phase end (their cells leak into
-the collated proof), which a deterministic boundary guard now prevents by
+the collated proof), which a deterministic boundary guard prevented by
 keeping the limit-adjacent region serial. After these fixes 18 of 24 gate
 runs pass, including limit-bound 672-682-transaction blocks.
+
+A seventh defect invalidated that boundary guard on gas-bound blocks: a
+~560k-gas mixed-corpus transaction batch blows through the guard's 2M-gas
+margin, the commit loop stops mid-batch at the 10M soft limit, and the
+lookahead-touched tail leaked into the collated proof (+756 bytes,
+collated-only mismatch). The lookahead/prepare now reads a replay-only shadow
+`OutputQueueMerger` over the same queue roots under `state_usage_tree_`
+ignore_loads, so queue cells enter the proof only when the commit loop or the
+serial path materializes them through the primary merger - exactly the serial
+touch set, independent of where a batch stops. The boundary guard remains as
+a performance heuristic only. One mismatch class stays open and is NOT an
+executor defect: collated-only divergences (observed -204..+493 bytes) that
+occur even with `attempts=0`, when the parallel batch path never executes -
+a nondeterminism between repeated collations of the same block in one
+process. The mismatch error now appends a collated-data footprint diff
+(multi-root, per-root breadcrumbs) alongside the state-update diff to
+localize the next occurrence.
 
 The last known equivalence defect - a roughly 100-byte size-estimate drift
 that could flip one transaction exactly at the byte threshold - was traced

@@ -1229,6 +1229,266 @@ proof construction of option 1, both of which are projects rather than
 optimizations, and both of which must be run against the byte-identity gate at
 every step.
 
+## Mixed jetton+compute corpus - 2026-08-06 - decisive executor experiment
+
+The benchmark stack now generates the realistic mixed workload the executor
+question needed. `bench-state-gen --compute-count N` adds active compute-bound
+contract accounts (`test/integration/contracts/compute-bound.fc` compiled into
+`benchmark/contracts/compute-bound.code.boc`; distinct addresses via a 64-bit
+instance data cell), and `bench-spam --compute-share p --compute-rounds-min/max`
+turns a deterministic per-wallet fraction of externals into 0.6 TON calls with a
+16-bit rounds body. Calibration against gated blocks gives roughly
+`gas = 5k + 127 * rounds`, so rounds 800..7000 cover ~105k..900k gas per call -
+inside the 1M per-transaction basechain limit, and heavy enough that a 15% share
+makes blocks gas-bound (10M soft) before they are byte-bound.
+
+### Seventh defect: lookahead collated-proof leak on gas-bound blocks
+
+The first gas-bound gate run (all-compute externals at 4000 rounds) failed with
+a new signature: block data byte-identical, collated data +756 bytes in the
+parallel pass, all block components matching. Root cause: the 64-entry parallel
+lookahead materialized queue entries through the state usage tree before
+execution, and its safety relied on the boundary guard's 2M-gas margin -
+sized for ~30k-gas jetton transfers. A ~560k-gas transaction batch blows
+through that margin, the commit loop stops mid-batch at the 10M soft limit,
+and the touched-but-uncommitted tail stays in the collated-data prev-state
+proof. No margin can fix this class: a worst-case-safe margin would be
+64 x 1M gas, larger than the whole block budget.
+
+The fix removes the mechanism instead of tuning it: a replay-only shadow
+`OutputQueueMerger` over the same queue roots serves lookahead/prepare under
+`state_usage_tree_` ignore_loads, so preparation leaves no trace in the proof.
+The real merger is touched only by the commit loop and the serial path, whose
+lazy materialization (whole equal-lt groups, recording on) reproduces exactly
+the serial pass's touch set. Anchors derived from shadow-traversed cells remain
+real coordinator tree nodes because ignore_loads suppresses only load marks,
+not node creation or tree-node propagation; shadow/real position sync is
+fail-closed and every commit still cross-checks lt/source/hash against the real
+merger. The previously failing signature now passes, including a mid-batch
+boundary stop that discarded 24 prepared results, and the old jetton corpus
+still passes 18/18 with an unchanged median speedup (0.99, range 0.95-1.42).
+
+### Mixed-corpus gate results
+
+Main runs: 100k wallet pairs + 1024 compute accounts, 450 ext/s for 45 s,
+compute share 0.15, rounds 800..7000 (mean gas per heavy call ~500k). Gated
+blocks carried 642-654 transactions at 12.4-12.8M gas (`internal_load`
+1.00-1.02) and 1.81-1.96 MB estimated block size - saturated on the gas axis
+and touching the byte hard region, denser than anything mainnet has produced.
+
+Across two runs, 31 of 32 completed gate runs produced byte-identical block and
+collated data and passed `ValidateQuery` (run 2 was cut short at 14/14 by a
+stand-level validator crash; see below). 119-161 of ~650 transactions per block
+executed through the parallel path (the rest are externals and same-account
+repeats, which stay serial by design), every pass hit exactly one gas boundary
+stop, and the inbound-phase stop telemetry was byte-identical across all runs
+of a block (same txs, gas, size estimate, proof counters).
+
+Median serial/parallel Collator speedups on the mix: 1.04 at 2 workers, 1.06
+at 4, 1.05 at 8 (range 0.96-1.13 excluding one 1.82 cache-order outlier whose
+paired sample read 1.00). The decisive answer, on the numbers:
+
+1. **On a realistic mix the executor is barely net-positive (~+5%)** - far
+   from the 1.19-1.74x of compute-only blocks and just above the 0.97-0.99 of
+   jetton-only blocks. Interpolating the three corpora: the executor pays off
+   in proportion to the fraction of block gas spent in parallel-eligible
+   heavy TVM execution, and a realistic 15% DeFi-like share is not enough.
+2. **Worker count is irrelevant (2 = 4 = 8)**, confirming again that the
+   ceiling is the serial phase structure - externals processing, same-account
+   chains, and the finalization tail - not execution bandwidth.
+
+### Eighth defect - collated-data replay nondeterminism, NOT an executor defect
+
+One saturated run of 32 failed with a +28-byte collated-only mismatch (block
+data identical) on a block whose other five runs, including the opposite pass
+order at the same worker count, passed. A later verification pass caught the
+same class in a much starker form: on a 233-transaction block with an empty
+inbound queue, 2 of 4 gate runs failed with collated-only deltas of -204 and
++493 bytes - **while `attempts=0`**: the parallel batch path never executed a
+single statement (queue_eof), both passes ran byte-identical code, and the
+serial pass's collated bytes were stable across runs while the
+workers-flagged pass varied in both directions. Inbound stop telemetry was
+byte-identical in every case.
+
+The correct conclusion is that this class is not in the parallel executor at
+all: it is a nondeterminism in the collated-data cell footprint between
+repeated collations of the same block inside one process - some
+cache-state-dependent or wall-clock-dependent touch in ordinary collation.
+The gate compares two collations, so it flakes at whatever rate that
+nondeterminism fires (~3% on saturated mixed blocks, ~50% on one observed
+small pure-new-message block shape). The mismatch handler now appends a
+collated-data footprint diff (multi-root walk with per-root breadcrumbs,
+reusing the state-update divergence reporter), so the next occurrence names
+the exact diverged cells; 15 subsequent gate runs did not reproduce it.
+Until localized, isolated collated-only gate failures on otherwise passing
+blocks must be read as this replay nondeterminism, not as executor
+regressions - and equally, the class must be closed before any live-collation
+claim, because live candidates would inherit the same instability.
+
+### Stand reliability note
+
+The Windows stand's validator-engine sporadically dies with access violations
+(exit 0xC0000005) and occasional heap-corruption events, killing roughly one
+bench run in three under compute load. Windows Event Log shows the identical
+crash class on 2026-08-03 across three different binaries - before any of
+this session's changes - and one captured backtrace points into the
+FastSyncOverlay broadcast path during spam, far from the replay code. It is a
+pre-existing stand flake: reruns succeed, and no crash has ever produced a
+wrong gate verdict (fail-loud holds). A symbolized crash-dump session is
+warranted if the rate worsens.
+
+## Execution-architecture survey refresh - 2026-08-06
+
+A bounded source pass over Solana/Agave, Aptos, Sui, and Monad (primary
+sources: papers, code, engineering blogs; vendor TPS claims labeled as such,
+never adopted) plus a same-day TON upstream check. Mechanics only; nothing
+here is a performance forecast for TON.
+
+### What the other stacks actually did
+
+- **Solana/Agave** requires declared read/write account sets and schedules on
+  account locks. Its production arc is instructive: the v1.18 "central
+  scheduler" built a priority/dependency graph (prio-graph) over pending
+  transactions; by v2.2-2.3 Anza removed the graph from the hot path because
+  building it cost more than it saved, replacing it with a greedy
+  lock-conflict check ([anza.xyz/blog/introducing-the-central-scheduler](https://www.anza.xyz/blog/introducing-the-central-scheduler-an-optional-feature-of-agave-v1-18),
+  [helius.dev agave-v2.1/v2.3 notes](https://www.helius.dev/blog/agave-v21-update-all-you-need-to-know)).
+  Firedancer isolates conflict-free microblock packing on a dedicated `pack`
+  tile so execution tiles run lock-free
+  ([fd_pack.c](https://github.com/firedancer-io/firedancer/blob/main/src/disco/pack/fd_pack.c)).
+  Agave 3.x/4.0 latency work moved replay-side verification off the critical
+  path (async dispatch, join-on-demand).
+- **Aptos Block-STM** ([arXiv:2203.06871](https://arxiv.org/abs/2203.06871))
+  is optimistic execution in preset block order over multi-version memory,
+  with aborted incarnations' write sets serving as dependency estimates. The
+  published 110-170k TPS figures are synthetic p2p blocks. "Block-STM v2" has
+  no public paper as of today - only vendor claims (256-core scaling) and
+  aptos-core PRs enabling it on internal test fleets. The adjacent
+  RapidLane/deferred-objects work ([arXiv:2405.06117](https://arxiv.org/abs/2405.06117))
+  attacks hot-account contention by deferring commutative sub-operations to a
+  sequential post-phase - i.e. by redefining the conflict unit, not by
+  smarter scheduling.
+- **Sui**: Pilotfish ([paper](https://sonnino.com/papers/pilotfish.pdf))
+  distributes one validator's execution across machines with per-object
+  versioned queues delivering consensus-ordered operation streams; it scales
+  linearly only when compute-bound and remains an unshipped prototype. What
+  shipped in production is consensus-side: Mysticeti v2 + Transaction Driver
+  (default since node v1.60, 2025-11) folds per-transaction certification
+  into consensus blocks, removing serial certificate aggregation
+  ([blog.sui.io/mysticeti-v2-sui-consensus](https://blog.sui.io/mysticeti-v2-sui-consensus/)).
+- **Monad** (mainnet 2025-11-24) executes all block transactions
+  speculatively in parallel and merges read/write sets serially in block
+  order, re-executing on conflict; the design bet is that re-execution is
+  memory-hot and cheap. MonadDB backs this with a natively versioned Patricia
+  trie and io_uring async state reads
+  ([docs.monad.xyz parallel-execution](https://docs.monad.xyz/monad-arch/execution/parallel-execution),
+  [monaddb](https://docs.monad.xyz/monad-arch/execution/monaddb)). The 10k
+  TPS figure is claimed capacity, not observed sustained load.
+
+### Transferable to TON
+
+1. **Greedy-over-graph, validated in production.** Solana's reversal from
+   prio-graph to greedy is independent evidence for what this fork measured:
+   when the conflict test is trivial (TON: destination account, known for
+   free), any scheduling machinery beyond the cheapest conflict check is pure
+   overhead. Our 0.97x jetton result is the same economics Anza hit.
+2. **Tail overlap, not more workers.** Every stack, once execution
+   parallelized, moved to its serial residue: Solana to scheduling/replay
+   I/O, Sui to certificate aggregation, Monad to state materialization,
+   Aptos to the commit path. This matches the measured TON profile exactly
+   (59% execution already parallel; a diffuse ~150ms finalization tail).
+   The transferable direction is overlapping/pipelining the tail with
+   execution - Firedancer's pack/execute separation and Agave 4.0's
+   off-critical-path verification are working precedents.
+3. **Worker self-scheduling from a shared index** (Block-STM's collaborative
+   scheduler) rather than a central dispatch hop - relevant to the ~35ms
+   orchestration cost that erased the jetton win.
+4. **Async, versioned state I/O** (MonadDB): prefetching accounts referenced
+   by the inbound queue before execution and starting prev-state proof work
+   at collation begin both apply without touching block format - the proof
+   is over the previous state, fully known at collation start.
+5. **Per-object versioned queues** (Pilotfish) are structurally the same as
+   whole-account chains delivered in (lt, hash) order - external validation
+   of this fork's account-lane architecture, including its finding that
+   scaling is linear only when compute-bound (our 1.19-1.74x vs 0.97x).
+
+### Not transferable, and why
+
+1. **Optimistic execution + re-execution** (Block-STM, Monad): solves
+   conflict-set discovery for shared-state VMs. TON's conflict set is exact
+   by construction; speculation adds re-execution cost and threatens the
+   byte-identical candidate gate for nothing.
+2. **Multi-version memory with abort/ESTIMATE machinery**: justified only
+   when conflicts are unknown. They are known here.
+3. **Priority-fee scheduling freedom**: TON's canonical (lt, hash) order
+   leaves the collator no ordering freedom to optimize; only the
+   conflict-handling half of those schedulers is meaningful for TON.
+4. **Declared access lists as an API**: unnecessary (destination account is
+   implicit) and impossible to refine (sub-account state is not declarable
+   in the message format without a protocol change).
+5. **Consensus-path restructuring** (Mysticeti v2, MonadBFT): out of scope
+   by definition; TON's candidate/validate flow stays.
+6. **Sui's owned-object no-consensus lane**: presumes client-ordered
+   per-object causality; TON's lt is chain-assigned and everything already
+   flows through collation.
+7. **Distributed cross-machine execution** (Pilotfish): targets aggregate-CPU
+   scarcity, which is not the measured bottleneck (a single-machine serial
+   tail is); network hops would land on exactly the orchestration path that
+   already erased the jetton win. TON's protocol answer to that regime is
+   sharding.
+
+### TON upstream status (checked 2026-08-06)
+
+- **PR #2485 (dedicated collators) was closed unmerged today and superseded
+  by [PR #2523 "Collators"](https://github.com/ton-blockchain/ton/pull/2523)**
+  (SpyCheese, `ton-blockchain:collators` -> `testnet`, 38 commits, +2815/-717):
+  an on-chain validator-registry contract in Tolk, new ConfigParam 46, and a
+  simplification from shard-scoped to node-level collators with delegation.
+  Review is just starting. The overlap conclusion is unchanged - it is the
+  deployment boundary this executor would sit inside, not an intra-block
+  transaction executor - but every future overlap refresh must now track
+  #2523, not #2485.
+- PR #2513 (lower ihave fanout) merged 2026-08-02; #2512 (same against
+  `testnet-stripped`) still open. Master since 2026-08-01 carries only the
+  v2026.07 merge (QUIC/broadcast performance) and the fanout change - nothing
+  touching collator.cpp, block limits, or Config 23/29.
+- No public code yet for the announced CellDB 2.0/RocksDB replacement; the
+  latest public CellDB work remains the v2 line merged in 2025. Absence of
+  public code is not absence of private work.
+
+## Next engineering project - decision 2026-08-06
+
+Candidates were incremental prev-state proof construction, serial-tail
+restructuring, and the PHASE2 admission/scaffolding track. The numbers now
+line up behind one direction:
+
+- The executor question is answered: ~+5% on a realistic mix, invariant in
+  worker count. Additional execution parallelism has no remaining payoff on
+  any measured corpus short of compute-only blocks.
+- The serial finalization tail is ~150ms of a ~400-500ms saturated collation
+  (combine_account_transactions 44-46ms, create_shard_state 33-38ms,
+  create_block_candidate 32ms, create_collated_data 34-45ms with 20-28ms of
+  prev-state proof, create_block 12-15ms), and the survey shows every peer
+  stack converged on exactly this target once execution parallelized.
+- The split-pressure measurements make collation wall time the lever that
+  moves the shard-split threshold: holding 0.4s cadence pushes the byte
+  boundary toward the ~2.5 MiB/s protocol ceiling.
+
+The chosen project is **pipelined finalization**: overlap the tail phases
+with the execution window instead of running them as a monolithic post-phase.
+Concretely, in order: (1) incremental `AccountBlocks` assembly - combine each
+account's transaction dictionary as its chain closes during collation rather
+than in one 44-46ms pass at the end; (2) prev-state proof construction
+started at collation begin and advanced as loads occur (the W6 option 1 that
+was deferred until a byte-identity gate existed - it now exists and has
+caught seven defects); (3) shard-state/candidate serialization overlap where
+dependency order allows. Every step lands under the vrp byte-identity gate
+plus ValidateQuery, with serial-first/parallel-first pairing, on both the
+jetton and mixed corpora. PHASE2's admission/scaffolding (W3 external
+re-admission) stays queued behind this: it improves goodput under
+over-saturation but does not move collation wall time, which is what both
+the split threshold and the executor ceiling are bound by.
+
 ## Replay-only Collator integration - implementation gate
 
 The Collator now contains a default-off, replay-only path for inbound internal
