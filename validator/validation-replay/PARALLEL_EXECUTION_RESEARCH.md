@@ -1188,8 +1188,46 @@ That reshapes the remaining options honestly:
    diff afterwards. This is a smaller, better-contained change than (1).
 
 No implementation was attempted in this pass; the measurement exists to stop
-the wrong one from being built. The next executor work should be option 2,
-with option 1 left as a separate, explicitly gated project.
+the wrong one from being built.
+
+### Option 2 measured and also rejected
+
+Splitting the remainder further: `prepare_proofs` is 14-17 ms and the
+continuation flush is **0.15 ms** - the journal-replay versioning from earlier
+today reduced the phase-boundary flush to nothing, so the earlier "~20-25 ms
+remainder" was mostly `prepare_proofs` alone.
+
+`prepare_proofs` cannot be replaced by the coordinator's known changed keys as
+proposed. Its `scan_diff` calls have no useful return value: the callbacks do
+nothing but return true. Their entire purpose is the side effect of *touching
+cells* so the collated proof covers the changed dictionary paths, and
+`scan_diff` already skips identical subtrees by hash, so it is proportional to
+the diff rather than to the dictionary. Replacing it with per-key lookups
+would walk from the root once per key - likely slower - and, more seriously,
+would touch a different cell set, changing the collated data byte-for-byte in
+a consensus-critical structure. At 14-17 ms out of a ~500 ms collation, that
+is roughly 3% for a real byte-identity risk. Not worth doing.
+
+### The serial tail is diffuse - no single lever remains
+
+The measurement that matters is the shape, not any single phase. Serial
+finalization on a 678-transaction block is spread across comparable pieces:
+`combine_account_transactions` 44-46 ms, `create_shard_state` 33-38 ms,
+`create_block_candidate` 32 ms, `create_collated_data` 34-45 ms (of which the
+prev-state proof is 20-28), `create_block` 12-15 ms. The largest single serial
+phase is now `combine_account_transactions` - building the `AccountBlocks`
+augmented dictionary - not proof construction.
+
+So W6 as originally scoped ("overlap the serialize tail") would, even if
+perfectly executed against `create_collated_data`, remove under 10% of
+collation. The honest position at the end of this pass: per-account execution
+is already parallel, orchestration overhead is trimmed to a small residue, and
+what remains is five separate serial phases of 12-46 ms each, none dominant.
+There is no remaining single change with a large payoff; further gains require
+either restructuring several finalization phases at once or the incremental
+proof construction of option 1, both of which are projects rather than
+optimizations, and both of which must be run against the byte-identity gate at
+every step.
 
 ## Replay-only Collator integration - implementation gate
 

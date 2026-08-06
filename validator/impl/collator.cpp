@@ -7272,13 +7272,19 @@ bool Collator::create_collated_data() {
   // 3. Previous state proof (only shardchains)
   std::map<td::Bits256, Ref<vm::Cell>> proofs;
   if (!is_masterchain()) {
-    if (!prepare_proofs()) {
-      return fatal_error("cannot prepare proof for collated data");
+    {
+      td::ScopedRealCpuTimer prepare_proofs_timer{stats_.work_time.collated_prepare_proofs};
+      if (!prepare_proofs()) {
+        return fatal_error("cannot prepare proof for collated data");
+      }
     }
-    auto flush_status = flush_parallel_account_continuations();
-    if (flush_status.is_error()) {
-      return fatal_error(
-          flush_status.move_as_error_prefix("cannot flush parallel proof contexts before proof generation: "));
+    {
+      td::ScopedRealCpuTimer flush_timer{stats_.work_time.collated_continuation_flush};
+      auto flush_status = flush_parallel_account_continuations();
+      if (flush_status.is_error()) {
+        return fatal_error(
+            flush_status.move_as_error_prefix("cannot flush parallel proof contexts before proof generation: "));
+      }
     }
 
     state_usage_tree_->set_use_mark_for_is_loaded(false);

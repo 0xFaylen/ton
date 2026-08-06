@@ -194,6 +194,9 @@ struct CollationStats {
     td::RealCpuTimer::Time collated_prev_state_proof;
     td::RealCpuTimer::Time collated_neighbor_proofs;
     td::RealCpuTimer::Time collated_storage_dict_proofs;
+    // Subphases of the create_collated_data remainder.
+    td::RealCpuTimer::Time collated_prepare_proofs;
+    td::RealCpuTimer::Time collated_continuation_flush;
     td::RealCpuTimer::Time create_block_candidate;
 
     std::string to_str(bool is_cpu) const {
@@ -211,6 +214,8 @@ struct CollationStats {
                        << " collated_prev_state_proof=" << collated_prev_state_proof.get(is_cpu)
                        << " collated_neighbor_proofs=" << collated_neighbor_proofs.get(is_cpu)
                        << " collated_storage_dict_proofs=" << collated_storage_dict_proofs.get(is_cpu)
+                       << " collated_prepare_proofs=" << collated_prepare_proofs.get(is_cpu)
+                       << " collated_continuation_flush=" << collated_continuation_flush.get(is_cpu)
                        << " create_block_candidate=" << create_block_candidate.get(is_cpu)
                        << " tvm_hotpath=" << tvm_hotpath.to_str(is_cpu);
     }
@@ -234,6 +239,8 @@ struct CollationStats {
       collated_prev_state_proof += r.collated_prev_state_proof;
       collated_neighbor_proofs += r.collated_neighbor_proofs;
       collated_storage_dict_proofs += r.collated_storage_dict_proofs;
+      collated_prepare_proofs += r.collated_prepare_proofs;
+      collated_continuation_flush += r.collated_continuation_flush;
       create_block_candidate += r.create_block_candidate;
       tvm_hotpath.merge(r.tvm_hotpath);
       return *this;
@@ -257,6 +264,8 @@ struct CollationStats {
       collated_prev_state_proof *= r;
       collated_neighbor_proofs *= r;
       collated_storage_dict_proofs *= r;
+      collated_prepare_proofs *= r;
+      collated_continuation_flush *= r;
       create_block_candidate *= r;
       tvm_hotpath.scale(r);
       return *this;
