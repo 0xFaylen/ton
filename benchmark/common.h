@@ -38,6 +38,7 @@ struct ContractSet {
   Ref<vm::DataCell> w5_code;
   Ref<vm::DataCell> jw_code;
   Ref<vm::DataCell> minter_code;
+  Ref<vm::DataCell> compute_code;  // compute-bound.code.boc (16-bit rounds body)
 };
 
 td::Result<ContractSet> load_contracts(td::CSlice dir);
@@ -92,6 +93,11 @@ Ref<vm::DataCell> build_jw_data(Uint128 jetton_balance, const td::Bits256 &owner
                                 Ref<vm::Cell> jw_code);
 // jetton-minter data: total_supply:Coins admin:MsgAddress(none) content:^Cell code:^Cell
 Ref<vm::DataCell> build_minter_data(Uint128 total_supply, Ref<vm::Cell> content, Ref<vm::Cell> jw_code);
+// compute-bound contract initial data: instance:uint64 (distinct addresses; the
+// contract overwrites it with a 32-bit value on the first call)
+Ref<vm::DataCell> build_compute_data(td::uint64 index);
+// compute-bound account address = hash of StateInit{compute_code, data(index)}
+td::Bits256 derive_compute_addr(td::uint64 index, const ContractSet &contracts);
 // StateInit with code+data only (5 bits, 2 refs); its hash is the account address
 Ref<vm::DataCell> build_state_init(Ref<vm::Cell> code, Ref<vm::Cell> data);
 // Ballast data: chain of `num_cells` cells, 127 bytes of splitmix64 filler each,
@@ -225,14 +231,17 @@ struct Manifest {
   Uint128 total_balance{0};
   td::uint64 num_v5{0};
   td::uint64 num_ballast{0};
+  td::uint64 num_compute{0};
   int ballast_cells{17};
   td::uint32 wallet_id{0};
   td::Bits256 w5_code_hash{};
   td::Bits256 jw_code_hash{};
+  td::Bits256 compute_code_hash{};
   td::Bits256 minter_addr{};
   Uint128 v5_balance{0};
   Uint128 jw_balance{0};
   Uint128 jw_jetton_balance{0};
+  Uint128 compute_balance{0};
   std::string celldb_path;
 
   std::string to_json() const;
@@ -262,5 +271,12 @@ struct SpamParams {
 td::Result<Ref<vm::DataCell>> build_signed_external(const td::Bits256 &seed, td::uint64 wallet_index,
                                                     td::uint64 recipient_index, const Manifest &manifest,
                                                     const ContractSet &contracts, const SpamParams &params = {});
+
+// Pre-signed wallet-v5 external (seqno 0) sending `msg_value` to compute-bound
+// contract #compute_index with a 16-bit `rounds` body (mixed-corpus heavy call).
+td::Result<Ref<vm::DataCell>> build_signed_compute_external(const td::Bits256 &seed, td::uint64 wallet_index,
+                                                            td::uint64 compute_index, td::uint32 rounds,
+                                                            Uint128 msg_value, const Manifest &manifest,
+                                                            const ContractSet &contracts);
 
 }  // namespace bench

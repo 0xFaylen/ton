@@ -65,6 +65,7 @@ namespace {
 
 constexpr td::uint64 kRecipientSalt = 0x7265636970696e74ULL;  // "recipint"
 constexpr td::uint64 kSampleSalt = 0x73616d706c652121ULL;     // "sample!!"
+constexpr td::uint64 kComputeSalt = 0x636f6d7075746521ULL;    // "compute!"
 
 std::atomic<int> g_interrupts{0};
 std::atomic<int> g_exit_code{0};
@@ -88,6 +89,12 @@ struct SpamOptions {
   int signer_threads = 0;       // 0 = auto
   td::uint64 index = 0;         // for the addr subcommand
   bool force_fallback = false;  // start in listBlockTransactions mode (testing)
+  // Mixed corpus: fraction of externals that call a compute-bound contract
+  // instead of doing a jetton transfer, with rounds drawn uniformly per wallet.
+  double compute_share = 0.0;
+  td::uint32 compute_rounds_min = 800;
+  td::uint32 compute_rounds_max = 7000;
+  Uint128 compute_msg_value = 600'000'000;  // 0.6 TON: covers ~1M gas at 400 nanoton/gas + fees
 };
 
 struct Bits256Hash {
@@ -155,18 +162,20 @@ struct PresignedMsg {
   td::Bits256 jw_addr{};
   td::BufferSlice query;  // pre-enveloped liteServer.query{liteServer.sendMessage{boc}}
   bool sampled{false};
+  bool is_compute{false};
 };
 
 class SignerPool {
  public:
-  SignerPool(const Manifest &manifest, const ContractSet &contracts, td::uint64 first, td::uint64 count,
-             td::uint64 target_buffer, double track_sample)
-      : manifest_(manifest)
+  SignerPool(const SpamOptions &opts, const Manifest &manifest, const ContractSet &contracts, td::uint64 first,
+             td::uint64 count, td::uint64 target_buffer)
+      : opts_(opts)
+      , manifest_(manifest)
       , contracts_(contracts)
       , next_(first)
       , end_(first + count)
       , target_buffer_(target_buffer)
-      , track_sample_(track_sample) {
+      , track_sample_(opts.track_sample) {
   }
   ~SignerPool() {
     stop();
@@ -240,25 +249,41 @@ class SignerPool {
   td::Result<PresignedMsg> build(td::uint64 index) {
     PresignedMsg msg;
     msg.wallet_index = index;
-    td::uint64 x = index ^ kRecipientSalt;
-    td::uint64 recipient = splitmix64_next(x) % manifest_.num_v5;
-    if (recipient == index) {
-      recipient = (recipient + 1) % manifest_.num_v5;
-    }
-    if (track_sample_ > 0) {
-      td::uint64 y = index ^ kSampleSalt;
-      msg.sampled = static_cast<double>(splitmix64_next(y) >> 11) * 0x1p-53 < track_sample_;
-    }
     TRY_RESULT(wallet, derive_wallet(manifest_.seed, index, manifest_.wallet_id, manifest_.minter_addr, contracts_));
     msg.w5_addr = wallet.w5_addr;
     msg.jw_addr = wallet.jw_addr;
-    TRY_RESULT(ext, build_signed_external(manifest_.seed, index, recipient, manifest_, contracts_));
+    // Deterministic per-wallet mix decision + compute parameters.
+    td::uint64 cstate = index ^ kComputeSalt;
+    bool is_compute = opts_.compute_share > 0 && manifest_.num_compute > 0 &&
+                      static_cast<double>(splitmix64_next(cstate) >> 11) * 0x1p-53 < opts_.compute_share;
+    Ref<vm::DataCell> ext;
+    if (is_compute) {
+      td::uint64 target = splitmix64_next(cstate) % manifest_.num_compute;
+      td::uint32 rounds = opts_.compute_rounds_min +
+                          static_cast<td::uint32>(splitmix64_next(cstate) %
+                                                  (opts_.compute_rounds_max - opts_.compute_rounds_min + 1));
+      TRY_RESULT_ASSIGN(ext, build_signed_compute_external(manifest_.seed, index, target, rounds,
+                                                           opts_.compute_msg_value, manifest_, contracts_));
+      msg.is_compute = true;
+    } else {
+      td::uint64 x = index ^ kRecipientSalt;
+      td::uint64 recipient = splitmix64_next(x) % manifest_.num_v5;
+      if (recipient == index) {
+        recipient = (recipient + 1) % manifest_.num_v5;
+      }
+      if (track_sample_ > 0) {
+        td::uint64 y = index ^ kSampleSalt;
+        msg.sampled = static_cast<double>(splitmix64_next(y) >> 11) * 0x1p-53 < track_sample_;
+      }
+      TRY_RESULT_ASSIGN(ext, build_signed_external(manifest_.seed, index, recipient, manifest_, contracts_));
+    }
     msg.msg_hash = ext->get_hash().bits();
     TRY_RESULT(boc, vm::std_boc_serialize(ext, 31));
     msg.query = envelope(ton::create_serialize_tl_object<ton::lite_api::liteServer_sendMessage>(std::move(boc)));
     return std::move(msg);
   }
 
+  const SpamOptions &opts_;
   const Manifest &manifest_;
   const ContractSet &contracts_;
 
@@ -505,8 +530,7 @@ class SpamRunner : public td::actor::Actor {
                       : std::min<td::uint64>(std::max<td::uint64>(td::uint64(opts_.rate * 2), 1000), target_total_);
     int threads =
         opts_.signer_threads ? opts_.signer_threads : td::clamp(static_cast<int>(opts_.rate / 2500) + 1, 1, 8);
-    signer_ = std::make_unique<SignerPool>(manifest_, contracts_, opts_.wallet_offset, target_total_, buffer,
-                                           opts_.track_sample);
+    signer_ = std::make_unique<SignerPool>(opts_, manifest_, contracts_, opts_.wallet_offset, target_total_, buffer);
     signer_->start(threads);
     LOG(INFO) << "bench-spam: target " << target_total_ << " messages at " << opts_.rate << "/s, " << threads
               << " signer threads, presign buffer " << buffer << ", " << opts_.connections << " send connection(s)";
@@ -599,6 +623,7 @@ class SpamRunner : public td::actor::Actor {
     sent_records_.push_back(SentRecord{msg.wallet_index, now, msg.msg_hash, msg.w5_addr});
     pending_by_hash_.emplace(msg.msg_hash, idx);
     pending_by_account_.emplace(msg.w5_addr, idx);
+    compute_sent_ += msg.is_compute;
     if (msg.sampled) {
       sample_batch_.push_back(BlockParser::Sample{msg.msg_hash, msg.w5_addr, msg.jw_addr, now});
     }
@@ -1064,6 +1089,7 @@ class SpamRunner : public td::actor::Actor {
     os.precision(3);
     os << "{\"mode\":\"" << (fallback_mode_ ? "listBlockTransactions" : "getBlock") << "\"";
     os << ",\"sent\":" << sent_ << ",\"send_ok\":" << send_ok_ << ",\"send_errors\":" << send_err_;
+    os << ",\"compute_sent\":" << compute_sent_ << ",\"compute_share\":" << opts_.compute_share;
     os << ",\"included\":" << inclusion_ms_.size() << ",\"unmatched\":" << pending_by_hash_.size();
     os << ",\"rate_target\":" << opts_.rate << ",\"duration_s\":" << send_span << ",\"warmup_s\":" << opts_.warmup
        << ",\"window_s\":" << window;
@@ -1126,6 +1152,11 @@ class SpamRunner : public td::actor::Actor {
     printf("  mode:               %s\n", fallback_mode_ ? "listBlockTransactions (fallback)" : "getBlock");
     printf("  sent:               %llu (ok %llu, errors %llu)\n", (unsigned long long)sent_,
            (unsigned long long)send_ok_, (unsigned long long)send_err_);
+    if (opts_.compute_share > 0) {
+      printf("  compute externals:  %llu of %llu sent (share %.3f, rounds %u..%u)\n",
+             (unsigned long long)compute_sent_, (unsigned long long)sent_, opts_.compute_share,
+             opts_.compute_rounds_min, opts_.compute_rounds_max);
+    }
     printf("  included:           %zu (unmatched %zu)\n", inclusion_ms_.size(), pending_by_hash_.size());
     printf("  blocks observed:    %zu (skipped %llu)\n", blocks_.size(), (unsigned long long)blocks_skipped_);
     printf("  window:             %.1fs (warmup %.1fs excluded)\n", window, opts_.warmup);
@@ -1160,7 +1191,7 @@ class SpamRunner : public td::actor::Actor {
   td::uint64 target_total_{0};
   double tokens_{0};
   double last_tick_{0};
-  td::uint64 sent_{0}, send_ok_{0}, send_err_{0};
+  td::uint64 sent_{0}, send_ok_{0}, send_err_{0}, compute_sent_{0};
   std::map<std::string, td::uint64> send_error_categories_;
   double first_send_time_{0}, last_send_time_{0};
   bool sending_done_{false};
@@ -1284,6 +1315,15 @@ td::Status do_selfcheck(const Manifest &manifest, const ContractSet &contracts) 
     return td::Status::Error("derive_wallet is not deterministic");
   }
 
+  // (5) compute-bound external (mixed corpus): TLB-valid and addressed to the wallet
+  if (manifest.num_compute > 0) {
+    TRY_RESULT(cext, build_signed_compute_external(manifest.seed, 0, manifest.num_compute - 1, 1000, 600'000'000,
+                                                   manifest, contracts));
+    if (!block::gen::t_Message_Any.validate_ref(1000000, cext)) {
+      return td::Status::Error("compute external message failed block::gen::Message validation");
+    }
+  }
+
   printf("selfcheck: ALL OK (msg_hash=%s)\n", ext->get_hash().to_hex().c_str());
   return td::Status::OK();
 }
@@ -1313,6 +1353,21 @@ int run_spam(const SpamOptions &opts) {
   if (manifest.num_v5 < 2) {
     LOG(ERROR) << "manifest num_v5 must be >= 2";
     return 2;
+  }
+  if (opts.compute_share > 0) {
+    if (manifest.num_compute == 0) {
+      LOG(ERROR) << "--compute-share > 0 requires a state with compute accounts (manifest num_compute)";
+      return 2;
+    }
+    if (td::Bits256{contracts.compute_code->get_hash().bits()} != manifest.compute_code_hash) {
+      LOG(ERROR) << "compute code hash in manifest does not match --contracts-dir";
+      return 2;
+    }
+    if (opts.compute_rounds_min == 0 || opts.compute_rounds_min > opts.compute_rounds_max ||
+        opts.compute_rounds_max > 0xffff) {
+      LOG(ERROR) << "compute rounds must satisfy 1 <= min <= max <= 65535";
+      return 2;
+    }
   }
   if (opts.liteserver_addr.empty() || opts.liteserver_pubkey_b64.empty()) {
     LOG(ERROR) << "--liteserver and --liteserver-pubkey-b64 are required";
@@ -1413,6 +1468,30 @@ int main(int argc, char *argv[]) {
   });
   p.add_option('\0', "force-fallback", "start in listBlockTransactions mode (for testing the fallback path)",
                [&] { opts.force_fallback = true; });
+  p.add_checked_option('\0', "compute-share",
+                       "fraction of externals sent as compute-bound calls instead of jetton transfers (default 0)",
+                       [&](td::Slice arg) {
+                         opts.compute_share = td::to_double(arg);
+                         return opts.compute_share >= 0 && opts.compute_share <= 1
+                                    ? td::Status::OK()
+                                    : td::Status::Error("--compute-share must be in [0,1]");
+                       });
+  p.add_checked_option('\0', "compute-rounds-min", "minimum compute rounds per call (default 800)",
+                       [&](td::Slice arg) {
+                         TRY_RESULT_ASSIGN(opts.compute_rounds_min, td::to_integer_safe<td::uint32>(arg));
+                         return td::Status::OK();
+                       });
+  p.add_checked_option('\0', "compute-rounds-max", "maximum compute rounds per call (default 7000)",
+                       [&](td::Slice arg) {
+                         TRY_RESULT_ASSIGN(opts.compute_rounds_max, td::to_integer_safe<td::uint32>(arg));
+                         return td::Status::OK();
+                       });
+  p.add_checked_option('\0', "compute-msg-value", "nanotons attached to each compute call (default 600000000)",
+                       [&](td::Slice arg) {
+                         TRY_RESULT(value, bench::dec_to_u128(arg));
+                         opts.compute_msg_value = value;
+                         return td::Status::OK();
+                       });
   p.add_checked_option('\0', "index", "wallet index (addr subcommand)", [&](td::Slice arg) {
     TRY_RESULT_ASSIGN(opts.index, td::to_integer_safe<td::uint64>(arg));
     return td::Status::OK();

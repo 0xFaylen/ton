@@ -84,6 +84,7 @@ td::Result<ContractSet> load_contracts(td::CSlice dir) {
   TRY_RESULT_ASSIGN(res.w5_code, load_boc_file(PSTRING() << dir << "/wallet-v5.code.boc"));
   TRY_RESULT_ASSIGN(res.jw_code, load_boc_file(PSTRING() << dir << "/jetton-wallet.code.boc"));
   TRY_RESULT_ASSIGN(res.minter_code, load_boc_file(PSTRING() << dir << "/jetton-minter.code.boc"));
+  TRY_RESULT_ASSIGN(res.compute_code, load_boc_file(PSTRING() << dir << "/compute-bound.code.boc"));
   return res;
 }
 
@@ -215,6 +216,16 @@ Ref<vm::DataCell> build_minter_data(Uint128 total_supply, Ref<vm::Cell> content,
   cb.store_ref(std::move(content));
   cb.store_ref(std::move(jw_code));
   return cb.finalize_novm();
+}
+
+Ref<vm::DataCell> build_compute_data(td::uint64 index) {
+  vm::CellBuilder cb;
+  cb.store_long(static_cast<long long>(index), 64);
+  return cb.finalize_novm();
+}
+
+td::Bits256 derive_compute_addr(td::uint64 index, const ContractSet &contracts) {
+  return td::Bits256{build_state_init(contracts.compute_code, build_compute_data(index))->get_hash().bits()};
 }
 
 Ref<vm::DataCell> build_state_init(Ref<vm::Cell> code, Ref<vm::Cell> data) {
@@ -525,14 +536,17 @@ std::string Manifest::to_json() const {
   obj("total_balance", u128_to_dec(total_balance));
   obj("num_v5", static_cast<td::int64>(num_v5));
   obj("num_ballast", static_cast<td::int64>(num_ballast));
+  obj("num_compute", static_cast<td::int64>(num_compute));
   obj("ballast_cells", ballast_cells);
   obj("wallet_id", static_cast<td::int64>(wallet_id));
   obj("w5_code_hash_hex", td::hex_encode(w5_code_hash.as_slice()));
   obj("jw_code_hash_hex", td::hex_encode(jw_code_hash.as_slice()));
+  obj("compute_code_hash_hex", td::hex_encode(compute_code_hash.as_slice()));
   obj("minter_addr_hex", td::hex_encode(minter_addr.as_slice()));
   obj("v5_balance", u128_to_dec(v5_balance));
   obj("jw_balance", u128_to_dec(jw_balance));
   obj("jw_jetton_balance", u128_to_dec(jw_jetton_balance));
+  obj("compute_balance", u128_to_dec(compute_balance));
   obj("celldb_path", celldb_path);
   obj.leave();
   return jb.string_builder().as_cslice().str();
@@ -575,6 +589,9 @@ td::Result<Manifest> Manifest::from_json(td::Slice json) {
   m.num_v5 = static_cast<td::uint64>(num_v5);
   TRY_RESULT(num_ballast, obj.get_required_long_field("num_ballast"));
   m.num_ballast = static_cast<td::uint64>(num_ballast);
+  // Optional (absent in pre-mixed-corpus manifests): compute-bound accounts.
+  TRY_RESULT(num_compute, obj.get_optional_long_field("num_compute"));
+  m.num_compute = static_cast<td::uint64>(num_compute);
   TRY_RESULT_ASSIGN(m.ballast_cells, obj.get_required_int_field("ballast_cells"));
   TRY_RESULT(wallet_id, obj.get_required_long_field("wallet_id"));
   m.wallet_id = static_cast<td::uint32>(wallet_id);
@@ -582,6 +599,10 @@ td::Result<Manifest> Manifest::from_json(td::Slice json) {
   TRY_RESULT_ASSIGN(m.w5_code_hash, bits256_from_hex(w5_code_hash_hex));
   TRY_RESULT(jw_code_hash_hex, obj.get_required_string_field("jw_code_hash_hex"));
   TRY_RESULT_ASSIGN(m.jw_code_hash, bits256_from_hex(jw_code_hash_hex));
+  TRY_RESULT(compute_code_hash_hex, obj.get_optional_string_field("compute_code_hash_hex"));
+  if (!compute_code_hash_hex.empty()) {
+    TRY_RESULT_ASSIGN(m.compute_code_hash, bits256_from_hex(compute_code_hash_hex));
+  }
   TRY_RESULT(minter_addr_hex, obj.get_required_string_field("minter_addr_hex"));
   TRY_RESULT_ASSIGN(m.minter_addr, bits256_from_hex(minter_addr_hex));
   TRY_RESULT(v5_balance, obj.get_required_string_field("v5_balance"));
@@ -590,6 +611,10 @@ td::Result<Manifest> Manifest::from_json(td::Slice json) {
   TRY_RESULT_ASSIGN(m.jw_balance, dec_to_u128(jw_balance));
   TRY_RESULT(jw_jetton_balance, obj.get_required_string_field("jw_jetton_balance"));
   TRY_RESULT_ASSIGN(m.jw_jetton_balance, dec_to_u128(jw_jetton_balance));
+  TRY_RESULT(compute_balance, obj.get_optional_string_field("compute_balance"));
+  if (!compute_balance.empty()) {
+    TRY_RESULT_ASSIGN(m.compute_balance, dec_to_u128(compute_balance));
+  }
   TRY_RESULT_ASSIGN(m.celldb_path, obj.get_required_string_field("celldb_path"));
   return m;
 }
@@ -611,32 +636,16 @@ td::Result<WalletInfo> derive_wallet(const td::Bits256 &seed, td::uint64 index, 
   return info;
 }
 
-td::Result<Ref<vm::DataCell>> build_signed_external(const td::Bits256 &seed, td::uint64 wallet_index,
-                                                    td::uint64 recipient_index, const Manifest &manifest,
-                                                    const ContractSet &contracts, const SpamParams &params) {
-  TRY_RESULT(sender, derive_wallet(seed, wallet_index, manifest.wallet_id, manifest.minter_addr, contracts));
-  TRY_RESULT(recipient, derive_wallet(seed, recipient_index, manifest.wallet_id, manifest.minter_addr, contracts));
-
-  // Jetton transfer body (op-codes.fc op::transfer)
-  vm::CellBuilder body;
-  body.store_long(0xf8a7ea5, 32);                             // op
-  body.store_long(static_cast<long long>(wallet_index), 64);  // query_id
-  store_grams(body, params.jetton_amount);                    // amount
-  store_addr_std(body, recipient.w5_addr);                    // destination (new owner)
-  store_addr_none(body);                                      // response_destination
-  body.store_long(0, 1);                                      // custom_payload:(Maybe ^Cell)
-  store_grams(body, 0);                                       // forward_ton_amount
-  body.store_long(0, 1);                                      // forward_payload:(Either Cell ^Cell) = inline empty
-
-  // MessageRelaxed: internal to the sender's jetton wallet
+// MessageRelaxed: internal from a w5 wallet to `dest` with an inline body.
+static Ref<vm::DataCell> build_internal_msg(const td::Bits256 &dest, Uint128 msg_value, const vm::CellBuilder &body) {
   vm::CellBuilder msg;
   msg.store_long(0, 1);  // int_msg_info$0
   msg.store_long(1, 1);  // ihr_disabled
   msg.store_long(1, 1);  // bounce
   msg.store_long(0, 1);  // bounced
   store_addr_none(msg);  // src
-  store_addr_std(msg, sender.jw_addr);
-  store_currency_collection(msg, params.msg_value);
+  store_addr_std(msg, dest);
+  store_currency_collection(msg, msg_value);
   store_grams(msg, 0);    // ihr_fee
   store_grams(msg, 0);    // fwd_fee
   msg.store_long(0, 64);  // created_lt
@@ -644,14 +653,19 @@ td::Result<Ref<vm::DataCell>> build_signed_external(const td::Bits256 &seed, td:
   msg.store_long(0, 1);   // init:(Maybe ...)
   msg.store_long(0, 1);   // body:(Either X ^X) = inline
   msg.append_builder(body);
-  auto msg_cell = msg.finalize_novm();
+  return msg.finalize_novm();
+}
 
+// Wraps one internal message into a signed wallet-v5 (seqno 0) external.
+static td::Result<Ref<vm::DataCell>> build_signed_w5_external(const td::Bits256 &seed, td::uint64 wallet_index,
+                                                              const Manifest &manifest, const td::Bits256 &w5_addr,
+                                                              Ref<vm::DataCell> msg_cell) {
   // c5 / OutList: out_list$_ prev:^(OutList 0) action:(action_send_msg mode)
   vm::CellBuilder c5;
   c5.store_ref(build_empty_cell());  // out_list_empty$_
   c5.store_long(0x0ec3c86d, 32);     // action_send_msg
   c5.store_long(3, 8);               // mode = +1 pay fees separately, +2 ignore errors
-  c5.store_ref(msg_cell);
+  c5.store_ref(std::move(msg_cell));
   auto c5_cell = c5.finalize_novm();
 
   // Signed wallet-v5 external body
@@ -674,12 +688,50 @@ td::Result<Ref<vm::DataCell>> build_signed_external(const td::Bits256 &seed, td:
   vm::CellBuilder ext;
   ext.store_long(0b10, 2);
   store_addr_none(ext);
-  store_addr_std(ext, sender.w5_addr);
+  store_addr_std(ext, w5_addr);
   store_grams(ext, 0);   // import_fee
   ext.store_long(0, 1);  // init:(Maybe ...)
   ext.store_long(0, 1);  // body:(Either X ^X) = inline
   ext.append_builder(inner);
   return ext.finalize_novm();
+}
+
+td::Result<Ref<vm::DataCell>> build_signed_external(const td::Bits256 &seed, td::uint64 wallet_index,
+                                                    td::uint64 recipient_index, const Manifest &manifest,
+                                                    const ContractSet &contracts, const SpamParams &params) {
+  TRY_RESULT(sender, derive_wallet(seed, wallet_index, manifest.wallet_id, manifest.minter_addr, contracts));
+  TRY_RESULT(recipient, derive_wallet(seed, recipient_index, manifest.wallet_id, manifest.minter_addr, contracts));
+
+  // Jetton transfer body (op-codes.fc op::transfer)
+  vm::CellBuilder body;
+  body.store_long(0xf8a7ea5, 32);                             // op
+  body.store_long(static_cast<long long>(wallet_index), 64);  // query_id
+  store_grams(body, params.jetton_amount);                    // amount
+  store_addr_std(body, recipient.w5_addr);                    // destination (new owner)
+  store_addr_none(body);                                      // response_destination
+  body.store_long(0, 1);                                      // custom_payload:(Maybe ^Cell)
+  store_grams(body, 0);                                       // forward_ton_amount
+  body.store_long(0, 1);                                      // forward_payload:(Either Cell ^Cell) = inline empty
+
+  auto msg_cell = build_internal_msg(sender.jw_addr, params.msg_value, body);
+  return build_signed_w5_external(seed, wallet_index, manifest, sender.w5_addr, std::move(msg_cell));
+}
+
+td::Result<Ref<vm::DataCell>> build_signed_compute_external(const td::Bits256 &seed, td::uint64 wallet_index,
+                                                            td::uint64 compute_index, td::uint32 rounds,
+                                                            Uint128 msg_value, const Manifest &manifest,
+                                                            const ContractSet &contracts) {
+  if (rounds > 0xffff) {
+    return td::Status::Error("compute rounds must fit in 16 bits");
+  }
+  TRY_RESULT(sender, derive_wallet(seed, wallet_index, manifest.wallet_id, manifest.minter_addr, contracts));
+  auto dest = derive_compute_addr(compute_index, contracts);
+
+  vm::CellBuilder body;
+  body.store_long(rounds, 16);  // compute-bound.fc: rounds:uint16 (non-empty body)
+
+  auto msg_cell = build_internal_msg(dest, msg_value, body);
+  return build_signed_w5_external(seed, wallet_index, manifest, sender.w5_addr, std::move(msg_cell));
 }
 
 }  // namespace bench

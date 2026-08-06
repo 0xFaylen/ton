@@ -9,6 +9,7 @@ Code cells used by `bench-state-gen` / `bench-spam` (see `benchmark/DESIGN.md`).
 | `wallet-v5.code.boc` | `20834b7b72b112147e1b2fb457b84e74d1a30f04f737d4f62a668e9552d2b72f` | 6 | 20 |
 | `jetton-wallet.code.boc` | `beb0683ebeb8927fe9fc8ec0a18bc7dd17899689825a121eab46c5a3a860d0ce` | 7 | 17 |
 | `jetton-minter.code.boc` | `13f5d7a316c6d76e1053e88ac59b5de65a072a388451371dc5c5becbba13f50e` | 4 | 11 |
+| `compute-bound.code.boc` | `c18087185a460dc6ac3de5b21b3a9c2bfa4a14967550dfadb423142cd4be09b9` | 1 | 2 |
 
 `contracts.json` holds the same hashes plus jetton op-codes
 (from `crypto/func/auto-tests/legacy_tests/jetton-wallet/imports/op-codes.fc`):
@@ -64,6 +65,13 @@ run as:
 ```sh
 build/crypto/fift -I crypto/fift/lib:crypto/smartcont save-jw.fif
 ```
+
+`compute-bound.code.boc`: compiled from
+`test/integration/contracts/compute-bound.fc` (16-bit `rounds` LCG loop,
+~127 gas/round) the same way. Its initial data cell in generated states is
+`instance:uint64` (bench::build_compute_data), which makes the account
+addresses distinct; the contract overwrites it with a 32-bit value on the
+first call.
 
 Sanity check (root hash / depth / distinct cell count) was done by loading
 each .boc with `pytoniq_core.Cell.one_from_boc` from the repo venv.

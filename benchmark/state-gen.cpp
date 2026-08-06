@@ -68,12 +68,14 @@ struct Config {
   td::Bits256 seed = td::sha256_bits256("tonbench-default-seed");
   td::uint64 num_v5 = 1000000;
   td::uint64 num_ballast = 0;
+  td::uint64 num_compute = 0;
   int ballast_cells = 17;
   td::uint32 wallet_id = 0;
   td::uint32 gen_utime = 0;                   // 0 → now()
-  Uint128 v5_balance = 100'000'000'000ULL;    // 100 TON
-  Uint128 jw_balance = 1'000'000'000ULL;      // 1 TON
-  Uint128 minter_balance = 1'000'000'000ULL;  // 1 TON
+  Uint128 v5_balance = 100'000'000'000ULL;     // 100 TON
+  Uint128 jw_balance = 1'000'000'000ULL;       // 1 TON
+  Uint128 minter_balance = 1'000'000'000ULL;   // 1 TON
+  Uint128 compute_balance = 1'000'000'000ULL;  // 1 TON
   Uint128 jw_jetton_balance = 1'000'000'000'000'000ULL;
   std::string contracts_dir = "benchmark/contracts";
   std::string out_dir;
@@ -253,7 +255,7 @@ class RunFileSink : public CellSink {
 // Phase 1: parallel derivation into 256 bucket files
 // ---------------------------------------------------------------------------
 
-enum class AccountType : td::uint8 { W5 = 0, JW = 1, Ballast = 2, Minter = 3 };
+enum class AccountType : td::uint8 { W5 = 0, JW = 1, Ballast = 2, Minter = 3, Compute = 4 };
 
 #pragma pack(push, 1)
 struct DeriveRecord {
@@ -343,10 +345,11 @@ struct GenContext {
   ContractSet contracts;
   td::Bits256 minter_addr{};
   // shared stand-ins (cells emitted once globally)
-  Ref<vm::Cell> w5_code_standin, jw_code_standin, minter_code_standin, ballast_code_standin, empty_cell_standin;
+  Ref<vm::Cell> w5_code_standin, jw_code_standin, minter_code_standin, ballast_code_standin, compute_code_standin,
+      empty_cell_standin;
   Ref<vm::DataCell> ballast_code, empty_cell;
   // storage_used per account shape
-  StorageUsedStat w5_used, jw_used, ballast_used, minter_used;
+  StorageUsedStat w5_used, jw_used, ballast_used, minter_used, compute_used;
 };
 
 td::Result<GenContext> make_gen_context(const Config &cfg) {
@@ -359,6 +362,7 @@ td::Result<GenContext> make_gen_context(const Config &cfg) {
   ctx.jw_code_standin = make_standin(ctx.contracts.jw_code);
   ctx.minter_code_standin = make_standin(ctx.contracts.minter_code);
   ctx.ballast_code_standin = make_standin(ctx.ballast_code);
+  ctx.compute_code_standin = make_standin(ctx.contracts.compute_code);
   ctx.empty_cell_standin = make_standin(ctx.empty_cell);
 
   auto minter_data = build_minter_data(cfg.total_supply(), ctx.empty_cell, ctx.contracts.minter_code);
@@ -377,6 +381,8 @@ td::Result<GenContext> make_gen_context(const Config &cfg) {
   ctx.ballast_used = compute_account_storage_used(cfg.jw_balance, ballast_roots);
   std::vector<Ref<vm::Cell>> minter_roots{ctx.contracts.minter_code, minter_data};
   ctx.minter_used = compute_account_storage_used(cfg.minter_balance, minter_roots);
+  std::vector<Ref<vm::Cell>> compute_roots{ctx.contracts.compute_code, build_compute_data(0)};
+  ctx.compute_used = compute_account_storage_used(cfg.compute_balance, compute_roots);
   return std::move(ctx);
 }
 
@@ -386,6 +392,7 @@ void derive_phase(const GenContext &ctx, BucketWriter &writer, Progress &progres
   constexpr td::uint64 kChunk = 4096;
   std::atomic<td::uint64> next_v5{0};
   std::atomic<td::uint64> next_ballast{0};
+  std::atomic<td::uint64> next_compute{0};
   auto worker = [&] {
     BucketBuffer buf(writer);
     while (true) {
@@ -422,6 +429,22 @@ void derive_phase(const GenContext &ctx, BucketWriter &writer, Progress &progres
         auto addr = tagged_sha256(cfg.seed, "bl", i);
         td::MutableSlice(rec.addr, 32).copy_from(addr.as_slice());
         rec.type = static_cast<td::uint8>(AccountType::Ballast);
+        rec.index = i;
+        buf.add(rec);
+        progress.accounts.fetch_add(1, std::memory_order_relaxed);
+      }
+    }
+    while (true) {
+      auto begin = next_compute.fetch_add(kChunk);
+      if (begin >= cfg.num_compute) {
+        break;
+      }
+      auto end = std::min(begin + kChunk, cfg.num_compute);
+      for (td::uint64 i = begin; i < end; i++) {
+        DeriveRecord rec{};
+        auto addr = derive_compute_addr(i, ctx.contracts);
+        td::MutableSlice(rec.addr, 32).copy_from(addr.as_slice());
+        rec.type = static_cast<td::uint8>(AccountType::Compute);
         rec.index = i;
         buf.add(rec);
         progress.accounts.fetch_add(1, std::memory_order_relaxed);
@@ -496,6 +519,12 @@ std::pair<Ref<vm::Cell>, Uint128> build_account_cells(const GenContext &ctx, con
       code = ctx.minter_code_standin;
       balance = cfg.minter_balance;
       used = &ctx.minter_used;
+      break;
+    case AccountType::Compute:
+      data = emit_retain_standin(build_compute_data(rec.index));
+      code = ctx.compute_code_standin;
+      balance = cfg.compute_balance;
+      used = &ctx.compute_used;
       break;
     default:
       LOG(FATAL) << "bad account type " << rec.type;
@@ -845,6 +874,9 @@ td::Result<GenResult> run_pipeline(Config cfg, bool write_db) {
     if (cfg.num_ballast > 0) {
       main_sink->emit(ctx.ballast_code);
     }
+    if (cfg.num_compute > 0) {
+      emit_subtree(*main_sink, ctx.contracts.compute_code);
+    }
     ShardAccountsStreamBuilder top_builder(*main_sink);
     for (int b = 0; b < 256; b++) {
       if (pendings[b].type != DictNode::Type::Empty) {
@@ -874,14 +906,17 @@ td::Result<GenResult> run_pipeline(Config cfg, bool write_db) {
   res.manifest.total_balance = res.total_balance;
   res.manifest.num_v5 = cfg.num_v5;
   res.manifest.num_ballast = cfg.num_ballast;
+  res.manifest.num_compute = cfg.num_compute;
   res.manifest.ballast_cells = cfg.ballast_cells;
   res.manifest.wallet_id = cfg.wallet_id;
   res.manifest.w5_code_hash = td::Bits256{ctx.contracts.w5_code->get_hash().bits()};
   res.manifest.jw_code_hash = td::Bits256{ctx.contracts.jw_code->get_hash().bits()};
+  res.manifest.compute_code_hash = td::Bits256{ctx.contracts.compute_code->get_hash().bits()};
   res.manifest.minter_addr = ctx.minter_addr;
   res.manifest.v5_balance = cfg.v5_balance;
   res.manifest.jw_balance = cfg.jw_balance;
   res.manifest.jw_jetton_balance = cfg.jw_jetton_balance;
+  res.manifest.compute_balance = cfg.compute_balance;
   res.manifest.celldb_path = celldb_path;
 
   if (!write_db) {
@@ -965,7 +1000,7 @@ std::vector<TestAccount> make_test_accounts(const GenContext &ctx, size_t count)
     acc.addr = tagged_sha256(cfg.seed, "ta", i);
     Ref<vm::Cell> code, data;
     const StorageUsedStat *used = nullptr;
-    switch (i % 4) {
+    switch (i % 5) {
       case 0:
         code = ctx.contracts.w5_code;
         data = build_w5_data(tagged_sha256(cfg.seed, "tk", i), cfg.wallet_id);
@@ -985,11 +1020,17 @@ std::vector<TestAccount> make_test_accounts(const GenContext &ctx, size_t count)
         acc.balance = cfg.jw_balance;
         used = &ctx.ballast_used;
         break;
-      default:
+      case 3:
         code = ctx.contracts.minter_code;
         data = build_minter_data(cfg.total_supply(), ctx.empty_cell, ctx.contracts.jw_code);
         acc.balance = cfg.minter_balance;
         used = &ctx.minter_used;
+        break;
+      default:
+        code = ctx.contracts.compute_code;
+        data = build_compute_data(i);
+        acc.balance = cfg.compute_balance;
+        used = &ctx.compute_used;
         break;
     }
     acc.account = build_account(acc.addr, acc.balance, std::move(code), std::move(data), *used, cfg.gen_utime);
@@ -1164,6 +1205,7 @@ td::Bits256 self_test_celldb(const Config &base_cfg) {
   Config cfg = base_cfg;
   cfg.num_v5 = 2000;
   cfg.num_ballast = 100;
+  cfg.num_compute = 50;
   cfg.out_dir = PSTRING() << "/tmp/bench-state-gen-selftest." << getpid();
   cfg.tmp_dir = cfg.out_dir + "/tmp";
   cfg.overwrite = true;
@@ -1278,6 +1320,11 @@ td::Bits256 self_test_celldb(const Config &base_cfg) {
   CHECK(manifest.file_hash == res.file_hash);
   CHECK(manifest.total_balance == res.total_balance);
   CHECK(manifest.num_v5 == cfg.num_v5 && manifest.num_ballast == cfg.num_ballast);
+  CHECK(manifest.num_compute == cfg.num_compute);
+  {
+    auto contracts = load_contracts(cfg.contracts_dir).move_as_ok();
+    CHECK(manifest.compute_code_hash == td::Bits256{contracts.compute_code->get_hash().bits()});
+  }
   CHECK(manifest.seed == cfg.seed);
 
   LOG(INFO) << "self-test (c) celldb round-trip: OK (" << visited << " cells, root " << res.root_hash.to_hex() << ")";
@@ -1383,6 +1430,11 @@ int main(int argc, char *argv[]) {
     TRY_RESULT_ASSIGN(cfg.num_ballast, td::to_integer_safe<td::uint64>(arg));
     return td::Status::OK();
   });
+  p.add_checked_option('\0', "compute-count", "number of compute-bound contract accounts (mixed corpus)",
+                       [&](td::Slice arg) {
+                         TRY_RESULT_ASSIGN(cfg.num_compute, td::to_integer_safe<td::uint64>(arg));
+                         return td::Status::OK();
+                       });
   p.add_checked_option('\0', "ballast-cells", "data cells per ballast account", [&](td::Slice arg) {
     TRY_RESULT_ASSIGN(cfg.ballast_cells, td::to_integer_safe<int>(arg));
     if (cfg.ballast_cells < 1) {
