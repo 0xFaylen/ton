@@ -155,6 +155,11 @@ class Collator final : public td::actor::Actor {
   std::map<ShardIdFull, td::int32> neighbor_msg_queues_limits_;
   std::vector<block::McShardDescr> neighbors_;
   std::unique_ptr<block::OutputQueueMerger> nb_out_msgs_;
+  // Replay-only shadow of nb_out_msgs_ over the same queue roots. The parallel
+  // lookahead/prepare reads it under state_usage_tree_ ignore_loads, so queue
+  // cells enter the collated proof only when the commit loop (or the serial
+  // path) materializes them through nb_out_msgs_, exactly like a serial pass.
+  std::unique_ptr<block::OutputQueueMerger> replay_shadow_out_msgs_;
   std::unique_ptr<parallel_inbound::ReusableWorkerPool> replay_parallel_worker_pool_;
   std::map<ton::StdSmcAddress, std::unique_ptr<ParallelAccountContinuation>> replay_parallel_account_continuations_;
   std::vector<ton::StdSmcAddress> special_smcs;

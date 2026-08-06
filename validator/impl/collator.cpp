@@ -4676,15 +4676,13 @@ td::Result<std::size_t> Collator::process_parallel_inbound_batch() {
     return std::size_t{0};
   }
 
-  // The lookahead materializes up to kParallelLookahead queue entries through
-  // the state usage tree before the serial pass would load them. Away from the
-  // block limits that is invisible: every touched entry is either committed in
-  // this batch or processed serially right after it, so both passes count the
-  // same cells by the next batch boundary. If the inbound phase ends while
-  // touched entries remain unprocessed, their cells stay in the collated-data
-  // proof and the candidate is no longer byte-identical to the serial pass.
-  // Keep the limit-adjacent region on the serial path so a started batch
-  // always commits fully and leaves no touched-but-unprocessed tail.
+  // Queue reads for the lookahead/prepare below go through a shadow merger
+  // under ignore_loads on the state usage tree and all neighbor proof-builder
+  // trees, so they leave no trace in any collated proof or size estimate.
+  // Cells enter the proofs only when the commit loop or the serial path
+  // materializes them through nb_out_msgs_. This guard is therefore not a
+  // correctness boundary; it only avoids preparing and executing work that a
+  // nearby block limit would force the commit loop to discard.
   {
     // 64 entries at ~2.5 KiB block bytes / ~2 KiB proof cells is ~160 KiB
     // worst case; 256 KiB leaves headroom without giving up much of the
@@ -4709,13 +4707,68 @@ td::Result<std::size_t> Collator::process_parallel_inbound_batch() {
   auto& parallel_stats = stats_.replay_parallel_accounts;
   ++parallel_stats.attempts;
   td::ScopedRealCpuTimer prepare_timer{parallel_stats.prepare_time};
-  const auto checkpoint = nb_out_msgs_->checkpoint();
+
+  // All shadow reads below run under ignore_loads on every proof-recording
+  // tree the queue roots can reach: the state usage tree for the own/trivial
+  // neighbor and each neighbor proof-builder tree for remote neighbors (their
+  // on_cell_loaded callbacks also feed the collated-data size estimate, which
+  // must not move for entries a block limit later discards). Anchors derived
+  // from shadow cells are still real tree nodes: ignore_loads suppresses only
+  // the load marks and callbacks, not node creation or LoadedCell tree-node
+  // propagation, so a later load of the same node with recording on still
+  // records exactly like the serial pass.
+  struct IgnoreLoadsGuard {
+    Collator* collator{nullptr};
+    bool held{false};
+    explicit IgnoreLoadsGuard(Collator* collator_ptr) : collator(collator_ptr) {
+      toggle(true);
+      held = true;
+    }
+    void toggle(bool value) {
+      if (collator->state_usage_tree_) {
+        collator->state_usage_tree_->set_ignore_loads(value);
+      }
+      for (auto& neighbor_builder : collator->neighbor_proof_builders_) {
+        neighbor_builder.second.set_ignore_loads(value);
+      }
+    }
+    void release() {
+      if (held) {
+        toggle(false);
+        held = false;
+      }
+    }
+    ~IgnoreLoadsGuard() {
+      release();
+    }
+  };
+  IgnoreLoadsGuard ignore_loads_guard{this};
+
+  if (!replay_shadow_out_msgs_) {
+    std::vector<block::OutputQueueMerger::Neighbor> neighbor_queues;
+    for (const auto& descr : neighbors_) {
+      auto it = neighbor_msg_queues_limits_.find(descr.shard());
+      td::int32 msg_limit = it == neighbor_msg_queues_limits_.end() ? -1 : it->second;
+      neighbor_queues.emplace_back(descr.top_block_id(), descr.outmsg_root, descr.disabled_, msg_limit);
+    }
+    replay_shadow_out_msgs_ = std::make_unique<block::OutputQueueMerger>(shard_, std::move(neighbor_queues));
+  }
+  while (replay_shadow_out_msgs_->checkpoint() < nb_out_msgs_->checkpoint()) {
+    if (!replay_shadow_out_msgs_->next()) {
+      return td::Status::Error("shadow inbound queue is shorter than the primary inbound queue");
+    }
+  }
+  if (replay_shadow_out_msgs_->checkpoint() != nb_out_msgs_->checkpoint() || replay_shadow_out_msgs_->is_eof()) {
+    return td::Status::Error("shadow inbound queue diverged from the primary inbound queue");
+  }
+
+  const auto checkpoint = replay_shadow_out_msgs_->checkpoint();
   std::vector<std::unique_ptr<ParallelInboundPrepared>> batch;
   std::set<ton::StdSmcAddress> batch_accounts;
   batch.reserve(kParallelLookahead);
 
-  while (batch.size() < kParallelLookahead && !nb_out_msgs_->is_eof()) {
-    auto* item = nb_out_msgs_->cur();
+  while (batch.size() < kParallelLookahead && !replay_shadow_out_msgs_->is_eof()) {
+    auto* item = replay_shadow_out_msgs_->cur();
     if (!item || item->msg.is_null() || item->limit_exceeded) {
       break;
     }
@@ -4773,13 +4826,13 @@ td::Result<std::size_t> Collator::process_parallel_inbound_batch() {
     prepared->source = item->source;
     prepared->message_hash = env.msg->get_hash().as_bits256();
     batch.push_back(std::move(prepared));
-    if (batch.size() == kParallelLookahead || !nb_out_msgs_->next()) {
+    if (batch.size() == kParallelLookahead || !replay_shadow_out_msgs_->next()) {
       break;
     }
   }
 
-  if (!nb_out_msgs_->rewind(checkpoint)) {
-    return td::Status::Error("cannot restore inbound queue after parallel lookahead");
+  if (!replay_shadow_out_msgs_->rewind(checkpoint)) {
+    return td::Status::Error("cannot restore shadow inbound queue after parallel lookahead");
   }
   if (batch.size() < 2) {
     ++parallel_stats.serial_fallbacks;
@@ -4816,7 +4869,7 @@ td::Result<std::size_t> Collator::process_parallel_inbound_batch() {
     }
     prepared->account->block_lt = start_lt;
 
-    auto* queue_item = nb_out_msgs_->cur();
+    auto* queue_item = replay_shadow_out_msgs_->cur();
     if (!queue_item || queue_item->lt != prepared->message_lt || queue_item->source != prepared->source) {
       return td::Status::Error("parallel inbound queue changed during preparation");
     }
@@ -4904,13 +4957,17 @@ td::Result<std::size_t> Collator::process_parallel_inbound_batch() {
     if (stats_.work_time.tvm_hotpath.is_exact()) {
       prepared->stats.work_time.tvm_hotpath.enable_exact();
     }
-    if (!nb_out_msgs_->next() && prepared.get() != batch.back().get()) {
+    if (!replay_shadow_out_msgs_->next() && prepared.get() != batch.back().get()) {
       return td::Status::Error("parallel inbound queue ended during preparation");
     }
   }
-  if (!nb_out_msgs_->rewind(checkpoint)) {
-    return td::Status::Error("cannot restore inbound queue after parallel preparation");
+  if (!replay_shadow_out_msgs_->rewind(checkpoint)) {
+    return td::Status::Error("cannot restore shadow inbound queue after parallel preparation");
   }
+  // Worker execution and the serial commit below must record normally: the
+  // commit loop's nb_out_msgs_ reads are the collated-proof touches that keep
+  // the parallel pass byte-identical to a serial pass.
+  ignore_loads_guard.release();
 
   if (!replay_parallel_worker_pool_) {
     prepare_timer.pause();
@@ -4978,6 +5035,7 @@ td::Result<std::size_t> Collator::process_parallel_inbound_batch() {
       }
       auto* current = nb_out_msgs_->cur();
       if (!current || current->lt != prepared->message_lt || current->source != prepared->source ||
+          current->limit_exceeded ||
           td::bitstring::bits_memcmp(current->key.cbits() + 96, prepared->message_hash.cbits(), 256)) {
         return td::Status::Error("parallel inbound canonical order changed before commit");
       }
