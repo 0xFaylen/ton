@@ -1553,6 +1553,59 @@ tail approaching zero.
   queue message with zero speculation - its state is already final. Monad
   needs speculation for this; Solana has no queue-as-state at all.
 
+### CORRECTION 2026-08-15: the byte soft limit is not the throughput ceiling
+
+The roadmap line below - that a Config 23 soft-limit change from 1 MiB to
+2 MiB "would double the ceiling again" - is **refuted by measurement**. Two
+saturated runs at 600 ext/s on the 100k state, mainnet parity otherwise,
+`block_limit_mul` 1 versus 2 (bytes+lt soft/hard scaled), verbosity 3 in
+both arms:
+
+| | mul=1 (soft 1 MiB) | mul=2 (soft 2 MiB) |
+|---|---|---|
+| collation `total_s` median / p90 | 0.249 / 0.412 | 0.255 / 0.419 |
+| block size estimate p90 | 1,482,112 | 1,493,321 |
+| size estimate median | 1,017,355 | 842,334 |
+| blocks over the 1 MiB soft estimate | 61 of 130 | 39 of 122 |
+| overload reasons | 34 timing, 52+10 byte-class | **86 timing, 0 byte-class** |
+
+The two arms build the **same size of block in the same time**: p90 estimate
+1.48 versus 1.49 MB, p90 collation wall 0.41 versus 0.42 s against the 400 ms
+slot. Raising the byte limit changed neither, because the byte limit was
+never what stopped collation - the slot was. At mul=1 the collator already
+exceeded the 1 MiB soft estimate on 61 of 130 blocks: the soft limit sets the
+overload class and the `fits(cl_normal)` stop rule, it does not cap block
+content. Removing it only deletes the byte-class overload signal (52+10 -> 0)
+while the timing signal doubles (34 -> 86), i.e. it hides the split symptom
+without adding throughput.
+
+The two claims that were conflated, now separated:
+
+- **The byte soft limit IS the split trigger** under jetton load (the
+  2026-08-05 rate ladder: byte-class bits 0/0/1/59/70/46). That stands.
+- **The byte soft limit is NOT the throughput ceiling.** Collation wall time
+  against the 400 ms slot is. That is what these two runs establish.
+
+Independent agreement: mainnet telemetry over 72,683 collated blocks
+(07-15 Aug) shows max observed bytes 534,762 = 51% of the soft limit and max
+gas 83% of soft - the configured limits are not reached on mainnet either,
+while `soft_timeout = slot_start + target_rate_` (`block-producer.cpp` L125)
+binds. Two different methods, same conclusion.
+
+Caveats: one run per arm, laptop-class stand, verbosity 3 costs goodput
+equally in both arms. The included-TPS difference between the arms
+(797 versus 620) is NOT attributed to the limit change - the timers say both
+arms did the same work at the same speed, and this stand's over-saturation
+regime is known to be unstable run to run. The structural result - identical
+p90 size and wall time, byte-class overloads vanishing - is what these runs
+support.
+
+Consequence for the roadmap: raising limits buys nothing until collation
+wall time falls. Pipelined finalization (W7 phases A-C) is the prerequisite
+for any limit increase, not an alternative to it. The order is fixed: make
+collation faster first, then raise limits to convert the freed time into
+payload.
+
 Honest ceiling math: the single-shard protocol ceiling is the byte envelope,
 ~2.5 MiB/s payload = ~2,300 raw tx/s = ~1,000+ jetton operations/s at a held
 400ms cadence. The current split threshold sits at 650-975 raw tx/s and is
