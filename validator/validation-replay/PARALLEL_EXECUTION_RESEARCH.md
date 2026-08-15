@@ -1601,6 +1601,145 @@ and 29 GB free disk, so no such window exists. The third-party anchor
 tontester limits (512 KB / 100M gas), not ConfigParam 23, and does not
 transfer.
 
+### Own per-shard TPS model, and what binds it
+
+TON Core published no number, so here is ours, from the same estimator used
+on the mainnet telemetry (bucket medians, not an OLS slope):
+`TPS = (slot - fixed_cost) / marginal_cost x blocks_per_second`.
+
+| input | mainnet today | this stand (state fully RAM-resident) |
+|---|---|---|
+| fixed cost per block | 358.7 ms cold / 1.3 ms warm | **2.8 ms** |
+| marginal cost | 1.93 ms/tx | **0.718 ms/tx** |
+
+Fit from 125 joined blocks spanning 0-688 transactions at 600 ext/s. At a
+400 ms slot and 2.43 blocks/s:
+
+| regime | tx/block | raw tx/s per shard |
+|---|---|---|
+| cold block (post-split/merge today) | 21 | **~52** |
+| warm block (quiet mainnet today) | 207 | **~502** |
+| this stand (in-memory-equivalent) | 553 | **~1,344** (~448 jetton TPS) |
+
+**Independent corroboration.** `benchmark/RESULTS.md` (DanShaders, unmerged
+`bench-jetton-tps` branch, i9-13900H / 125 GiB RAM / 208 GB celldb) reports
+**476 jetton TPS with the state RAM-resident**. Our 1,344 raw tx/s is ~448
+jetton TPS at the measured 3.0 raw-tx-per-transfer ratio - within 6% of his
+number, on different hardware, a different state and a different method.
+Two independent measurements of the same quantity agree.
+
+**CORRECTION to the byte-ceiling refutation above.** That section concluded
+"raising limits buys nothing until collation wall time falls". That is true
+**only for a collation-bound setup**, which is what this laptop stand is. The
+binder is whichever arrives first:
+
+- **Disk-bound / slow collation -> collation-bound.** The slot ends before
+  the byte limit is reached, so raising the limit changes nothing. This
+  stand measured exactly that (identical p90 size and wall time at 1 MiB vs
+  2 MiB soft), and DanShaders reports the same from the other side: "x10
+  limits change nothing on the disk-bound state".
+- **RAM-resident / fast collation -> byte-bound.** His RAM-resident run is
+  explicitly "byte-bound on a 1 MB soft limit" at 476 jTPS. Collation there
+  is fast enough to fill the block before the slot ends.
+
+So TON Core's announced order is not just defensible, it is the only order
+that works: in-memory moves the binder from collation speed to bytes, and
+only then does raising the byte limit convert into TPS. At 476 jTPS
+byte-bound on 1 MiB, a 2 MiB limit implies roughly 950 jTPS if collation
+keeps up - which is where their own pre-collator testnet figure of
+"1,000 transactions per second in a single shardchain" (@toncore #99) comes
+from. The whole published story is internally consistent.
+
+Consequence for W7 unchanged in direction, sharpened in framing: after
+in-memory the binder is bytes, and the value of faster collation is that it
+keeps collation from becoming the binder again as limits rise. The
+1.24-1.51x figure measured here is what *this* stand needs to fill 2 MiB in
+slot; a RAM-resident collator needs less.
+
+### What the update actually ships (audit, 2026-08-15 13:22 UTC)
+
+- **Role separation: shipped.** #2523 merged into `testnet` 2026-08-07;
+  `CollationManager` is fully removed from `testnet` and replaced by
+  delegation of the **whole leader window** (`block-producer.cpp:121`
+  `prepare_delegation`, `pleaseCollatePrepare` fan-out, scoreboard pick with
+  exponential ban 60s-3600s, signed `delegationToSign`). Delegation is for
+  **shardchains only** - collators are excluded from masterchain groups.
+- **Every validator still validates every candidate**, including the
+  delegating leader (`block-validator.cpp:81-105`, no self-produced skip).
+  Only candidate *generation* relocates; validation, signing, broadcast and
+  state application stay on the validator.
+- **in-memory celldb: NOT shipped and NOT automated.** `--celldb-in-memory`
+  predates this work, defaults to false, and has **zero linkage to any
+  collator path**. mytonctrl has no in-memory setting at all, and its
+  collator PR #589 *removes* shard scoping so the collator syncs the whole
+  basechain. Both collator docs pages are accelerator-era with no hardware,
+  RAM or celldb guidance. The announcement's "particularly in in-memory
+  mode" therefore describes an operator option nobody has documented, not
+  something the release delivers.
+- **ConfigParam 46 (validator registry) is required for collators to work at
+  all**: without it `get_all_collators()` is empty and delegation never
+  happens. The 08-18 vote contents are unpublished; setting param 46 is the
+  well-supported inference. Whether it also touches ConfigParam 23 is
+  unknown.
+- **Block-limit override (`5f1934f5`) is still unmerged** and has no PR
+  pointing at it; whether it ships on 08-17 is unknown. Precise reading of
+  its ceiling: `ValidateQuery` re-derives limits from ConfigParam 22/23 and
+  enforces `gas.hard` and `lt_delta.hard`, so those axes cannot be raised
+  locally - but there is **no validator-side byte check**, so the byte axis
+  can be raised locally up to the ConfigParam 29 candidate cap. On a
+  collation-bound node that buys nothing (measured above); on a fast
+  collator it is exactly the step-3 lever.
+- **Separately: `max_split` was cut 16 -> 4 "temporarily" on 2026-07-15**
+  with an announced intent to raise it. Restoring shard count raises total
+  network TPS, not single-shard TPS - keep the two apart.
+
+### Verdict per announcement point (2026-08-15)
+
+**1. "This separation increases network throughput."** Shipped and
+code-verified: #2523 merged to `testnet` 2026-08-07, `CollationManager`
+removed, whole leader windows delegated with a scoreboard. Bounded by two
+facts: only candidate *generation* relocates - every validator, including
+the delegating leader, still validates every candidate - and delegation is
+shardchain-only. Our stand's decomposition: collation is **269 ms of a
+571 ms block cycle (47%)**, so perfect overlap of the remainder would give
+at most ~1.9x cadence. That is an upper bound, not a prediction.
+
+**2. "Enabling collators, particularly in in-memory mode, will increase the
+maximum TPS of a single shardchain."** The in-memory part **is not shipped**:
+old flag, default false, zero linkage to collator code, no mytonctrl
+setting, no docs, no hardware guidance. If an operator does enable it, the
+gain is arithmetic from mainnet-measured inputs: a cold block costs 358.7 ms
+fixed versus 1.3 ms warm, so at 1.93 ms/tx and a 400 ms slot the shard moves
+from ~21 tx/block (~52 tx/s) to ~207 tx/block (~502 tx/s) - about **10x, and
+only on shards currently running cold**. On an already-warm shard this point
+delivers nothing measurable. It is restoration of pre-churn capacity, not a
+new ceiling.
+
+**3. "Increasing the limits will lead to a proportional increase in TPS."**
+Not in this release; the 08-18 vote contents are unpublished and the
+block-limit override commit is unmerged. **Unresolved on our stand**: at
+1200 ext/s the same comparison gave -40% at verbosity 3 and +55% at
+verbosity 1, and the two mul=1 controls themselves differ by 1137 vs 808
+tx/s under identical settings. Run-to-run variance on this stand is
+comparable to the effect, so neither sign is established; repeated paired
+runs are in flight. What the mechanism does say: the byte soft limit doubles
+as a deadline guard, so a limit rise converts to TPS only where collation
+reliably fills the larger block inside the slot - which is exactly why
+TON Core's ordering (in-memory first, limits second) is the only workable
+one.
+
+### Is any of this guaranteed? No - and here is the list
+
+Nothing about a percentage is guaranteed. Specifically unestablished:
+TON Core published **no number of any kind** for collator TPS; in-memory is
+an undocumented operator choice, not a shipped default; the 08-18 vote
+contents are unpublished; the five `collators`-branch commits have no PR and
+may not ship on 08-17; validators keep full validation duty; and the size of
+the effect scales with how often blocks currently run cold, which is a
+function of split churn rather than of this release. The only figure resting
+entirely on mainnet-measured inputs is the ~10x cold-to-warm restoration,
+and it is conditional on in-memory actually being enabled.
+
 ### Pre-activation baseline is time-critical
 
 Activation is 08-20. Any before/after measurement requires the baseline
