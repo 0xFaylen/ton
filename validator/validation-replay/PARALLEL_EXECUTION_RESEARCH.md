@@ -1517,6 +1517,102 @@ re-admission) stays queued behind this: it improves goodput under
 over-saturation but does not move collation wall time, which is what both
 the split threshold and the executor ceiling are bound by.
 
+## TON 2026.08 collators: what is claimed, what is code - 2026-08-15
+
+Upstream refs fetched today: `master` = `bb935a83` (v2026.07, 2026-08-03,
+unmoved), `testnet` = `f7a473a0` (today 11:27, #2538 merged), plus a separate
+`collators` branch = `bb9ef7a3` (2026-08-14, SpyCheese) with 5 commits not yet
+in testnet. No `v2026.08` release tag exists yet.
+
+### The claim, verbatim and complete
+
+@toncore #118 (2026-08-12, the channel's latest post) makes exactly three
+throughput statements, all qualitative, two of them future tense:
+
+1. "This separation increases network throughput." (role separation)
+2. "Enabling collators, particularly in in-memory mode, will increase the
+   maximum TPS of a single shardchain."
+3. "As the next step, we plan to increase the maximum block size and other
+   network limits ... Increasing the limits will also lead to a proportional
+   increase in the TPS of a single shardchain."
+
+**Post #118 contains no numbers at all.** TON Core has never published a
+numeric TPS effect for collators. The multipliers it has published - 10x
+operations (consensus), 6x fees, 2-4x network traffic (@toncore #115) - are
+latency/fee/traffic figures and must not be reported as TPS. The only TPS
+pair it has ever published is @toncore #99 (2026-03-06, five months before
+this announcement): **1,000 TPS in a single shardchain in testnet load
+testing** against "~500" as the historical mainnet peak during the
+Notcoin/DOGS/Hamster period. That is a pre-collator Sub-Second test figure.
+
+Schedule (tonstatus #235): software 08-17 14:00 UTC, config vote 08-18
+12:30, mytonctrl update and collator activation 08-20 12:00. All three are in
+the future, so no mainnet collator measurement can exist yet.
+
+### Code check: nothing makes collation cheaper
+
+`master..testnet` is 20,197 insertions across 132 files, but `collator.cpp`
+receives **39 lines from a single commit, "metrics: expand blockchain
+observability"** - `ScopedRealCpuTimer` around dispatch_queue,
+import_internals and process_new_msgs, plus stats fields. `celldb.cpp` gains
+7 lines that skip meta validation under `TON_TONTESTER=1`. **No line reduces
+the cost of collation.** The claimed throughput gain therefore cannot come
+from cheaper collation code; it must come from where the announcement says
+it does - role separation and in-memory operation.
+
+`--celldb-in-memory` is **not new**: the flag and its help text ("store all
+cells in-memory, much faster but requires a lot of RAM. RocksDb is still used
+as persistent storage") are present at v2026.07 and earlier. What 2026.08
+changes is not the option but who can afford it: with collation delegated,
+only the dedicated collator needs the large-RAM machine, while validators
+keep the published 128 GB validator profile. No collator-specific hardware
+guidance has been published, and `celldb-in-memory` appears nowhere in
+ton-blockchain/docs or mytonctrl.
+
+### The tooling for step 3 is already written
+
+Commit `5f1934f5` (2026-08-14, `collators` branch, not yet in testnet),
+"Override block limits in collator options", adds node-local overrides of
+`block_limits_` on all four axes (bytes / gas / lt_delta / collated_data),
+each with underload/soft/hard. The chain is `block_limits_` ->
+`block_limit_status_` (collator.cpp:1963) -> `classify()` -> both the
+collation stop rule (`block_full_`) and `check_block_overload` ->
+`overload_history_` -> `want_split_`. So one option moves both how much a
+block holds and when the shard asks to split. On the validator side only
+hard limits are enforced - `lt_delta.hard` (validate-query.cpp:2441) and
+`gas.hard` (6103); there is no byte check at all, the byte ceiling being the
+collator's own ConfigParam 29 `max_block_size` guard (collator.cpp:7520).
+Read together with announcement sentence 3, this is most plausibly the
+staging mechanism for the planned limit increase, not a conservative guard.
+
+### What we can and cannot measure here
+
+Measurable, and measured above: the transfer function from collation speed
+to per-shard TPS. At this stand's rate the collator fills **1.33-1.62 MiB
+per 400 ms slot**, so the 1 MiB soft limit is already below capability while
+a 2 MiB limit needs **1.24-1.51x faster collation** before sentence 3's
+"proportional" holds. Verbosity 3 inflates collation time in both arms, so
+that requirement is if anything overstated.
+
+Not measurable on this stand: the in-memory effect. It needs a state larger
+than page cache but smaller than RAM; this box has 15.8 GB RAM (3.2 free)
+and 29 GB free disk, so no such window exists. The third-party anchor
+(DanShaders, ~105 -> ~241 jetton TPS RAM-resident, ~2.3x) is a single node at
+tontester limits (512 KB / 100M gas), not ConfigParam 23, and does not
+transfer.
+
+### Pre-activation baseline is time-critical
+
+Activation is 08-20. Any before/after measurement requires the baseline
+captured before 08-17. The quantities to freeze now, from public data only:
+per-shard sustained TPS distribution, masterchain and shard block rates,
+splits per day, single-shard time share, and the cold/warm split of collation
+fixed cost. After 08-20 the falsifiable predictions are: cold-block fixed
+price largely disappears on collator-produced shards; splits per day fall
+with the split criterion untouched (`check_block_overload` is byte-identical
+across master, testnet and the collators branch); and per-shard sustained TPS
+rises toward but not past what collation speed allows within the slot.
+
 ## W7 roadmap: the streaming collator - 2026-08-06
 
 The synthesis of every measurement and the survey. Three TON-unique
